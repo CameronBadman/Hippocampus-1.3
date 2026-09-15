@@ -18,6 +18,7 @@ hf-policies = { path = "crates/hf-policies" }
 hf-episodes = { path = "crates/hf-episodes" }
 hf-splits = { path = "crates/hf-splits" }
 hf-walk = { path = "crates/hf-walk" }
+hf-model = { path = "crates/hf-model" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

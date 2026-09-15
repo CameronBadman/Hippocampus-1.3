@@ -511,7 +511,15 @@ name = "hf-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "hf-core",
+ "hf-embed",
+ "hf-episodes",
+ "hf-io",
+ "hf-walk",
+ "serde",
+ "serde_json",
+ "sha2",
  "tch",
 ]
 

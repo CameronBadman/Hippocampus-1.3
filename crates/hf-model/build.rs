@@ -12,13 +12,16 @@ fn main() {
         (_, Ok(root)) => format!("{root}/lib"),
         _ => return,
     };
-    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib}");
-    println!("cargo:rustc-link-arg-bins=-L{lib}");
-    println!("cargo:rustc-link-arg-bins=-Wl,--no-as-needed");
-    for name in ["torch_cuda", "c10_cuda"] {
-        if std::path::Path::new(&format!("{lib}/lib{name}.so")).exists() {
-            println!("cargo:rustc-link-arg-bins=-l{name}");
+    // binaries, integration tests and examples of this crate all link libtorch
+    for kind in ["bins", "tests"] {
+        println!("cargo:rustc-link-arg-{kind}=-Wl,-rpath,{lib}");
+        println!("cargo:rustc-link-arg-{kind}=-L{lib}");
+        println!("cargo:rustc-link-arg-{kind}=-Wl,--no-as-needed");
+        for name in ["torch_cuda", "c10_cuda"] {
+            if std::path::Path::new(&format!("{lib}/lib{name}.so")).exists() {
+                println!("cargo:rustc-link-arg-{kind}=-l{name}");
+            }
         }
+        println!("cargo:rustc-link-arg-{kind}=-Wl,--as-needed");
     }
-    println!("cargo:rustc-link-arg-bins=-Wl,--as-needed");
 }

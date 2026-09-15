@@ -5,12 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The real-walk model on libtorch via tch-rs"
+description = "The real-walk model on libtorch via tch-rs: the transformer scorer over either feature set, the greedy prior, losses, a hand-written AdamW, checkpoints and the state digest"
 
 [dependencies]
 hf-core.workspace = true
+hf-walk.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
 tch.workspace = true
+
+[dev-dependencies]
+hf-io.workspace = true
+hf-embed.workspace = true
+hf-episodes.workspace = true
 
 [[bin]]
 name = "hf-smoke"
