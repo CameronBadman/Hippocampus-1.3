@@ -1,0 +1,32 @@
+[package]
+name = "hf-stage0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "hf-stage0: the real-walk stage-0 runner -- train, evaluate, re-evaluate -- writing the artifacts the foundation's readers consume"
+
+[dependencies]
+hf-core.workspace = true
+hf-graph.workspace = true
+hf-io.workspace = true
+hf-embed.workspace = true
+hf-policies.workspace = true
+hf-episodes.workspace = true
+hf-walk.workspace = true
+hf-model.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+flate2.workspace = true
+tch.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+flate2.workspace = true
+
+[[bin]]
+name = "hf-stage0"
+path = "src/main.rs"

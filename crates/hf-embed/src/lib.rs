@@ -194,6 +194,16 @@ impl EmbeddingMatrix {
         ))
     }
 
+    /// A matrix from rows already in memory (the fixture world's embeddings).
+    pub fn from_rows(nodes: Vec<String>, dimension: usize, data: Vec<f32>) -> Self {
+        assert_eq!(
+            data.len(),
+            nodes.len() * dimension,
+            "rows do not match the dimension"
+        );
+        Self::build(nodes, dimension, Data::Owned(data))
+    }
+
     fn build(nodes: Vec<String>, dimension: usize, data: Data) -> Self {
         let index = nodes
             .iter()

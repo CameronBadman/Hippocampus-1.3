@@ -550,6 +550,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hf-stage0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flate2",
+ "hf-core",
+ "hf-embed",
+ "hf-episodes",
+ "hf-graph",
+ "hf-io",
+ "hf-model",
+ "hf-policies",
+ "hf-walk",
+ "serde",
+ "serde_json",
+ "tch",
+]
+
+[[package]]
 name = "hf-walk"
 version = "0.1.0"
 dependencies = [
