@@ -1,5 +1,5 @@
 //! Bench: load a cache (first run parses vectors.jsonl and builds the sidecar; the
-//! second maps it). `cargo run --release -p hf-embed --example load -- <cache dir>`
+//! second maps it). `cargo run --release -p hf-embed --example load_cache -- <cache dir>`
 fn peak_rss_mb() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()

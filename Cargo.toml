@@ -11,6 +11,10 @@ publish = false
 
 [workspace.dependencies]
 hf-core = { path = "crates/hf-core" }
+hf-graph = { path = "crates/hf-graph" }
+hf-io = { path = "crates/hf-io" }
+hf-embed = { path = "crates/hf-embed" }
+hf-policies = { path = "crates/hf-policies" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

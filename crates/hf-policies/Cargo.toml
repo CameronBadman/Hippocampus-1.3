@@ -1,0 +1,17 @@
+[package]
+name = "hf-policies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The baseline walks of policies_v5 — blind, bidirectional BFS, similarity-greedy, oracle — with their exact tie-breaks"
+
+[dependencies]
+hf-core.workspace = true
+hf-io.workspace = true
+hf-embed.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

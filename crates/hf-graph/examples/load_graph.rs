@@ -1,5 +1,5 @@
 //! Load a graph structure-only and report counts, wall time and peak RSS —
-//! the bench for step 2 (`cargo run --release -p hf-graph --example load -- <edges.tsv> [percentile]`).
+//! the bench for step 2 (`cargo run --release -p hf-graph --example load_graph -- <edges.tsv> [percentile]`).
 use std::time::Instant;
 
 fn peak_rss_mb() -> f64 {

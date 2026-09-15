@@ -1,4 +1,4 @@
-//! Bench: read a whole split. `cargo run --release -p hf-io --example load -- <split dir>`
+//! Bench: read a whole split. `cargo run --release -p hf-io --example load_split -- <split dir>`
 fn peak_rss_mb() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
