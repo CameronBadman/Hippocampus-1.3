@@ -18,20 +18,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub const STOP_REGISTERED: &str = "target_registered";
 pub const STOP_EXHAUSTED: &str = "exhausted";
 
-/// A vector lookup by node id; `None` when the node has no vector.
+/// A vector lookup by node id in float64 — the fixture path's `dict` of
+/// Python floats is exact here; a float32 cache is widened (Python computes
+/// its float32 cosines through numpy, which this matches to rounding).
 pub trait Embeddings {
-    fn vector(&self, node: &str) -> Option<&[f32]>;
+    fn vector(&self, node: &str) -> Option<Vec<f64>>;
 }
 
 impl Embeddings for hf_embed::EmbeddingMatrix {
-    fn vector(&self, node: &str) -> Option<&[f32]> {
+    fn vector(&self, node: &str) -> Option<Vec<f64>> {
         self.get(node)
+            .map(|v| v.iter().map(|x| *x as f64).collect())
     }
 }
 
-impl Embeddings for HashMap<String, Vec<f32>> {
-    fn vector(&self, node: &str) -> Option<&[f32]> {
-        self.get(node).map(Vec::as_slice)
+impl Embeddings for HashMap<String, Vec<f64>> {
+    fn vector(&self, node: &str) -> Option<Vec<f64>> {
+        self.get(node).cloned()
     }
 }
 
@@ -293,15 +296,15 @@ pub fn bidirectional_bfs_trace(g: &EpisodeGraph) -> WalkTrace {
     trace
 }
 
-/// Cosine in float64 over float32 inputs, 0 when either norm is 0 (`policies_v5.cosine`).
-pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+/// Cosine in float64, 0 when either norm is 0 (`policies_v5.cosine`).
+pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
     let mut dot = 0f64;
     let mut na = 0f64;
     let mut nb = 0f64;
     for (x, y) in a.iter().zip(b) {
-        dot += *x as f64 * *y as f64;
-        na += *x as f64 * *x as f64;
-        nb += *y as f64 * *y as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
     }
     if na == 0.0 || nb == 0.0 {
         return 0.0;
@@ -314,10 +317,13 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
 pub fn similarity_greedy_trace(
     g: &EpisodeGraph,
     embeddings: &dyn Embeddings,
-    query: Option<&[f32]>,
+    query: Option<&[f64]>,
 ) -> WalkTrace {
-    let q: Vec<f32> = match query.or_else(|| embeddings.vector(&g.target)) {
-        Some(q) => q.to_vec(),
+    let q: Vec<f64> = match query
+        .map(<[f64]>::to_vec)
+        .or_else(|| embeddings.vector(&g.target))
+    {
+        Some(q) => q,
         None => return blind_exhaust_trace(g),
     };
     let mut counter = 0u64;
@@ -326,7 +332,7 @@ pub fn similarity_greedy_trace(
         |node, _| {
             counter += 1;
             let key = match embeddings.vector(node) {
-                Some(v) => -cosine(v, &q),
+                Some(v) => -cosine(&v, &q),
                 None => 2.0,
             };
             Key(key, counter)

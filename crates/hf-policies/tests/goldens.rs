@@ -15,7 +15,7 @@ fn traces_match_policies_v5_on_every_fixture_episode() {
         &std::fs::read_to_string(root.join("tests/goldens/policies.json")).unwrap(),
     )
     .unwrap();
-    let embeddings: HashMap<String, Vec<f32>> = golden["embeddings"]
+    let embeddings: HashMap<String, Vec<f64>> = golden["embeddings"]
         .as_object()
         .unwrap()
         .iter()
@@ -25,7 +25,7 @@ fn traces_match_policies_v5_on_every_fixture_episode() {
                 v.as_array()
                     .unwrap()
                     .iter()
-                    .map(|x| x.as_f64().unwrap() as f32)
+                    .map(|x| x.as_f64().unwrap())
                     .collect(),
             )
         })

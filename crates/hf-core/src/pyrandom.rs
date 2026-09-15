@@ -192,6 +192,18 @@ impl PyRandom {
         result
     }
 
+    /// `random()`: a float in [0, 1) from 53 bits, exactly as CPython builds it.
+    pub fn random(&mut self) -> f64 {
+        let a = (self.genrand_u32() >> 5) as f64;
+        let b = (self.genrand_u32() >> 6) as f64;
+        (a * 67_108_864.0 + b) * (1.0 / 9_007_199_254_740_992.0)
+    }
+
+    /// `uniform(a, b)`: `a + (b - a) * random()`.
+    pub fn uniform(&mut self, a: f64, b: f64) -> f64 {
+        a + (b - a) * self.random()
+    }
+
     /// `getstate()`.
     pub fn state(&self) -> PyRandomState {
         PyRandomState {

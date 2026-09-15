@@ -96,6 +96,8 @@ def pyrandom_goldens():
             "sample_85_8": rng.sample(range(85), 8),
             "sample_86_8": rng.sample(range(86), 8),
             "sample_40000_8_first_20": [rng.sample(range(40000), 8) for _ in range(20)],
+            "random_8": [rng.random() for _ in range(8)],
+            "uniform_m1_1_8": [rng.uniform(-1, 1) for _ in range(8)],
         }
         state = rng.getstate()
         entry["state_after"] = {"mt": list(state[1][:624]), "index": state[1][624]}

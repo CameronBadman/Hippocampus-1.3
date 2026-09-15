@@ -133,6 +133,22 @@ fn twister_reproduces_cpython_for_every_seed() {
                 "seed {seed} sample 40000/8 #{k}"
             );
         }
+        let got: Vec<f64> = (0..8).map(|_| rng.random()).collect();
+        let want: Vec<f64> = entry["random_8"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        assert_eq!(got, want, "seed {seed} random()");
+        let got: Vec<f64> = (0..8).map(|_| rng.uniform(-1.0, 1.0)).collect();
+        let want: Vec<f64> = entry["uniform_m1_1_8"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        assert_eq!(got, want, "seed {seed} uniform(-1, 1)");
         let state = rng.state();
         let want_state = PyRandomState {
             mt: entry["state_after"]["mt"]
