@@ -1,0 +1,17 @@
+[package]
+name = "hf-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A real network from the adapters' edges.tsv / text.tsv: balls, degree percentiles, induced subgraphs, bounded simple paths"
+
+[dependencies]
+hf-core.workspace = true
+anyhow.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

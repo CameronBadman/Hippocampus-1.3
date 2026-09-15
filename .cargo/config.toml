@@ -1,0 +1,7 @@
+# torch-sys links the libtorch inside the sibling foundation checkout's venv (the
+# torch 2.13.0+cu130 wheel). `relative = true` resolves against this workspace's
+# root, so the convention is hippo-13 and hippocampus-foundation side by side;
+# `source tools/env.sh` overrides it for another layout.
+[env]
+LIBTORCH = { value = "../hippocampus-foundation/.venv/lib/python3.12/site-packages/torch", relative = true }
+LIBTORCH_CXX11_ABI = "1"
