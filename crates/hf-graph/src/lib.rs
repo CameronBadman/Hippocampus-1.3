@@ -193,6 +193,18 @@ impl RealGraph {
         Ok(attached)
     }
 
+    /// Attach texts for known nodes from memory (the fixture world's `text=` map).
+    pub fn set_texts<'a>(&mut self, texts: impl IntoIterator<Item = (&'a str, &'a str)>) -> usize {
+        let mut attached = 0;
+        for (node, body) in texts {
+            if let Some(id) = self.index.get(node) {
+                self.text[*id as usize] = Some(body.to_string());
+                attached += 1;
+            }
+        }
+        attached
+    }
+
     pub fn node_count(&self) -> usize {
         self.names.len()
     }
@@ -375,6 +387,28 @@ impl Subgraph {
 
     pub fn edge_count(&self) -> usize {
         self.out.values().map(Vec::len).sum()
+    }
+
+    /// The subgraph with every edge whose `(head, tail)` pair the predicate names
+    /// removed — all parallel relations between the pair go at once, as the
+    /// sampler prunes by node pair. Node order and edge order are kept.
+    pub fn without_pairs(&self, remove: impl Fn(NodeId, NodeId) -> bool) -> Subgraph {
+        let mut out: HashMap<NodeId, Vec<OutEdge>> = HashMap::new();
+        for (head, edges) in &self.out {
+            let kept: Vec<OutEdge> = edges
+                .iter()
+                .copied()
+                .filter(|e| !remove(*head, e.tail))
+                .collect();
+            if !kept.is_empty() {
+                out.insert(*head, kept);
+            }
+        }
+        Subgraph {
+            nodes: self.nodes.clone(),
+            members: self.members.clone(),
+            out,
+        }
     }
 
     pub fn out_neighbours(&self, node: NodeId) -> Vec<NodeId> {

@@ -1,0 +1,22 @@
+[package]
+name = "hf-episodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The stage-0 episode sampler over a real graph: episodes_v5's draws, removals and payloads, reproduced exactly, in parallel"
+
+[dependencies]
+hf-core.workspace = true
+hf-graph.workspace = true
+hf-io.workspace = true
+hf-policies.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+hf-embed.workspace = true
