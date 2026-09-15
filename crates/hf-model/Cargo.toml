@@ -1,0 +1,17 @@
+[package]
+name = "hf-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The real-walk model on libtorch via tch-rs"
+
+[dependencies]
+hf-core.workspace = true
+anyhow.workspace = true
+tch.workspace = true
+
+[[bin]]
+name = "hf-smoke"
+path = "src/bin/hf_smoke.rs"

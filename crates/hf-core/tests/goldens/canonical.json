@@ -1,0 +1,162 @@
+{
+ "cases": [
+  {
+   "value": {
+    "b": 1,
+    "a": 2,
+    "aa": 3,
+    "A": 4,
+    "é": 5,
+    "z": {
+     "y": [
+      3,
+      2,
+      1
+     ],
+     "x": {}
+    }
+   },
+   "canonical_b64": "eyJBIjo0LCJhIjoyLCJhYSI6MywiYiI6MSwieiI6eyJ4Ijp7fSwieSI6WzMsMiwxXX0sIsOpIjo1fQ=="
+  },
+  {
+   "value": {
+    "floats": [
+     1.0,
+     0.1,
+     0.5,
+     1e+21,
+     1e+20,
+     1e-07,
+     1e-06,
+     5e-324,
+     1.7976931348623157e+308,
+     -0.0,
+     0.0,
+     1.2345678901234568e+20,
+     3.141592653589793,
+     100.0,
+     1e+300,
+     2.5e-05
+    ]
+   },
+   "canonical_b64": "eyJmbG9hdHMiOlsxLDAuMSwwLjUsMWUrMjEsMTAwMDAwMDAwMDAwMDAwMDAwMDAwLDFlLTcsMC4wMDAwMDEsNWUtMzI0LDEuNzk3NjkzMTM0ODYyMzE1N2UrMzA4LDAsMCwxMjM0NTY3ODkwMTIzNDU2ODAwMDAsMy4xNDE1OTI2NTM1ODk3OTMsMTAwLDFlKzMwMCwwLjAwMDAyNV19"
+  },
+  {
+   "value": {
+    "ints": [
+     0,
+     1,
+     -1,
+     9007199254740991,
+     -9007199254740991,
+     4294967296,
+     -4294967296,
+     1234567890123
+    ]
+   },
+   "canonical_b64": "eyJpbnRzIjpbMCwxLC0xLDkwMDcxOTkyNTQ3NDA5OTEsLTkwMDcxOTkyNTQ3NDA5OTEsNDI5NDk2NzI5NiwtNDI5NDk2NzI5NiwxMjM0NTY3ODkwMTIzXX0="
+  },
+  {
+   "value": {
+    "strings": [
+     "",
+     "a",
+     "\u0000",
+     "\n\t\r\b\f",
+     "\"quoted\"",
+     "back\\slash",
+     "  ",
+     "😀",
+     "café",
+     "\u001f",
+     "",
+     ""
+    ]
+   },
+   "canonical_b64": "eyJzdHJpbmdzIjpbIiIsImEiLCJcdTAwMDAiLCJcblx0XHJcYlxmIiwiXCJxdW90ZWRcIiIsImJhY2tcXHNsYXNoIiwi4oCo4oCpIiwi8J+YgCIsImNhZsOpIiwiXHUwMDFmIiwifyIsIsKAIl19"
+  },
+  {
+   "value": {
+    "keys": {
+     "€": 1,
+     "😀": 2,
+     "～": 3,
+     "a": 4,
+     "é": 5,
+     "Z": 6,
+     "10": 7,
+     "9": 8,
+     "": 9
+    }
+   },
+   "canonical_b64": "eyJrZXlzIjp7IiI6OSwiMTAiOjcsIjkiOjgsIloiOjYsImEiOjQsIsOpIjo1LCLigqwiOjEsIvCfmIAiOjIsIu+9niI6M319"
+  },
+  {
+   "value": {
+    "episode_id": "wikidata5m-train-000001-2b061859",
+    "visible": {
+     "schema_version": "5.0.0",
+     "nodes": [
+      {
+       "node": "Q1",
+       "text": ""
+      }
+     ],
+     "edges": [
+      {
+       "edge_id": 0,
+       "source": "Q1",
+       "target": "Q2",
+       "relation": null
+      }
+     ],
+     "removal_level": 2,
+     "subgraph_size": 40
+    }
+   },
+   "canonical_b64": "eyJlcGlzb2RlX2lkIjoid2lraWRhdGE1bS10cmFpbi0wMDAwMDEtMmIwNjE4NTkiLCJ2aXNpYmxlIjp7ImVkZ2VzIjpbeyJlZGdlX2lkIjowLCJyZWxhdGlvbiI6bnVsbCwic291cmNlIjoiUTEiLCJ0YXJnZXQiOiJRMiJ9XSwibm9kZXMiOlt7Im5vZGUiOiJRMSIsInRleHQiOiIifV0sInJlbW92YWxfbGV2ZWwiOjIsInNjaGVtYV92ZXJzaW9uIjoiNS4wLjAiLCJzdWJncmFwaF9zaXplIjo0MH19"
+  },
+  {
+   "value": {
+    "nested": [
+     [],
+     {},
+     [
+      []
+     ],
+     [
+      {}
+     ],
+     {
+      "a": []
+     },
+     {
+      "a": {}
+     },
+     [
+      null,
+      true,
+      false
+     ]
+    ]
+   },
+   "canonical_b64": "eyJuZXN0ZWQiOltbXSx7fSxbW11dLFt7fV0seyJhIjpbXX0seyJhIjp7fX0sW251bGwsdHJ1ZSxmYWxzZV1dfQ=="
+  },
+  {
+   "value": {
+    "sampler": {
+     "cost_epsilon": 0.5,
+     "family": "wikidata5m",
+     "hub_degree_cap": 19,
+     "max_paths": 512,
+     "removal_level": 2,
+     "screen_region": 0.5,
+     "seed_label": "real-walk-v1",
+     "subgraph_size": 40,
+     "target_distance": 3
+    }
+   },
+   "canonical_b64": "eyJzYW1wbGVyIjp7ImNvc3RfZXBzaWxvbiI6MC41LCJmYW1pbHkiOiJ3aWtpZGF0YTVtIiwiaHViX2RlZ3JlZV9jYXAiOjE5LCJtYXhfcGF0aHMiOjUxMiwicmVtb3ZhbF9sZXZlbCI6Miwic2NyZWVuX3JlZ2lvbiI6MC41LCJzZWVkX2xhYmVsIjoicmVhbC13YWxrLXYxIiwic3ViZ3JhcGhfc2l6ZSI6NDAsInRhcmdldF9kaXN0YW5jZSI6M319"
+  }
+ ]
+}

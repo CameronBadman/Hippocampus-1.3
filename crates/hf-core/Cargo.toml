@@ -1,0 +1,17 @@
+[package]
+name = "hf-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared discipline for the real-walk engine: canonical JSON, digests, CPython-compatible random, exclusive files, typed errors"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+hex.workspace = true

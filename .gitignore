@@ -1,0 +1,5 @@
+/target/
+**/*.rs.bk
+# regenerable local artifacts; evidence lives in hippocampus-foundation/private
+/private/
+/scratch/

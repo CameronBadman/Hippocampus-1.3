@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+hf-core = { path = "crates/hf-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_json_canonicalizer = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+ureq = { version = "3", features = ["json"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+memmap2 = "0.9"
+safetensors = "0.5"
+tch = "0.26"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4
