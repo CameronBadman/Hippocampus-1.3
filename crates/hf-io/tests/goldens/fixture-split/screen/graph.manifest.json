@@ -1,0 +1,15 @@
+{
+  "edge_count": 1600,
+  "edges_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "family": "fixture",
+  "node_count": 400,
+  "record_kind": "real_graph_manifest_v5",
+  "source": {
+    "dataset": "synthetic fixture world",
+    "seed": 5
+  },
+  "text_coverage": 1.0,
+  "text_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "training_authorized": false,
+  "typed": false
+}

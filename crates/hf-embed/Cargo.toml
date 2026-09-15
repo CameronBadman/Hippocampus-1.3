@@ -1,0 +1,23 @@
+[package]
+name = "hf-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The v5 embedding cache (vectors.jsonl + manifest) with a memory-mapped float32 sidecar, and the ollama embed client and CLI"
+
+[dependencies]
+hf-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+memmap2.workspace = true
+ureq.workspace = true
+clap.workspace = true
+
+[[bin]]
+name = "hf-embed"
+path = "src/bin/hf_embed.rs"

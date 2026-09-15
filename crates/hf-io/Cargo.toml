@@ -1,0 +1,19 @@
+[package]
+name = "hf-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Real-walk split directories: the v5 layout read and written with the foundation's framing, digests and file modes"
+
+[dependencies]
+hf-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+hf-core.workspace = true

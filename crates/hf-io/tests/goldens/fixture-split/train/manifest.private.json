@@ -1,0 +1,33 @@
+{
+  "disclosure": "private_labels_and_oracle",
+  "episode_count": 12,
+  "family": "fixture",
+  "graph_manifest_sha256": "sha256:e9f35b3f88cad7b5361f15d7d765fcac0a256038044a92716c64aece0f3767d7",
+  "hidden_bytes": 1938,
+  "hidden_sha256": "sha256:27cd64b1324965acb83f85037d6dbc79f43709b717cd5136664795f4ea16f981",
+  "record_kind": "real_walk_split_manifest_v5",
+  "removal_levels": {
+    "2": 12
+  },
+  "sampler": {
+    "cost_epsilon": 0.5,
+    "family": "fixture",
+    "greedy_share": 1.0,
+    "hub_degree_cap": null,
+    "hub_percentile": null,
+    "max_paths": 512,
+    "removal_level": 2,
+    "removal_rule": "cheapest-first",
+    "screen_region": 0.0,
+    "seed_label": "real-walk-v1",
+    "subgraph_size": 64,
+    "target_distance": 3,
+    "text_mode": "texts.jsonl"
+  },
+  "schema_version": "5.0.0",
+  "split": "train",
+  "stage": "stage0_known_target",
+  "training_authorized": false,
+  "visible_bytes": 9677,
+  "visible_sha256": "sha256:738cd23a4204d8cf433ee123926fc5b51aba1afa76a74a764d012784d368934e"
+}
