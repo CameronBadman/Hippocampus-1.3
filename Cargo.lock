@@ -527,6 +527,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hf-splits"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hf-core",
+ "hf-embed",
+ "hf-episodes",
+ "hf-graph",
+ "hf-io",
+ "hf-policies",
+ "serde_json",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

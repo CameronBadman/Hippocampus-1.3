@@ -16,6 +16,7 @@ hf-io = { path = "crates/hf-io" }
 hf-embed = { path = "crates/hf-embed" }
 hf-policies = { path = "crates/hf-policies" }
 hf-episodes = { path = "crates/hf-episodes" }
+hf-splits = { path = "crates/hf-splits" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
