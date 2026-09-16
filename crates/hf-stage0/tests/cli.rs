@@ -254,3 +254,71 @@ fn print_capacity_builds_the_config_model_and_prints_the_count() {
     );
     let _ = std::fs::remove_file(&alt);
 }
+
+/// The rule a run is governed by comes from its config, not from a constant:
+/// the v2 configs name `experiments/real_walk_v2/RULE.md`, and the runner used
+/// to stamp every probe with the v1 path. A config that names no rule keeps
+/// that v1 default, which is what the v1 configs and the Python runner write.
+#[test]
+fn the_configs_governing_rule_round_trips_into_probe_and_reeval() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("governed");
+    std::fs::create_dir_all(&root).unwrap();
+    let rule = "experiments/real_walk_v2/RULE.md";
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config()).unwrap()).unwrap();
+    cfg["governed_by"] = rule.into();
+    let named = root.join("training-config.governed.json");
+    std::fs::write(&named, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let base = |cfg: &PathBuf, o: &PathBuf| -> Vec<String> {
+        vec![
+            "--config".into(),
+            cfg.to_string_lossy().into(),
+            "--output".into(),
+            o.to_string_lossy().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--fixture".into(),
+            "--train-episodes".into(),
+            "6".into(),
+            "--screen-episodes".into(),
+            "3".into(),
+            "--updates".into(),
+            "1".into(),
+        ]
+    };
+    let read = |p: PathBuf| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    };
+    // the config's own rule reaches probe.json and reeval.json
+    let out = root.join("run");
+    let mut args = base(&named, &out);
+    args.push("--save-checkpoint".into());
+    let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(read(out.join("probe.json"))["governed_by"], rule);
+    let re = root.join("reeval");
+    let mut args = base(&named, &re);
+    args.extend(
+        [
+            "--reevaluate-checkpoint",
+            out.join("checkpoint.json").to_str().unwrap(),
+        ]
+        .map(String::from),
+    );
+    let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(read(re.join("reeval.json"))["governed_by"], rule);
+    // a config naming no rule keeps the v1 default
+    let plain = root.join("plain");
+    let args = base(&config(), &plain);
+    let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        read(plain.join("probe.json"))["governed_by"],
+        "experiments/real_walk_v1/RULE.md"
+    );
+}

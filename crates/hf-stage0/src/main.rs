@@ -157,6 +157,15 @@ fn print_capacity(config_path: &Path, dim: i64) -> Result<(), HfError> {
     Ok(())
 }
 
+/// The rule a run is governed by: the config names it. The v1 rule is the
+/// default the runner has always written, kept for a config that names none.
+fn governed_by(config: &Value) -> Value {
+    config
+        .get("governed_by")
+        .cloned()
+        .unwrap_or_else(|| Value::from("experiments/real_walk_v1/RULE.md"))
+}
+
 fn engine_info() -> Value {
     json!({
         "engine": "hippo-13 hf-stage0",
@@ -641,6 +650,7 @@ fn reevaluate(
     let reeval = json!({
         "record_kind": format!("real_walk_stage0_reeval{}", if args.fixture { "_FIXTURE" } else { "" }),
         "evidence": !args.fixture,
+        "governed_by": governed_by(config),
         "checkpoint": ck_path.to_string_lossy(),
         "checkpoint_seed": saved.get("seed"),
         "git_head": provenance["git_head"],
@@ -961,7 +971,7 @@ fn train(
     let probe = json!({
         "record_kind": format!("real_walk_stage0_probe{}", if args.fixture { "_FIXTURE" } else { "" }),
         "evidence": !args.fixture,
-        "governed_by": "experiments/real_walk_v1/RULE.md",
+        "governed_by": governed_by(config),
         "git_head": head_at_start,
         "git_head_at_finish": data::git_head(foundation),
         "engine_head": provenance["engine_head"],
