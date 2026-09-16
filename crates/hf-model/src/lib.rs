@@ -78,6 +78,34 @@ impl ModelConfig {
     }
 }
 
+/// The bound PyTorch gives a linear weight of this fan-in:
+/// `kaiming_uniform_(a=sqrt(5))` is uniform on ±1/sqrt(fan_in).
+fn torch_uniform(in_dim: i64) -> nn::Init {
+    let bound = 1.0 / (in_dim as f64).sqrt();
+    nn::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    }
+}
+
+/// A linear layer initialised as `torch.nn.Linear` initialises one, which
+/// `tch`'s `LinearConfig::default()` does not: its default is Kaiming-uniform
+/// with the ReLU gain, a bound of sqrt(6/fan_in) — sqrt(6) = 2.449 times
+/// PyTorch's. The bias default already agrees (`tch` derives ±1/sqrt(fan_in)
+/// from `in_dim`, as PyTorch does).
+fn torch_linear(p: nn::Path, in_dim: i64, out_dim: i64, bias: bool) -> nn::Linear {
+    nn::linear(
+        p,
+        in_dim,
+        out_dim,
+        nn::LinearConfig {
+            ws_init: torch_uniform(in_dim),
+            bs_init: None,
+            bias,
+        },
+    )
+}
+
 struct Attention {
     in_proj_weight: Tensor,
     in_proj_bias: Tensor,
@@ -104,8 +132,9 @@ impl Attention {
             hidden,
             hidden,
             nn::LinearConfig {
+                ws_init: torch_uniform(hidden),
                 bs_init: Some(nn::Init::Const(0.0)),
-                ..Default::default()
+                bias: true,
             },
         );
         Self {
@@ -169,29 +198,15 @@ struct Block {
 
 impl Block {
     fn new(p: &nn::Path, hidden: i64, heads: i64, multiplier: i64, pair_dim: i64) -> Self {
-        let no_bias = nn::LinearConfig {
-            bias: false,
-            ..Default::default()
-        };
         Self {
             norm_context: nn::layer_norm(p / "norm_context", vec![hidden], Default::default()),
             context_attention: Attention::new(&(p / "context_attention"), hidden, heads),
-            context_bias: nn::linear(p / "context_bias", pair_dim, heads, no_bias),
+            context_bias: torch_linear(p / "context_bias", pair_dim, heads, false),
             norm_query: nn::layer_norm(p / "norm_query", vec![hidden], Default::default()),
             query_attention: Attention::new(&(p / "query_attention"), hidden, heads),
             norm_ff: nn::layer_norm(p / "norm_ff", vec![hidden], Default::default()),
-            ff0: nn::linear(
-                p / "feedforward" / "0",
-                hidden,
-                multiplier * hidden,
-                Default::default(),
-            ),
-            ff2: nn::linear(
-                p / "feedforward" / "2",
-                multiplier * hidden,
-                hidden,
-                Default::default(),
-            ),
+            ff0: torch_linear(p / "feedforward" / "0", hidden, multiplier * hidden, true),
+            ff2: torch_linear(p / "feedforward" / "2", multiplier * hidden, hidden, true),
         }
     }
 
@@ -256,20 +271,18 @@ impl Model {
         let hidden = config.hidden_dimension;
         let vs = nn::VarStore::new(device);
         let p = vs.root();
-        let candidate_encoder =
-            nn::linear(&p / "candidate_encoder", cdim, hidden, Default::default());
+        let candidate_encoder = torch_linear(&p / "candidate_encoder", cdim, hidden, true);
         let candidate_norm =
             nn::layer_norm(&p / "candidate_norm", vec![hidden], Default::default());
-        let context_encoder =
-            nn::linear(&p / "context_encoder", ctx_dim, hidden, Default::default());
+        let context_encoder = torch_linear(&p / "context_encoder", ctx_dim, hidden, true);
         let context_norm = nn::layer_norm(&p / "context_norm", vec![hidden], Default::default());
         let (query_encoder, query_token) = match features.query_dim(edim) {
             Some(qdim) => (
-                Some(nn::linear(
+                Some(torch_linear(
                     &p / "query_encoder",
                     qdim as i64,
                     hidden,
-                    Default::default(),
+                    true,
                 )),
                 None,
             ),
@@ -296,17 +309,17 @@ impl Model {
                 )
             })
             .collect();
-        let score0 = nn::linear(
+        let score0 = torch_linear(
             &p / "score_head" / "0",
             hidden,
             config.score_hidden_dimension,
-            Default::default(),
+            true,
         );
-        let score2 = nn::linear(
+        let score2 = torch_linear(
             &p / "score_head" / "2",
             config.score_hidden_dimension,
             1,
-            Default::default(),
+            true,
         );
         let greedy_tau = if config.greedy_prior {
             // the residual is exactly zero at initialisation: the untrained walk is greedy
@@ -326,17 +339,17 @@ impl Model {
         } else {
             None
         };
-        let stop0 = nn::linear(
+        let stop0 = torch_linear(
             &p / "stop_head" / "0",
             STOP_DIM as i64,
             config.coverage_hidden_dimension,
-            Default::default(),
+            true,
         );
-        let stop2 = nn::linear(
+        let stop2 = torch_linear(
             &p / "stop_head" / "2",
             config.coverage_hidden_dimension,
             1,
-            Default::default(),
+            true,
         );
         let device_probe = p.zeros_no_train("_device_probe", &[1]);
         Ok(Self {
