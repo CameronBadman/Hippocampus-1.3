@@ -36,9 +36,9 @@ pub const TRAIN_SAMPLE_BASE: usize = 5000;
 struct Args {
     #[arg(long, required_unless_present = "engine_info")]
     config: Option<PathBuf>,
-    #[arg(long, required_unless_present = "engine_info")]
+    #[arg(long, required_unless_present_any = ["engine_info", "print_capacity"])]
     output: Option<PathBuf>,
-    #[arg(long, required_unless_present = "engine_info")]
+    #[arg(long, required_unless_present_any = ["engine_info", "print_capacity"])]
     model_seed: Option<u64>,
     /// synthetic fixture; never evidence
     #[arg(long)]
@@ -103,6 +103,10 @@ struct Args {
     /// print the engine's provenance and exit
     #[arg(long)]
     engine_info: bool,
+    /// build the config's model at this embedding dimension on the CPU, print
+    /// its trainable parameter count and exit; no data is read
+    #[arg(long, value_name = "DIM")]
+    print_capacity: Option<i64>,
 }
 
 fn foundation_root(args: &Args) -> PathBuf {
@@ -133,6 +137,23 @@ fn preflight(args: &Args, foundation: &Path) -> Result<(), HfError> {
             foundation.display()
         )));
     }
+    Ok(())
+}
+
+/// `--print-capacity <DIM>`: the config's model at that embedding dimension,
+/// instantiated on the CPU, and the count it would train.
+fn print_capacity(config_path: &Path, dim: i64) -> Result<(), HfError> {
+    let config = data::read_json(config_path)?;
+    let model_config = ModelConfig::from_value(&config["model"], dim)?;
+    let model = Model::new(model_config.clone(), Device::Cpu)?;
+    println!(
+        "{}",
+        json!({
+            "feature_set": model_config.feature_set,
+            "dim": dim,
+            "trainable_parameters": model.trainable_parameter_count(),
+        })
+    );
     Ok(())
 }
 
@@ -267,6 +288,13 @@ fn main() {
     let args = Args::parse();
     if args.engine_info {
         println!("{}", serde_json::to_string_pretty(&engine_info()).unwrap());
+        return;
+    }
+    if let Some(dim) = args.print_capacity {
+        let config = args.config.clone().expect("required");
+        if let Err(e) = print_capacity(&config, dim) {
+            hf_core::exit_with("hf-stage0", &e);
+        }
         return;
     }
     if let Err(e) = run(args) {

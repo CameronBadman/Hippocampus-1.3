@@ -1,7 +1,9 @@
 //! The runner on the fixture world: a training run writes the artifacts with
 //! their keys; a re-evaluation with a training sample and a candidate dump
 //! satisfies the readers' invariants; the refusals (holdout path, missing
-//! pin, doctored probe, flags without a re-evaluation) exit 2.
+//! pin, doctored probe, flags without a re-evaluation) exit 2;
+//! `--print-capacity` builds the config's model on the CPU and prints what it
+//! would train, reading no data.
 
 use std::path::PathBuf;
 
@@ -169,6 +171,11 @@ fn fixture_training_and_reevaluation_write_the_readers_artifacts() {
         let best = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         assert_eq!(scores[l["chosen"].as_u64().unwrap() as usize], best);
         assert_eq!(l["frontier"].as_array().unwrap().len(), scores.len());
+        assert_eq!(l["parents"].as_array().unwrap().len(), scores.len());
+        assert_eq!(l["depths"].as_array().unwrap().len(), scores.len());
+        for d in l["depths"].as_array().unwrap() {
+            assert!(d.as_u64().unwrap() >= 1);
+        }
     }
     // a second re-evaluation into the same directory is refused: the streams append
     let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
@@ -196,4 +203,54 @@ fn fixture_training_and_reevaluation_write_the_readers_artifacts() {
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("preregistration-commit"));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn print_capacity_builds_the_config_model_and_prints_the_count() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let cfg = config();
+    let o = run(&["--print-capacity", "8", "--config", cfg.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let line: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&o.stdout)).unwrap();
+    assert_eq!(
+        line.as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>(),
+        ["feature_set", "dim", "trainable_parameters"]
+    );
+    assert_eq!(line["feature_set"], "raw-v5");
+    assert_eq!(line["dim"], 8);
+    // the fixture model at width 8; the golden's count plus the greedy prior's
+    // single scalar, which this config does not ask for
+    assert_eq!(line["trainable_parameters"], 15446);
+    // no output and no seed are needed, and nothing is written
+    assert!(!PathBuf::from("probe.json").exists());
+    // the other feature sets are reachable through the same flag
+    let alt = std::env::temp_dir().join(format!("hf-stage0-cap-{}.json", std::process::id()));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    value["model"]["feature_set"] = "relational-v6-prev".into();
+    std::fs::write(&alt, serde_json::to_string(&value).unwrap()).unwrap();
+    let o = run(&["--print-capacity", "8", "--config", alt.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let prev: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&o.stdout)).unwrap();
+    assert_eq!(prev["feature_set"], "relational-v6-prev");
+    assert!(prev["trainable_parameters"].as_i64().unwrap() > 0);
+    // an unknown feature set is refused, not silently defaulted
+    value["model"]["feature_set"] = "relational-v7".into();
+    std::fs::write(&alt, serde_json::to_string(&value).unwrap()).unwrap();
+    assert_eq!(
+        run(&["--print-capacity", "8", "--config", alt.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    let _ = std::fs::remove_file(&alt);
 }

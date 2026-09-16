@@ -5,7 +5,10 @@
 //! padded batches) to 1e-4; the walk with the model as scorer reproduces the
 //! Python walk node for node under both stop rules; `walk_losses` on the
 //! four-episode batch with and without the residual penalty; the pre-clip
-//! gradient norm; AdamW's moments round-trip through save/load.
+//! gradient norm; AdamW's moments round-trip through save/load. The three
+//! feature sets the config may name report their widths through the model, and
+//! the previous-node set costs exactly the two extra context columns and the
+//! two extra pair columns.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -421,4 +424,44 @@ fn losses_and_the_gradient_norm_match_python() {
     other.load(&path).unwrap();
     assert_eq!(other.step_count, 1);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_three_feature_sets_report_their_dims_through_the_model() {
+    let g = golden();
+    let build = |name: &str| -> Model {
+        let mut m = g["model_config"].clone();
+        m["feature_set"] = name.into();
+        Model::new(ModelConfig::from_value(&m, 8).unwrap(), Device::Cpu).unwrap()
+    };
+    let want: [(&str, usize, usize, usize, Option<usize>); 3] = [
+        ("raw-v5", 4 * 8 + 7, 8, 2, Some(8)),
+        ("relational-v6", 16, 4, 3, None),
+        ("relational-v6-prev", 16, 6, 5, None),
+    ];
+    for (name, cdim, ctx_dim, pair_dim, query_dim) in want {
+        let model = build(name);
+        let features = model.features();
+        assert_eq!(features.name(), name);
+        assert_eq!(features.candidate_dim(8), cdim, "{name} candidate");
+        assert_eq!(features.context_dim(8), ctx_dim, "{name} context");
+        assert_eq!(features.pair_dim(), pair_dim, "{name} pair");
+        assert_eq!(features.query_dim(8), query_dim, "{name} query");
+    }
+    // the only cost of the previous-node columns: two more context inputs and
+    // two more pair-bias inputs per head, per block
+    let hidden = g["model_config"]["hidden_dimension"].as_i64().unwrap();
+    let heads = g["model_config"]["self_attention_heads"].as_i64().unwrap();
+    let blocks = g["model_config"]["traversal_blocks"].as_i64().unwrap();
+    assert_eq!(
+        build("relational-v6-prev").trainable_parameter_count()
+            - build("relational-v6").trainable_parameter_count(),
+        2 * hidden + blocks * 2 * heads
+    );
+    let mut unknown = g["model_config"].clone();
+    unknown["feature_set"] = "relational-v7".into();
+    assert!(ModelConfig::from_value(&unknown, 8)
+        .unwrap()
+        .features()
+        .is_err());
 }

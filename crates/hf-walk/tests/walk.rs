@@ -4,14 +4,17 @@
 //! coincide); with a deterministic pseudo-random scorer, walking 64 episodes
 //! in one batch equals walking each alone, decision for decision; the v6
 //! feature set carries no raw coordinate; the candidate records satisfy the
-//! ranking probe's gate 2 invariants.
+//! ranking probe's gate 2 invariants. The view a builder receives carries no
+//! accessor for anything the sampler kept back; `relational-v6-prev` leaves
+//! the candidate row of `relational-v6` untouched and its two previous-node
+//! columns agree between the context token and the pair channel.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use hf_walk::{
-    walk_batch, DecisionBatch, EpisodeIndex, FeatureSet, RawV5, RelationalV6, Scored, Scorer,
-    StopRule, WalkOptions, STOP_DIM,
+    walk_batch, DecisionBatch, EpisodeIndex, FeatureSet, RawV5, RelationalV6, RelationalV6Prev,
+    Scored, Scorer, StopRule, WalkOptions, STOP_DIM,
 };
 use sha2::{Digest, Sha256};
 
@@ -176,6 +179,16 @@ fn cosine_scored_walk_is_similarity_greedy_on_every_fixture_episode() {
                 index.names[result.expanded[k + 1] as usize]
             );
             assert_eq!(rec.scores.len(), rec.cosines.len());
+            assert_eq!(rec.parents.len(), rec.frontier.len());
+            assert_eq!(rec.depths.len(), rec.frontier.len());
+            let d = &result.decisions[k];
+            let want_parents: Vec<&str> = d
+                .parents
+                .iter()
+                .map(|p| index.names[*p as usize].as_str())
+                .collect();
+            assert_eq!(rec.parents, want_parents);
+            assert_eq!(rec.depths, d.depths);
         }
         assert_eq!(result.margins.len(), result.decisions.len());
         assert_eq!(result.cosine_margins.len(), result.decisions.len());
@@ -192,6 +205,7 @@ fn batched_and_single_walks_agree_decision_for_decision() {
     for (features, name) in [
         (&RawV5 as &dyn FeatureSet, "raw"),
         (&RelationalV6 as &dyn FeatureSet, "v6"),
+        (&RelationalV6Prev as &dyn FeatureSet, "v6-prev"),
     ] {
         for rule in [StopRule::Exhaust, StopRule::Learned] {
             let options = WalkOptions {
@@ -222,7 +236,10 @@ fn batched_and_single_walks_agree_decision_for_decision() {
                     assert_eq!(a.frontier, b.frontier);
                     assert_eq!(a.stop_features, b.stop_features);
                     assert_eq!(a.item.as_ref().unwrap().cand, b.item.as_ref().unwrap().cand);
+                    assert_eq!(a.item.as_ref().unwrap().ctx, b.item.as_ref().unwrap().ctx);
                     assert_eq!(a.item.as_ref().unwrap().pair, b.item.as_ref().unwrap().pair);
+                    assert_eq!(a.parents, b.parents);
+                    assert_eq!(a.depths, b.depths);
                 }
             }
             if rule == StopRule::Learned {
@@ -286,4 +303,225 @@ fn relational_features_carry_no_raw_coordinate() {
             assert_eq!(row[0], d.cosines[i], "column 0 is cos(c, q)");
         }
     }
+}
+
+/// A hand-built episode with no target to register, so the walk runs to
+/// exhaustion and every expansion order is observable: `s -> a -> b` and
+/// `s -> c -> t`, embeddings chosen so the cosine-greedy walk expands
+/// s, a, b, c, t in that order. At the decision whose expansions are
+/// [s, a, b, c], b is abandoned (no child of b expanded since, and c, which is
+/// not a child of b, was) while a is not (its child b was expanded since).
+fn abandonment_episode() -> EpisodeIndex {
+    let names: Vec<String> = ["s", "a", "b", "c", "t"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let rows: [[f32; 2]; 5] = [
+        [0.0, 1.0],
+        [0.9, 0.435_889_9],
+        [0.8, 0.6],
+        [0.1, 0.994_987_4],
+        [1.0, 0.0],
+    ];
+    let emb: Vec<f32> = rows.iter().flatten().copied().collect();
+    let unit = emb.clone(); // every row above is already unit length
+    EpisodeIndex {
+        episode_id: "hand-built".into(),
+        names,
+        start: 0,
+        target_shown: Some(4),
+        hidden_targets: Vec::new(),
+        out: vec![vec![1, 3], vec![2], vec![], vec![4], vec![]],
+        edim: 2,
+        emb,
+        unit,
+        query: vec![1.0, 0.0],
+        on_path: vec![false; 5],
+        distance: vec![None; 5],
+        removed_count: 0,
+        greedy_overshoot: None,
+    }
+}
+
+#[test]
+fn the_abandonment_and_recency_columns_read_the_expansion_order() {
+    let index = abandonment_episode();
+    let features = RelationalV6Prev;
+    let mut scorer = CosineScorer {
+        column: features.cosine_column(2),
+        cdim: features.candidate_dim(2),
+    };
+    let result = walk_batch(
+        &[&index],
+        &features,
+        &mut scorer,
+        WalkOptions {
+            stop_rule: StopRule::Exhaust,
+            record_candidates: false,
+            keep_items: true,
+            with_prior: false,
+        },
+    )
+    .unwrap()
+    .remove(0);
+    let order: Vec<&str> = result
+        .expanded
+        .iter()
+        .map(|n| index.names[*n as usize].as_str())
+        .collect();
+    assert_eq!(order, ["s", "a", "b", "c", "t"]);
+    let ctx_dim = features.context_dim(2);
+    let pair_dim = features.pair_dim();
+    // the decision whose expansions are [s, a, b, c]
+    let d = &result.decisions[3];
+    assert_eq!(d.expansions_before, 4);
+    let item = d.item.as_ref().unwrap();
+    let abandoned: Vec<f32> = (0..4).map(|k| item.ctx[k * ctx_dim + 4]).collect();
+    let recency: Vec<f32> = (0..4).map(|k| item.ctx[k * ctx_dim + 5]).collect();
+    assert_eq!(abandoned, vec![0.0, 0.0, 1.0, 0.0], "s, a, b, c");
+    assert_eq!(
+        recency,
+        vec![4.0 / 16.0, 3.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0]
+    );
+    // the pair channel carries the same two columns for every candidate
+    for i in 0..item.frontier_len {
+        for k in 0..4 {
+            let base = (i * 4 + k) * pair_dim;
+            assert_eq!(item.pair[base + 3], abandoned[k]);
+            assert_eq!(item.pair[base + 4], recency[k]);
+        }
+    }
+    // one expansion earlier, nothing has been abandoned yet
+    let earlier = result.decisions[2].item.as_ref().unwrap();
+    assert_eq!(result.decisions[2].expansions_before, 3);
+    assert_eq!(
+        (0..3)
+            .map(|k| earlier.ctx[k * ctx_dim + 4])
+            .collect::<Vec<f32>>(),
+        vec![0.0, 0.0, 0.0],
+        "s, a, b"
+    );
+    assert_eq!(
+        (0..3)
+            .map(|k| earlier.ctx[k * ctx_dim + 5])
+            .collect::<Vec<f32>>(),
+        vec![3.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0]
+    );
+}
+
+#[test]
+fn relational_v6_prev_keeps_the_v6_candidate_row_and_extends_the_other_channels() {
+    let (episodes, cache, _) = episodes();
+    let indexes: Vec<EpisodeIndex> = episodes
+        .iter()
+        .map(|e| EpisodeIndex::new(e, &cache, 8).unwrap())
+        .collect();
+    let refs: Vec<&EpisodeIndex> = indexes.iter().collect();
+    let options = WalkOptions {
+        stop_rule: StopRule::Exhaust,
+        record_candidates: false,
+        keep_items: true,
+        with_prior: false,
+    };
+    // the hash scorer reads the candidate rows only, so identical rows give
+    // identical walks: any divergence here is a divergence in the row
+    let mut scorer = HashScorer {
+        cdim: RelationalV6.candidate_dim(8),
+    };
+    let base = walk_batch(&refs, &RelationalV6, &mut scorer, options).unwrap();
+    let prev = walk_batch(&refs, &RelationalV6Prev, &mut scorer, options).unwrap();
+    assert_eq!(
+        RelationalV6Prev.candidate_dim(8),
+        RelationalV6.candidate_dim(8)
+    );
+    assert_eq!(RelationalV6Prev.context_dim(8), 6);
+    assert_eq!(RelationalV6Prev.pair_dim(), 5);
+    let mut decisions = 0usize;
+    for (i, (b, p)) in base.iter().zip(&prev).enumerate() {
+        assert_eq!(b.expanded, p.expanded, "{}", indexes[i].episode_id);
+        assert_eq!(b.decisions.len(), p.decisions.len());
+        for (db, dp) in b.decisions.iter().zip(&p.decisions) {
+            decisions += 1;
+            let (ib, ip) = (db.item.as_ref().unwrap(), dp.item.as_ref().unwrap());
+            assert_eq!(ib.cand, ip.cand, "the candidate row is v6's, unchanged");
+            for k in 0..db.expansions_before {
+                assert_eq!(ip.ctx[k * 6..k * 6 + 4], ib.ctx[k * 4..k * 4 + 4]);
+                for i in 0..db.frontier.len() {
+                    let (bb, bp) = (
+                        (i * db.expansions_before + k) * 3,
+                        (i * db.expansions_before + k) * 5,
+                    );
+                    assert_eq!(ip.pair[bp..bp + 3], ib.pair[bb..bb + 3]);
+                    assert_eq!(ip.pair[bp + 3], ip.ctx[k * 6 + 4]);
+                    assert_eq!(ip.pair[bp + 4], ip.ctx[k * 6 + 5]);
+                }
+            }
+        }
+    }
+    assert!(decisions > 100, "only {decisions} decisions compared");
+}
+
+#[test]
+fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
+    let source = include_str!("../src/visible.rs");
+    for name in [
+        "hidden_targets",
+        "on_path",
+        "distance",
+        "removed_count",
+        "greedy_overshoot",
+    ] {
+        assert!(
+            !source.contains(name),
+            "{name} appears in the view a feature builder receives"
+        );
+    }
+    // the whole state of the view, and the whole of its surface
+    let fields: Vec<&str> = source
+        .split("pub struct VisibleIndex<'a> {")
+        .nth(1)
+        .unwrap()
+        .split("\n}")
+        .next()
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.trim().split(':').next())
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "names",
+            "start",
+            "target_shown",
+            "out",
+            "edim",
+            "emb",
+            "unit",
+            "query"
+        ]
+    );
+    let mut methods: Vec<&str> = source
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub fn "))
+        .filter_map(|l| l.split(['(', '<']).next())
+        .collect();
+    methods.sort_unstable();
+    assert_eq!(
+        methods,
+        [
+            "degree",
+            "edim",
+            "emb",
+            "name",
+            "names",
+            "new",
+            "node_count",
+            "out",
+            "query",
+            "start",
+            "target_shown",
+            "unit"
+        ]
+    );
 }

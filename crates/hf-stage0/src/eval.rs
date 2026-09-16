@@ -361,6 +361,8 @@ pub fn write_candidate_dump(
                 "scores": rec.scores.iter().map(|x| round_to(*x, 6)).collect::<Vec<_>>(),
                 "cosines": rec.cosines.iter().map(|x| round_to(*x, 6)).collect::<Vec<_>>(),
                 "chosen": rec.chosen,
+                "parents": rec.parents,
+                "depths": rec.depths,
             });
             gz.write_all(line.to_string().as_bytes())
                 .and_then(|_| gz.write_all(b"\n"))
@@ -369,4 +371,81 @@ pub fn write_candidate_dump(
     }
     gz.finish().map_err(|e| HfError::Invalid(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dump line keeps every key the readers already consume and gains
+    /// `parents` (the discovery parent of each frontier candidate, by name) and
+    /// `depths`; `chosen` still indexes `frontier`.
+    #[test]
+    fn a_dump_line_carries_the_parents_and_depths_beside_the_old_keys() {
+        let dir = std::env::temp_dir().join(format!("hf-stage0-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = vec![(
+            "ep-1".to_string(),
+            vec![hf_walk::CandidateRecord {
+                frontier: vec!["Q2".into(), "Q3".into(), "Q4".into()],
+                scores: vec![0.25, 0.75, 0.5],
+                cosines: vec![0.1, 0.2, 0.3],
+                chosen: 1,
+                parents: vec!["Q1".into(), "Q1".into(), "Q2".into()],
+                depths: vec![1, 1, 2],
+            }],
+        )];
+        write_candidate_dump(&dir, "screen", &Value::from("reeval"), &records).unwrap();
+        let raw = std::fs::read(dir.join("candidate_dump.jsonl.gz")).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(&raw[..]), &mut text)
+            .unwrap();
+        let line: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let keys: Vec<&str> = line
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "split",
+                "update",
+                "episode_id",
+                "decision",
+                "frontier",
+                "scores",
+                "cosines",
+                "chosen",
+                "parents",
+                "depths",
+            ],
+            "the existing keys keep their names and their order"
+        );
+        assert_eq!(line["split"], "screen");
+        assert_eq!(line["update"], "reeval");
+        assert_eq!(line["episode_id"], "ep-1");
+        assert_eq!(line["decision"], 0);
+        assert_eq!(line["parents"], serde_json::json!(["Q1", "Q1", "Q2"]));
+        assert_eq!(line["depths"], serde_json::json!([1, 1, 2]));
+        let frontier = line["frontier"].as_array().unwrap();
+        let scores: Vec<f64> = line["scores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        let chosen = line["chosen"].as_u64().unwrap() as usize;
+        assert_eq!(frontier.len(), scores.len());
+        assert_eq!(line["parents"].as_array().unwrap().len(), frontier.len());
+        assert_eq!(line["depths"].as_array().unwrap().len(), frontier.len());
+        assert_eq!(frontier[chosen], "Q3");
+        assert_eq!(
+            scores[chosen],
+            scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

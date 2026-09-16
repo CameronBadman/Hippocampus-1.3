@@ -13,8 +13,8 @@ use std::path::Path;
 
 use hf_core::HfError;
 use hf_walk::{
-    DecisionBatch, DecisionItem, FeatureSet, RawV5, RelationalV6, Scored, Scorer, WalkResult,
-    STOP_DIM,
+    DecisionBatch, DecisionItem, FeatureSet, RawV5, RelationalV6, RelationalV6Prev, Scored, Scorer,
+    WalkResult, STOP_DIM,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,7 +37,8 @@ pub struct ModelConfig {
     pub greedy_prior: bool,
     #[serde(default = "default_prior_scale")]
     pub greedy_prior_scale: f64,
-    /// `"raw-v5"` (the Python layout) or `"relational-v6"` (the redesign).
+    /// `"raw-v5"` (the Python layout), `"relational-v6"` (the redesign) or
+    /// `"relational-v6-prev"` (the redesign with the previous-node channels).
     #[serde(default = "default_feature_set")]
     pub feature_set: String,
     #[serde(default)]
@@ -71,6 +72,7 @@ impl ModelConfig {
         match self.feature_set.as_str() {
             "raw-v5" => Ok(Box::new(RawV5)),
             "relational-v6" => Ok(Box::new(RelationalV6)),
+            "relational-v6-prev" => Ok(Box::new(RelationalV6Prev)),
             other => Err(HfError::Invalid(format!("unknown feature set {other:?}"))),
         }
     }

@@ -8,21 +8,27 @@
 //! are `exhaust` (stop on registration or an empty frontier) and `learned`
 //! (the stop head, consulted after each decision and before the expansion).
 //!
-//! Two feature sets are shipped behind one trait: `RawV5`, the Python
+//! Three feature sets are shipped behind one trait: `RawV5`, the Python
 //! candidate row (`[c, q, path_mean, parent]` + seven structure features, raw
-//! context and query embeddings, the `[cos, is-parent]` pair channel), and
+//! context and query embeddings, the `[cos, is-parent]` pair channel);
 //! `RelationalV6`, the redesign, in which no raw embedding coordinate enters
-//! any channel. The scorer is a trait so the walk is tested with stubs and
-//! driven by the libtorch model in `hf-model`.
+//! any channel; and `RelationalV6Prev`, that redesign with the
+//! selective-previous-nodes channels on the context token and the pair
+//! channel. A builder receives a `VisibleIndex` — the borrowed visible arrays
+//! of one episode — so no feature can be a function of what the sampler kept
+//! back. The scorer is a trait so the walk is tested with stubs and driven by
+//! the libtorch model in `hf-model`.
 
 pub mod features;
+pub mod visible;
 
 use std::collections::{HashMap, HashSet};
 
 use hf_core::HfError;
 use serde::Serialize;
 
-pub use features::{FeatureSet, RawV5, RelationalV6, STOP_DIM, STRUCTURE_DIM};
+pub use features::{FeatureSet, RawV5, RelationalV6, RelationalV6Prev, STOP_DIM, STRUCTURE_DIM};
+pub use visible::VisibleIndex;
 
 /// A node's index within one episode's subgraph.
 pub type Local = u32;
@@ -251,6 +257,10 @@ pub struct CandidateRecord {
     pub scores: Vec<f32>,
     pub cosines: Vec<f32>,
     pub chosen: usize,
+    /// The name of each frontier candidate's discovery parent, in `frontier` order.
+    pub parents: Vec<String>,
+    /// Each frontier candidate's depth, in `frontier` order.
+    pub depths: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -474,7 +484,12 @@ pub fn walk_batch(
             live.par_iter()
                 .map(|&i| {
                     let s = &states[i];
-                    let item = features.build(s.index, &s.frontier, &s.expanded, &s.parent_of);
+                    let item = features.build(
+                        VisibleIndex::new(s.index),
+                        &s.frontier,
+                        &s.expanded,
+                        &s.parent_of,
+                    );
                     let cosines: Vec<f32> = s
                         .frontier
                         .iter()
@@ -525,6 +540,12 @@ pub fn walk_batch(
                     scores: scores.clone(),
                     cosines: cosines.clone(),
                     chosen,
+                    parents: s
+                        .frontier
+                        .iter()
+                        .map(|e| s.index.names[e.parent as usize].clone())
+                        .collect(),
+                    depths: s.frontier.iter().map(|e| e.depth).collect(),
                 });
             }
             let entry = &s.frontier[chosen];
