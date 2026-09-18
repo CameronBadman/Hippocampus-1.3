@@ -7,7 +7,9 @@
 //! the checkpoints as the patterns and the names they resolved to,
 //! `training.clip_max_norm` as the clip in effect (absent = 1.0, null = none),
 //! every `updates.jsonl` row carries the greedy prior's `greedy_tau` after the
-//! step (`null` without the prior),
+//! step (`null` without the prior) and a `finite` flag, with a non-finite loss
+//! or gradient norm halting the run (skipped step, `instability.json`, exit 2,
+//! no `probe.json`),
 //! and the engine's build-time provenance — what the binary was built from,
 //! whether that tree was dirty, the binary's own digest — reaches
 //! `--engine-info` and every artifact, with a real run refused when the binary
@@ -765,6 +767,7 @@ fn greedy_tau_is_logged_on_every_update_row() {
                 "distinct_seen",
                 "seconds",
                 "greedy_tau",
+                "finite",
             ]
         );
     }
@@ -979,5 +982,156 @@ fn a_stale_binary_is_refused_unless_the_operator_allows_it() {
         serde_json::from_str(&std::fs::read_to_string(allowed.join("probe.json")).unwrap())
             .unwrap();
     assert_eq!(probe["engine_stale_allowed"], true);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `serde_json` writes a non-finite `f64` as `null`, so a NaN loss or gradient
+/// norm used to reach `updates.jsonl` as an absent-looking key while the
+/// optimiser carried the NaN into every weight and the run went on producing
+/// rows for ever. Part B's `clip_max_norm: null` arm has nothing else to bound
+/// it, so the engine now says on every row whether the update was finite and
+/// stops at the first that is not, before the step.
+#[test]
+fn a_non_finite_update_halts_the_run_before_the_step() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("non-finite");
+    let out = root.join("run");
+    let args: Vec<String> = [
+        "--config",
+        config().to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "6",
+        "--screen-episodes",
+        "3",
+        "--updates",
+        "4",
+        "--eval-every",
+        "2",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let o = run_env(&argv, &[("HF_TEST_INJECT_NAN_AT_UPDATE", "3")]);
+
+    // (1) the run stops at update 3, exit 2, saying which update it was
+    assert_eq!(o.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("band H: non-finite update 3"),
+        "stderr was {err}"
+    );
+
+    // (2) the rows: three of them, the first two finite, the third not — and
+    //     update 4 never happened
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(out.join("updates.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 3, "the run stops at the non-finite update");
+    for r in &rows[..2] {
+        assert_eq!(r["finite"], true, "{r}");
+        assert!(r["total"].as_f64().unwrap().is_finite());
+    }
+    assert_eq!(rows[2]["update"], 3);
+    assert_eq!(rows[2]["finite"], false);
+    // the very silence the flag exists for: the NaN total is `null` in the row
+    assert!(rows[2]["total"].is_null());
+
+    // (3) instability.json names the update, the fields and the run
+    let bad: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("instability.json")).unwrap())
+            .unwrap();
+    assert_eq!(bad["update"], 3);
+    assert_eq!(bad["last_finite_update"], 2);
+    assert_eq!(bad["model_seed"], 5);
+    assert_eq!(bad["evidence"], false);
+    assert_eq!(bad["injected"], true);
+    // the fixture config names no clip, which is 1.0
+    assert_eq!(bad["clip_max_norm"], 1.0);
+    let fields: Vec<&str> = bad["non_finite"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(fields.contains(&"total"), "{fields:?}");
+    assert!(fields.contains(&"grad_norm"), "{fields:?}");
+
+    // (4) no probe.json — nothing downstream may read this run as finished —
+    //     but the last finite weights are checkpointed, beside the marker a
+    //     launcher can test
+    assert!(!out.join("probe.json").exists());
+    assert!(out.join("halted").exists());
+    let ck: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("checkpoint-latest.json")).unwrap())
+            .unwrap();
+    assert_eq!(ck["update"], 3);
+
+    // (5) the halted directory is not a base to build on: a second run into it
+    //     refuses rather than truncating the log and finishing over the halt
+    let again = run_env(&argv, &[]);
+    assert_eq!(again.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("halted"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(!out.join("probe.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The control for the test above: a run that does not diverge says so on every
+/// row and writes none of the halt's artifacts.
+#[test]
+fn an_ordinary_run_says_every_update_was_finite() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("all-finite");
+    let out = root.join("run");
+    let o = run(&[
+        "--config",
+        config().to_str().unwrap(),
+        "--output",
+        out.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "6",
+        "--screen-episodes",
+        "3",
+        "--updates",
+        "4",
+        "--eval-every",
+        "4",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(out.join("updates.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    for r in &rows {
+        assert_eq!(r["finite"], true, "{r}");
+        for k in ["edge", "distance", "stop", "residual", "total", "grad_norm"] {
+            assert!(r[k].as_f64().expect(k).is_finite(), "{k} in {r}");
+        }
+    }
+    assert!(out.join("probe.json").exists());
+    assert!(!out.join("instability.json").exists());
+    assert!(!out.join("halted").exists());
     let _ = std::fs::remove_dir_all(&root);
 }

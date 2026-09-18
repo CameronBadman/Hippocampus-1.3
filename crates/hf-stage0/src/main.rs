@@ -7,7 +7,15 @@
 //! ancestor of the **foundation** repository's HEAD; the config must state
 //! `training_authorized: false`; an output path naming a holdout is refused;
 //! `--fixture` trains on the synthetic world, on the CPU, and labels its
-//! output `_FIXTURE` with `evidence: false`. Both repositories' heads are
+//! output `_FIXTURE` with `evidence: false`.
+//!
+//! Stability: every `updates.jsonl` row carries `finite`, and the first update
+//! whose losses or pre-clip gradient norm are not all finite skips its optimiser
+//! step, writes `instability.json` and a `halted` marker beside
+//! `checkpoint-latest`, and exits 2 — no `probe.json` is written, so nothing
+//! downstream reads the run as finished.
+//!
+//! Both repositories' heads are
 //! recorded (`git_head` the foundation's, `engine_head` this one's, read from
 //! the checkouts at RUN time), and beside them what the running binary was
 //! BUILT from: `engine_build_head`, `engine_build_dirty` and the binary's own
@@ -866,6 +874,32 @@ fn train(
     // config, still says which clip trained it)
     let clip_max_norm_value = clip.map(Value::from).unwrap_or(Value::Null);
     let output = args.output.as_ref().expect("required");
+    // A halted output is not a base to build on: its updates.jsonl carries the
+    // non-finite row and its checkpoint-latest is the state that produced it.
+    // Resuming (or re-running) into it would truncate the log past the halt and
+    // finish by writing probe.json beside instability.json — a directory that
+    // says both "finished" and "halted". The operator moves it aside first.
+    if output.join("halted").exists() {
+        return Err(HfError::BandH(format!(
+            "{} halted on a non-finite update (see instability.json); \
+             move it aside before running again",
+            output.display()
+        )));
+    }
+    // Test-only: `HF_TEST_INJECT_NAN_AT_UPDATE=n` multiplies update n's total
+    // loss by NaN, so the guard below is exercised without waiting for a real
+    // divergence. Honoured only under `--fixture`, whose artifacts are never
+    // evidence; a real run ignores the variable entirely.
+    let inject_nan_at: Option<u64> = if args.fixture {
+        std::env::var("HF_TEST_INJECT_NAN_AT_UPDATE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        None
+    };
+    if let Some(at) = inject_nan_at {
+        eprintln!("hf-stage0: HF_TEST_INJECT_NAN_AT_UPDATE={at} (fixture only; test only)");
+    }
     let mut started = hf_core::utc_now_iso();
     let head_at_start = provenance["git_head"]
         .as_str()
@@ -1010,6 +1044,7 @@ fn train(
             "training_authorized": false,
         })
     };
+    let mut last_finite: Option<u64> = None;
     for update in first_update..=updates {
         let batch_idx = rng.sample(d.train.len(), microbatch.min(d.train.len()));
         let batch: Vec<&hf_io::RealEpisode> = batch_idx.iter().map(|i| &d.train[*i]).collect();
@@ -1037,11 +1072,38 @@ fn train(
             )?
         };
         let out = model.forward_training(&walks)?;
-        let losses = walk_losses(&out, &walks, &refs, with_prior, loss_cfg)?;
+        let mut losses = walk_losses(&out, &walks, &refs, with_prior, loss_cfg)?;
+        if inject_nan_at == Some(update) {
+            // a multiply, not an add: the local gradient of `x + NaN` is 1, so
+            // only a product carries the NaN back into the parameters' grads
+            losses.total = f64::NAN * &losses.total;
+        }
         losses.total.backward();
         let grad_norm = clip_grad_norm(&model.vs, clip);
-        optimiser.step();
         let v = losses.values();
+        // serde_json writes a non-finite f64 as `null`, so a NaN or infinite
+        // loss term — or a pre-clip gradient norm that has already blown up —
+        // would be indistinguishable in updates.jsonl from a key that was never
+        // written. Every row says outright whether this update was finite, and
+        // the first that is not stops the run before the optimiser can carry the
+        // NaN into the weights (a `clip_max_norm: null` arm has nothing else to
+        // bound it).
+        let mut non_finite: Vec<&str> = Vec::new();
+        for (name, x) in ["edge", "distance", "stop", "residual", "total"]
+            .iter()
+            .zip(v.iter())
+        {
+            if !x.is_finite() {
+                non_finite.push(name);
+            }
+        }
+        if !grad_norm.is_finite() {
+            non_finite.push("grad_norm");
+        }
+        let finite = non_finite.is_empty();
+        if finite {
+            optimiser.step();
+        }
         let row = json!({
             "update": update,
             "edge": v[0], "distance": v[1], "stop": v[2], "residual": v[3], "total": v[4],
@@ -1054,11 +1116,64 @@ fn train(
             // after the step: the prior's temperature as this update left it
             // (null when the model has no greedy prior)
             "greedy_tau": model.greedy_tau(),
+            // every loss term and the pre-clip norm above are finite numbers,
+            // and the optimiser stepped; false means the step was SKIPPED and
+            // this is the run's last row
+            "finite": finite,
         });
         log.write_all(row.to_string().as_bytes())
             .and_then(|_| log.write_all(b"\n"))
             .and_then(|_| log.flush())
             .map_err(|e| HfError::Invalid(e.to_string()))?;
+        if !finite {
+            // The weights are the last finite ones — this update's step was
+            // skipped — but the sampler and train_draws have both consumed this
+            // update's batch, so the checkpoint says `update` and a resume would
+            // go on at `update + 1`. That is why `halted` is written beside it:
+            // the state is sound, the run is not to be continued blind.
+            let meta = checkpoint_meta(
+                update,
+                &rng,
+                (&evaluations, &evaluations_heldout, &evaluations_screen2),
+                &train_draws,
+                elapsed_before + t0.elapsed().as_secs_f64(),
+                &started,
+                &resumed_from,
+            );
+            latest.write(model, Some(&optimiser), &meta)?;
+            let instability = json!({
+                "record_kind": format!("hippo13_instability_v1{}", if args.fixture { "_FIXTURE" } else { "" }),
+                "evidence": !args.fixture,
+                "update": update,
+                "non_finite": non_finite,
+                // the last finite update SEEN BY THIS PROCESS; null when the
+                // first update it ran was the one that blew up — `first_update`
+                // tells a resumed run's null from a fresh run's
+                "last_finite_update": last_finite,
+                "first_update": first_update,
+                "model_seed": args.model_seed.expect("required"),
+                "clip_max_norm": clip_max_norm_value,
+                "family": d.family,
+                "halted_at": hf_core::utc_now_iso(),
+                "checkpoint_latest_update": update,
+                "injected": inject_nan_at == Some(update),
+            });
+            std::fs::write(
+                output.join("instability.json"),
+                hf_core::files::python_json_pretty(&instability),
+            )
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+            // the marker a launcher can test: no probe.json was written, so a
+            // watcher that only asks "is probe.json there?" would restart this
+            // seed for ever
+            std::fs::write(
+                output.join("halted"),
+                format!("non-finite update {update}: {}\n", non_finite.join(" ")),
+            )
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+            return Err(HfError::BandH(format!("non-finite update {update}")));
+        }
+        last_finite = Some(update);
         if update % args.eval_every == 0 || update == updates {
             let ev = eval::evaluate(model, &d.screen, &d.embeddings, d.dim, false)?;
             eval::write_evaluation_rows(output, "screen", &Value::from(update), &ev.rows)?;
