@@ -6,7 +6,9 @@
 //! `MultiheadAttention` module — with PyTorch's semantics: the per-head
 //! additive pair bias, a float key-padding mask of `-inf`, `nan_to_num` on
 //! fully masked rows. The optimiser is a hand-written AdamW whose moments are
-//! saved and loaded, so a resumed run is exact.
+//! saved and loaded, so a resumed run is exact, and whose weight decay can be
+//! waived for named parameters — `training.decay_exempt`, a list of globs over
+//! the parameter names, empty in every config written before it existed.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -892,6 +894,32 @@ pub fn clip_grad_norm(vs: &nn::VarStore, max_norm: f64) -> f64 {
     })
 }
 
+/// A simple glob over a parameter's FULL name, both ends anchored: `*` stands
+/// for any run of characters, the dots included, and every other character is
+/// literal. So `greedy_tau` matches that name and nothing else, `*bias` matches
+/// every name ENDING in `bias` (`…out_proj.bias` and `…in_proj_bias` alike, but
+/// not `blocks.0.context_bias.weight`), and `*norm*.weight` matches every
+/// LayerNorm gain (`candidate_norm.weight` as well as `blocks.0.norm_ff.weight`
+/// — note that `*.norm*.weight`, with the dot, misses the first).
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let mut rest = match name.strip_prefix(parts[0]) {
+        Some(r) => r,
+        None => return false,
+    };
+    let last = parts.len() - 1;
+    for part in &parts[1..last] {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(parts[last])
+}
+
 /// AdamW as PyTorch applies it (decoupled decay first, then the Adam step),
 /// with its moments held here so they can be saved and restored exactly.
 pub struct AdamW {
@@ -900,7 +928,9 @@ pub struct AdamW {
     pub betas: (f64, f64),
     pub eps: f64,
     pub step_count: i64,
-    /// Names exempt from weight decay (`tau`, norms, biases, when asked).
+    /// Parameter names exempt from weight decay (`greedy_tau`, the LayerNorm
+    /// gains, the biases — when asked). Empty unless `set_decay_exempt` fills
+    /// it from the config's `training.decay_exempt`.
     pub no_decay: Vec<String>,
     params: Vec<(String, Tensor)>,
     m: Vec<Tensor>,
@@ -928,6 +958,29 @@ impl AdamW {
             m,
             v,
         }
+    }
+
+    /// Fill `no_decay` from `patterns` (`training.decay_exempt` in the config),
+    /// resolved against THIS optimiser's own parameter names — the ones `step`
+    /// consults, already filtered to the trainable ones. Returns the matched
+    /// names in the optimiser's order and the patterns that matched nothing,
+    /// which the runner records and prints: a pattern matching nothing is not
+    /// an error (a config may name `greedy_tau` for a model built without the
+    /// prior), but it is never silent.
+    pub fn set_decay_exempt(&mut self, patterns: &[String]) -> (Vec<String>, Vec<String>) {
+        let matched: Vec<String> = self
+            .params
+            .iter()
+            .filter(|(name, _)| patterns.iter().any(|p| glob_match(p, name)))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let unmatched: Vec<String> = patterns
+            .iter()
+            .filter(|p| !self.params.iter().any(|(name, _)| glob_match(p, name)))
+            .cloned()
+            .collect();
+        self.no_decay = matched.clone();
+        (matched, unmatched)
     }
 
     pub fn zero_grad(&mut self) {

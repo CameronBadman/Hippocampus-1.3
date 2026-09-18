@@ -157,6 +157,30 @@ fn print_capacity(config_path: &Path, dim: i64) -> Result<(), HfError> {
     Ok(())
 }
 
+/// `training.decay_exempt`: the patterns whose matching parameters AdamW does
+/// not decay (`hf_model::glob_match` on the parameter's full name). Absent —
+/// every config written before the switch existed — is the empty list, which
+/// decays everything exactly as the Python runner's single AdamW group does. A
+/// value that is not a list of strings is a broken config, refused here.
+fn decay_exempt_patterns(training: &Value) -> Result<Vec<String>, HfError> {
+    match training.get("decay_exempt") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    HfError::Invalid(format!(
+                        "training.decay_exempt: {v} is not a pattern string"
+                    ))
+                })
+            })
+            .collect(),
+        Some(other) => Err(HfError::Invalid(format!(
+            "training.decay_exempt must be a list of patterns, not {other}"
+        ))),
+    }
+}
+
 /// The rule a run is governed by: the config names it. The v1 rule is the
 /// default the runner has always written, kept for a config that names none.
 fn governed_by(config: &Value) -> Value {
@@ -724,6 +748,32 @@ fn train(
         ..Default::default()
     };
     let mut optimiser = AdamW::new(&model.vs, lr, weight_decay);
+    let exempt_patterns = decay_exempt_patterns(training)?;
+    let (exempt_names, exempt_unmatched) = optimiser.set_decay_exempt(&exempt_patterns);
+    if !exempt_patterns.is_empty() {
+        println!(
+            "[{}] weight decay {weight_decay} exempts {} of {} parameters: {}",
+            d.family,
+            exempt_names.len(),
+            model.vs.trainable_variables().len(),
+            exempt_names.join(" "),
+        );
+    }
+    if !exempt_unmatched.is_empty() {
+        println!(
+            "[{}] training.decay_exempt patterns matching no parameter: {}",
+            d.family,
+            exempt_unmatched.join(" "),
+        );
+    }
+    // the set the run actually used, beside the patterns that produced it: the
+    // final checkpoint's metadata carries no config, so the patterns would be
+    // unrecoverable from it otherwise
+    let decay_exempt = json!({
+        "patterns": exempt_patterns,
+        "parameters": exempt_names,
+        "unmatched_patterns": exempt_unmatched,
+    });
     let output = args.output.as_ref().expect("required");
     let mut started = hf_core::utc_now_iso();
     let head_at_start = provenance["git_head"]
@@ -850,6 +900,7 @@ fn train(
             "preregistration_commit": args.preregistration_commit,
             "config": config,
             "model_config": model_config_value,
+            "decay_exempt": decay_exempt,
             "sampler_rng": rng.state(),
             "evaluations": evals.0,
             "evaluations_heldout": evals.1,
@@ -984,6 +1035,7 @@ fn train(
         "device": if model.device() == Device::Cpu { "cpu" } else { "cuda" },
         "sampler": d.sampler.as_value(),
         "config": config,
+        "decay_exempt": decay_exempt,
         "graph_manifest": d.graph_manifest,
         "embedding_manifest": d.embedding_manifest,
         "capacity": capacity,
@@ -1023,6 +1075,7 @@ fn train(
         let meta = json!({
             "record_kind": "hippo13_checkpoint_v1",
             "config": model_config_value,
+            "decay_exempt": decay_exempt,
             "seed": args.model_seed.expect("required"),
             "train_draws": train_draws,
             "update": updates,
