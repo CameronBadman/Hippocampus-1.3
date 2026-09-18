@@ -181,6 +181,28 @@ fn decay_exempt_patterns(training: &Value) -> Result<Vec<String>, HfError> {
     }
 }
 
+/// `training.clip_max_norm`: the gradient-norm clip applied to every update
+/// (`hf_model::clip_grad_norm`, `torch.nn.utils.clip_grad_norm_`'s rule).
+/// ABSENT — every config written before the key existed — is 1.0, the constant
+/// the runner passed unconditionally, so every existing config trains exactly
+/// as it did. An explicit `null` is NO clipping: the pre-clip norm is still
+/// computed and still logged in `updates.jsonl`, nothing is scaled. Anything
+/// else must be a finite, strictly positive number; a negative, a zero, a
+/// string, a list is a broken config, refused here rather than rounded into
+/// some default.
+fn clip_max_norm(training: &Value) -> Result<Option<f64>, HfError> {
+    match training.get("clip_max_norm") {
+        None => Ok(Some(1.0)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => match other.as_f64() {
+            Some(m) if m.is_finite() && m > 0.0 => Ok(Some(m)),
+            _ => Err(HfError::Invalid(format!(
+                "training.clip_max_norm must be a positive number or null, not {other}"
+            ))),
+        },
+    }
+}
+
 /// The rule a run is governed by: the config names it. The v1 rule is the
 /// default the runner has always written, kept for a config that names none.
 fn governed_by(config: &Value) -> Value {
@@ -774,6 +796,20 @@ fn train(
         "parameters": exempt_names,
         "unmatched_patterns": exempt_unmatched,
     });
+    let clip = clip_max_norm(training)?;
+    match clip {
+        None => println!(
+            "[{}] training.clip_max_norm: null — gradients are not clipped; \
+             the pre-clip norm is still computed and logged",
+            d.family
+        ),
+        Some(m) if m != 1.0 => println!("[{}] gradient clip {m}", d.family),
+        Some(_) => {}
+    }
+    // null or the number in effect, recorded so a reader never has to infer an
+    // absent key's meaning (and so the final checkpoint, which carries no
+    // config, still says which clip trained it)
+    let clip_max_norm_value = clip.map(Value::from).unwrap_or(Value::Null);
     let output = args.output.as_ref().expect("required");
     let mut started = hf_core::utc_now_iso();
     let head_at_start = provenance["git_head"]
@@ -901,6 +937,7 @@ fn train(
             "config": config,
             "model_config": model_config_value,
             "decay_exempt": decay_exempt,
+            "clip_max_norm": clip_max_norm_value,
             "sampler_rng": rng.state(),
             "evaluations": evals.0,
             "evaluations_heldout": evals.1,
@@ -943,7 +980,7 @@ fn train(
         let out = model.forward_training(&walks)?;
         let losses = walk_losses(&out, &walks, &refs, with_prior, loss_cfg)?;
         losses.total.backward();
-        let grad_norm = clip_grad_norm(&model.vs, 1.0);
+        let grad_norm = clip_grad_norm(&model.vs, clip);
         optimiser.step();
         let v = losses.values();
         let row = json!({
@@ -1036,6 +1073,7 @@ fn train(
         "sampler": d.sampler.as_value(),
         "config": config,
         "decay_exempt": decay_exempt,
+        "clip_max_norm": clip_max_norm_value,
         "graph_manifest": d.graph_manifest,
         "embedding_manifest": d.embedding_manifest,
         "capacity": capacity,
@@ -1076,6 +1114,7 @@ fn train(
             "record_kind": "hippo13_checkpoint_v1",
             "config": model_config_value,
             "decay_exempt": decay_exempt,
+            "clip_max_norm": clip_max_norm_value,
             "seed": args.model_seed.expect("required"),
             "train_draws": train_draws,
             "update": updates,

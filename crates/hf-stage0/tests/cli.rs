@@ -4,7 +4,8 @@
 //! pin, doctored probe, flags without a re-evaluation) exit 2;
 //! `--print-capacity` builds the config's model on the CPU and prints what it
 //! would train, reading no data; `training.decay_exempt` reaches the probe and
-//! the checkpoints as the patterns and the names they resolved to.
+//! the checkpoints as the patterns and the names they resolved to, and
+//! `training.clip_max_norm` as the clip in effect (absent = 1.0, null = none).
 
 use std::path::PathBuf;
 
@@ -472,5 +473,195 @@ fn the_decay_exempt_set_round_trips_into_probe_and_the_checkpoints() {
     let o = resume(&named);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(read(out.join("probe.json"))["decay_exempt"], *exempt);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `training.clip_max_norm` — the gradient-norm clip every update applies —
+/// reaches `probe.json` and both checkpoint metadata blocks as the value in
+/// effect, and is the value the training step actually uses. ABSENT is 1.0, the
+/// constant the runner passed before the key existed, and is RECORDED as 1.0 so
+/// no reader has to infer it; `null` is no clipping at all, and the pre-clip
+/// norm is still computed and still logged in `updates.jsonl`; a malformed value
+/// is refused; a value changed across a resume is band H.
+#[test]
+fn the_clip_max_norm_round_trips_into_probe_and_the_checkpoints() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("clip-max-norm");
+    std::fs::create_dir_all(&root).unwrap();
+    let stock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config()).unwrap()).unwrap();
+    let with = |clip: serde_json::Value, name: &str| -> PathBuf {
+        let mut cfg = stock.clone();
+        cfg["training"]["clip_max_norm"] = clip;
+        let p = root.join(format!("training-config.{name}.json"));
+        std::fs::write(&p, serde_json::to_string(&cfg).unwrap()).unwrap();
+        p
+    };
+    let base = |cfg: &PathBuf, o: &PathBuf| -> Vec<String> {
+        vec![
+            "--config".into(),
+            cfg.to_string_lossy().into(),
+            "--output".into(),
+            o.to_string_lossy().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--fixture".into(),
+            "--train-episodes".into(),
+            "6".into(),
+            "--screen-episodes".into(),
+            "3".into(),
+            "--updates".into(),
+            "2".into(),
+            "--save-checkpoint".into(),
+            "--checkpoint-every".into(),
+            "1".into(),
+        ]
+    };
+    let read = |p: PathBuf| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    };
+    let first_row = |o: &PathBuf| -> serde_json::Value {
+        let log = std::fs::read_to_string(o.join("updates.jsonl")).unwrap();
+        serde_json::from_str(log.lines().next().unwrap()).unwrap()
+    };
+    let train = |cfg: &PathBuf, o: &PathBuf| {
+        let args = base(cfg, o);
+        let out = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // the three configurations: the key absent, the key null, the key 10
+    let null_cfg = with(serde_json::Value::Null, "null");
+    let ten_cfg = with(serde_json::json!(10.0), "ten");
+    let absent = root.join("absent");
+    let none = root.join("none");
+    let ten = root.join("ten");
+    train(&config(), &absent);
+    train(&null_cfg, &none);
+    train(&ten_cfg, &ten);
+
+    // (1) the value in effect is recorded in all three places, the absent key
+    //     as the 1.0 it means rather than as nothing at all
+    for (out, want) in [
+        (&absent, serde_json::json!(1.0)),
+        (&none, serde_json::Value::Null),
+        (&ten, serde_json::json!(10.0)),
+    ] {
+        for file in ["probe.json", "checkpoint.json", "checkpoint-latest.json"] {
+            let v = read(out.join(file));
+            assert_eq!(
+                v.get("clip_max_norm"),
+                Some(&want),
+                "{}/{file}",
+                out.display()
+            );
+        }
+    }
+
+    // (2) the pre-clip norm is the same number in all three runs' first update —
+    //     the clip never changes what is logged, `null` included — and it sits
+    //     between the two clips, so 1.0 fires and 10 does not
+    let norm = first_row(&absent)["grad_norm"].as_f64().unwrap();
+    assert!(
+        norm > 1.0 && norm < 10.0,
+        "the premise of this test: the fixture's first pre-clip norm {norm} \
+         must be above 1.0 and below 10"
+    );
+    for out in [&none, &ten] {
+        assert_eq!(
+            first_row(out)["grad_norm"].as_f64(),
+            Some(norm),
+            "{}: the pre-clip norm must not depend on the clip",
+            out.display()
+        );
+        assert_eq!(first_row(out)["total"], first_row(&absent)["total"]);
+    }
+
+    // (3) and the value is USED, not merely recorded: with the norm above 1.0
+    //     the clipped run reaches different weights, and with it below 10 the
+    //     clip of 10 cannot fire, so that run's weights are the unclipped ones
+    let weights = |o: &PathBuf| std::fs::read(o.join("checkpoint.safetensors")).unwrap();
+    assert_ne!(
+        weights(&absent),
+        weights(&none),
+        "a clip of 1.0 below the norm must move the run off the unclipped path"
+    );
+    assert_eq!(
+        weights(&ten),
+        weights(&none),
+        "a clip above the norm is no clip at all"
+    );
+
+    // (4) a malformed value is a broken config, not a silent default
+    for bad in [
+        serde_json::json!(-1.0),
+        serde_json::json!(0),
+        serde_json::json!("1.0"),
+        serde_json::json!([1.0]),
+        serde_json::json!(true),
+    ] {
+        let cfg = with(bad.clone(), "bad");
+        let args = base(&cfg, &root.join("bad"));
+        let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(o.status.code(), Some(2), "{bad} must be refused");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("clip_max_norm"));
+    }
+
+    // and `--print-capacity` is untouched by the key: it trains nothing, so it
+    // reads no training block of this kind — the same bytes either way
+    let with_key = run(&[
+        "--print-capacity",
+        "8",
+        "--config",
+        ten_cfg.to_str().unwrap(),
+    ]);
+    let without = run(&[
+        "--print-capacity",
+        "8",
+        "--config",
+        config().to_str().unwrap(),
+    ]);
+    assert!(with_key.status.success() && without.status.success());
+    assert_eq!(with_key.stdout, without.stdout);
+
+    // (5) the clip lives in the config: a resume under the same config carries
+    //     it, and a resume that changes it — an absent key against an explicit
+    //     null included, which are different configs — is band H
+    let resume = |cfg_path: &PathBuf, o: &PathBuf| -> std::process::Output {
+        let mut args = base(cfg_path, o);
+        let updates = args.iter().position(|a| a == "--updates").unwrap();
+        args[updates + 1] = "3".into();
+        let latest = o.join("checkpoint-latest.json");
+        args.extend(["--resume", latest.to_str().unwrap()].map(String::from));
+        run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    for (cfg, out) in [(&config(), &none), (&null_cfg, &absent), (&ten_cfg, &none)] {
+        let o = resume(cfg, out);
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "a changed clip must not resume: {} into {}",
+            cfg.display(),
+            out.display()
+        );
+        assert!(String::from_utf8_lossy(&o.stderr).contains("config differs"));
+    }
+    let o = resume(&null_cfg, &none);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        read(none.join("probe.json"))["clip_max_norm"],
+        serde_json::Value::Null
+    );
+    assert_eq!(read(none.join("probe.json"))["updates"], 3);
+    let o = resume(&config(), &absent);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(read(absent.join("probe.json"))["clip_max_norm"], 1.0);
     let _ = std::fs::remove_dir_all(&root);
 }

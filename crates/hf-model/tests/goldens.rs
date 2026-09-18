@@ -406,7 +406,7 @@ fn losses_and_the_gradient_norm_match_python() {
     let mut opt = AdamW::new(&model.vs, 1e-3, 0.01);
     opt.zero_grad();
     penalty.total.backward();
-    let norm = clip_grad_norm(&model.vs, 1.0);
+    let norm = clip_grad_norm(&model.vs, Some(1.0));
     let want = g["grad_norm_penalty"].as_f64().unwrap();
     assert!(
         (norm - want).abs() < 1e-2 * (1.0 + want),

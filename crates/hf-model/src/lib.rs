@@ -8,7 +8,10 @@
 //! fully masked rows. The optimiser is a hand-written AdamW whose moments are
 //! saved and loaded, so a resumed run is exact, and whose weight decay can be
 //! waived for named parameters — `training.decay_exempt`, a list of globs over
-//! the parameter names, empty in every config written before it existed.
+//! the parameter names, empty in every config written before it existed. The
+//! gradient clip is likewise a value and no longer a constant —
+//! `training.clip_max_norm`, absent meaning the 1.0 every run so far used —
+//! and the pre-clip norm it returns is computed whether or not it clips.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -868,8 +871,15 @@ pub fn walk_losses(
     })
 }
 
-/// `torch.nn.utils.clip_grad_norm_`: returns the pre-clip total norm.
-pub fn clip_grad_norm(vs: &nn::VarStore, max_norm: f64) -> f64 {
+/// `torch.nn.utils.clip_grad_norm_`: returns the pre-clip total norm, having
+/// scaled every gradient by `max_norm / (norm + 1e-6)` when that is below one.
+///
+/// `None` is `training.clip_max_norm: null` — no clipping at all. The total
+/// norm is still computed and returned, by the same reduction and in the same
+/// order, so a run without a clip still logs the true norm in `updates.jsonl`;
+/// nothing is scaled. `Some(1.0)` is what the runner passed unconditionally
+/// before the key existed, and is what an absent key still means.
+pub fn clip_grad_norm(vs: &nn::VarStore, max_norm: Option<f64>) -> f64 {
     tch::no_grad(|| {
         let vars = vs.trainable_variables();
         let norms: Vec<Tensor> = vars
@@ -881,12 +891,14 @@ pub fn clip_grad_norm(vs: &nn::VarStore, max_norm: f64) -> f64 {
             return 0.0;
         }
         let total = f64::try_from(Tensor::stack(&norms, 0).norm()).unwrap_or(0.0);
-        let coef = max_norm / (total + 1e-6);
-        if coef < 1.0 {
-            for v in &vars {
-                let mut g = v.grad();
-                if g.defined() {
-                    let _ = g.g_mul_scalar_(coef);
+        if let Some(max_norm) = max_norm {
+            let coef = max_norm / (total + 1e-6);
+            if coef < 1.0 {
+                for v in &vars {
+                    let mut g = v.grad();
+                    if g.defined() {
+                        let _ = g.g_mul_scalar_(coef);
+                    }
                 }
             }
         }
