@@ -6,6 +6,8 @@
 //! would train, reading no data; `training.decay_exempt` reaches the probe and
 //! the checkpoints as the patterns and the names they resolved to,
 //! `training.clip_max_norm` as the clip in effect (absent = 1.0, null = none),
+//! every `updates.jsonl` row carries the greedy prior's `greedy_tau` after the
+//! step (`null` without the prior),
 //! and the engine's build-time provenance — what the binary was built from,
 //! whether that tree was dirty, the binary's own digest — reaches
 //! `--engine-info` and every artifact, with a real run refused when the binary
@@ -676,6 +678,120 @@ fn the_clip_max_norm_round_trips_into_probe_and_the_checkpoints() {
     let o = resume(&config(), &absent);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(read(absent.join("probe.json"))["clip_max_norm"], 1.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `greedy_tau` — the greedy prior's temperature as the optimiser step left it
+/// — is logged on every `updates.jsonl` row, so a run's tau trajectory can be
+/// read from the log rather than reconstructed from a checkpoint's tensors: a
+/// finite number when the config asks for the prior, `null` when it does not.
+/// The row RECORDS the step, it does not enter it: the keys that were there
+/// keep their order with the new one last, and the training step's own golden —
+/// the digest hf-model's `adamw` test measures after one and two steps — is
+/// untouched, since reading a tensor after `step()` cannot move it.
+#[test]
+fn greedy_tau_is_logged_on_every_update_row() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    // the scale is named in the config rather than left to hf-model's default,
+    // so the bound below tests this run and not that default
+    const SCALE: f64 = 10.0;
+    let root = tmp("greedy-tau");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config()).unwrap()).unwrap();
+    cfg["model"]["greedy_prior"] = serde_json::json!(true);
+    cfg["model"]["greedy_prior_scale"] = serde_json::json!(SCALE);
+    let prior_cfg = root.join("training-config.prior.json");
+    std::fs::write(&prior_cfg, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+    let train = |cfg: &PathBuf, o: &PathBuf, updates: &str| {
+        let out = run(&[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--output",
+            o.to_str().unwrap(),
+            "--model-seed",
+            "5",
+            "--fixture",
+            "--train-episodes",
+            "6",
+            "--screen-episodes",
+            "3",
+            "--updates",
+            updates,
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let rows = |o: &PathBuf| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(o.join("updates.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let with = root.join("prior");
+    let without = root.join("no-prior");
+    train(&prior_cfg, &with, "4");
+    train(&config(), &without, "2");
+    let prior_rows = rows(&with);
+    let plain_rows = rows(&without);
+
+    // (1) both ways: every row carries the key, LAST, with the keys that were
+    //     there before it unchanged and in their order
+    assert_eq!(prior_rows.len(), 4);
+    assert_eq!(plain_rows.len(), 2);
+    for r in prior_rows.iter().chain(plain_rows.iter()) {
+        let keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "update",
+                "edge",
+                "distance",
+                "stop",
+                "residual",
+                "total",
+                "grad_norm",
+                "registered",
+                "expansions",
+                "draws",
+                "distinct_seen",
+                "seconds",
+                "greedy_tau",
+            ]
+        );
+    }
+
+    // (2) with the prior: a finite tau on every row, at or below the scale it
+    //     was initialised to by the time the first update logs it, and moving
+    //     every update — a constant column would mean a value read once, or the
+    //     initialisation read instead of the parameter
+    let taus: Vec<f64> = prior_rows
+        .iter()
+        .map(|r| r["greedy_tau"].as_f64().expect("a number with the prior"))
+        .collect();
+    assert!(taus.iter().all(|t| t.is_finite()), "{taus:?}");
+    assert!(
+        taus[0] <= SCALE + 1e-6,
+        "row 1 tau {} is above the initial {SCALE}",
+        taus[0]
+    );
+    for w in taus.windows(2) {
+        assert!((w[1] - w[0]).abs() > 0.0, "tau did not move: {taus:?}");
+    }
+
+    // (3) without the prior there is no tensor to read: the key is present and
+    //     null, never absent and never a stand-in number
+    for r in &plain_rows {
+        assert_eq!(r["greedy_tau"], serde_json::Value::Null);
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

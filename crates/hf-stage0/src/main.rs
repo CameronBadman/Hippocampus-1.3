@@ -1051,6 +1051,9 @@ fn train(
             "draws": train_draws.values().sum::<u64>(),
             "distinct_seen": train_draws.len(),
             "seconds": ((elapsed_before + t0.elapsed().as_secs_f64()) * 10.0).round() / 10.0,
+            // after the step: the prior's temperature as this update left it
+            // (null when the model has no greedy prior)
+            "greedy_tau": model.greedy_tau(),
         });
         log.write_all(row.to_string().as_bytes())
             .and_then(|_| log.write_all(b"\n"))
