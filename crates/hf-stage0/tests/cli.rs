@@ -4,8 +4,12 @@
 //! pin, doctored probe, flags without a re-evaluation) exit 2;
 //! `--print-capacity` builds the config's model on the CPU and prints what it
 //! would train, reading no data; `training.decay_exempt` reaches the probe and
-//! the checkpoints as the patterns and the names they resolved to, and
-//! `training.clip_max_norm` as the clip in effect (absent = 1.0, null = none).
+//! the checkpoints as the patterns and the names they resolved to,
+//! `training.clip_max_norm` as the clip in effect (absent = 1.0, null = none),
+//! and the engine's build-time provenance — what the binary was built from,
+//! whether that tree was dirty, the binary's own digest — reaches
+//! `--engine-info` and every artifact, with a real run refused when the binary
+//! is not the checkout's.
 
 use std::path::PathBuf;
 
@@ -22,10 +26,16 @@ fn config() -> PathBuf {
 }
 
 fn run(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_hf-stage0"))
-        .args(args)
-        .output()
-        .unwrap()
+    run_env(args, &[])
+}
+
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hf-stage0"));
+    command.args(args);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    command.output().unwrap()
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -201,6 +211,9 @@ fn fixture_training_and_reevaluation_write_the_readers_artifacts() {
     );
     args = base(&root.join("real"));
     args.retain(|a| a != "--fixture");
+    // --allow-stale-engine passes the engine gate, which stands before the pin
+    // and refuses the binary these tests are built from (a dirty tree)
+    args.push("--allow-stale-engine".into());
     let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("preregistration-commit"));
@@ -663,5 +676,192 @@ fn the_clip_max_norm_round_trips_into_probe_and_the_checkpoints() {
     let o = resume(&config(), &absent);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(read(absent.join("probe.json"))["clip_max_norm"], 1.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The engine's provenance is what the BINARY was built from, not what `git`
+/// says in the checkout beside it at run time: a release binary built at one
+/// commit used to stamp every artifact with whatever HEAD had become. Both are
+/// reported now, with the binary's own digest to tie an artifact to the bytes
+/// that wrote it.
+#[test]
+fn engine_info_reports_the_build_the_binary_came_from() {
+    let o = run(&["--engine-info"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let info: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&o.stdout)).unwrap();
+    for key in [
+        "engine_build_head",
+        "engine_build_dirty",
+        "engine_build_time",
+        "engine_binary_sha256",
+    ] {
+        assert!(info.get(key).is_some(), "{key} missing from --engine-info");
+    }
+    // the build script's values, as this test crate was given them too
+    assert_eq!(info["engine_build_head"], env!("ENGINE_BUILD_HEAD"));
+    assert_eq!(
+        info["engine_build_dirty"],
+        env!("ENGINE_BUILD_DIRTY") == "true"
+    );
+    assert_eq!(info["engine_build_time"], env!("ENGINE_BUILD_TIME"));
+    let head = info["engine_build_head"].as_str().unwrap();
+    assert!(
+        head == "unknown" || (head.len() == 40 && head.chars().all(|c| c.is_ascii_hexdigit())),
+        "{head} is neither a commit nor unknown"
+    );
+    // the digest is of this very binary
+    let (_, digest) =
+        hf_core::sha256_file(std::path::Path::new(env!("CARGO_BIN_EXE_hf-stage0"))).unwrap();
+    assert_eq!(info["engine_binary_sha256"], digest);
+    // engine_head keeps its meaning: the checkout's HEAD at run time
+    assert!(info["engine_head"].is_string());
+}
+
+/// Every artifact a run writes carries the same provenance, so a reader holding
+/// only a probe or a checkpoint can tell which binary produced it.
+#[test]
+fn a_run_stamps_every_artifact_with_the_binarys_provenance() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("provenance");
+    let out = root.join("run");
+    let args: Vec<String> = vec![
+        "--config".into(),
+        config().to_string_lossy().into(),
+        "--output".into(),
+        out.to_string_lossy().into(),
+        "--model-seed".into(),
+        "5".into(),
+        "--fixture".into(),
+        "--train-episodes".into(),
+        "8".into(),
+        "--screen-episodes".into(),
+        "4".into(),
+        "--updates".into(),
+        "2".into(),
+        "--eval-every".into(),
+        "2".into(),
+        "--save-checkpoint".into(),
+        "--checkpoint-every".into(),
+        "2".into(),
+    ];
+    let o = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let (_, digest) =
+        hf_core::sha256_file(std::path::Path::new(env!("CARGO_BIN_EXE_hf-stage0"))).unwrap();
+    let read = |p: PathBuf| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}")))
+            .unwrap()
+    };
+    // probe, both checkpoint metas, and a re-evaluation's reeval.json
+    let re = root.join("reeval");
+    let mut re_args: Vec<String> = args
+        .iter()
+        .take_while(|a| *a != "--updates")
+        .cloned()
+        .collect();
+    re_args[3] = re.to_string_lossy().into();
+    re_args.extend(
+        [
+            "--reevaluate-checkpoint",
+            out.join("checkpoint.json").to_str().unwrap(),
+        ]
+        .map(String::from),
+    );
+    let o = run(&re_args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for artifact in [
+        out.join("probe.json"),
+        out.join("checkpoint.json"),
+        out.join("checkpoint-latest.json"),
+        re.join("reeval.json"),
+    ] {
+        let v = read(artifact.clone());
+        let what = artifact.display();
+        assert_eq!(v["engine_build_head"], env!("ENGINE_BUILD_HEAD"), "{what}");
+        assert_eq!(
+            v["engine_build_dirty"],
+            env!("ENGINE_BUILD_DIRTY") == "true",
+            "{what}"
+        );
+        assert_eq!(v["engine_binary_sha256"], digest, "{what}");
+        assert_eq!(v["engine_stale_allowed"], false, "{what}");
+        // the old key is kept, and still means the checkout at run time
+        assert!(v["engine_head"].is_string(), "{what}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A binary that is not the checkout's is refused before anything is read: the
+/// artifacts it would write would name a commit whose code never ran.
+/// `HF_TEST_ENGINE_HEAD_OVERRIDE` moves the run-time head out of step with the
+/// build's (a debug build only; the release binary ignores it).
+#[test]
+fn a_stale_binary_is_refused_unless_the_operator_allows_it() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let root = tmp("stale");
+    let elsewhere = "0000000000000000000000000000000000000000";
+    let base = |o: &PathBuf| -> Vec<String> {
+        vec![
+            "--config".into(),
+            config().to_string_lossy().into(),
+            "--output".into(),
+            o.to_string_lossy().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--train-episodes".into(),
+            "8".into(),
+            "--screen-episodes".into(),
+            "4".into(),
+            "--updates".into(),
+            "2".into(),
+        ]
+    };
+    let env = [("HF_TEST_ENGINE_HEAD_OVERRIDE", elsewhere)];
+    // a real run: band H, and nothing further is attempted
+    let args = base(&root.join("real"));
+    let o = run_env(&args.iter().map(String::as_str).collect::<Vec<_>>(), &env);
+    assert_eq!(o.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("band H"), "{err}");
+    assert!(err.contains("stale engine binary"), "{err}");
+    assert!(err.contains("--allow-stale-engine"), "{err}");
+    assert!(!root.join("real").exists(), "nothing was written");
+    // with the flag the gate is passed, and the next gate — the pin — speaks
+    let mut args = base(&root.join("real"));
+    args.push("--allow-stale-engine".into());
+    let o = run_env(&args.iter().map(String::as_str).collect::<Vec<_>>(), &env);
+    assert_eq!(o.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("stale engine binary"), "{err}");
+    assert!(err.contains("preregistration-commit"), "{err}");
+    // the fixture world is exempt, as it is from every governance gate: it is
+    // never evidence, and it says which binary ran all the same
+    let out = root.join("fixture");
+    let mut args = base(&out);
+    args.push("--fixture".into());
+    let o = run_env(&args.iter().map(String::as_str).collect::<Vec<_>>(), &env);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("probe.json")).unwrap()).unwrap();
+    assert_eq!(probe["engine_head"], elsewhere);
+    assert_eq!(probe["engine_build_head"], env!("ENGINE_BUILD_HEAD"));
+    assert_eq!(probe["engine_stale_allowed"], false);
+    // and the allowance is recorded where a reader will see it
+    let allowed = root.join("allowed");
+    let mut args = base(&allowed);
+    args.extend(["--fixture", "--allow-stale-engine"].map(String::from));
+    let o = run_env(&args.iter().map(String::as_str).collect::<Vec<_>>(), &env);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(allowed.join("probe.json")).unwrap())
+            .unwrap();
+    assert_eq!(probe["engine_stale_allowed"], true);
     let _ = std::fs::remove_dir_all(&root);
 }

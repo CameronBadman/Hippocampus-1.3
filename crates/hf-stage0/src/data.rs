@@ -341,3 +341,50 @@ pub fn git_head(root: &Path) -> String {
 pub fn engine_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
+
+/// The engine's git HEAD when this binary was BUILT, embedded by `build.rs`.
+/// `engine_head` — the key every artifact has always carried — is instead the
+/// checkout's HEAD at RUN time, and the two differ for every run made with a
+/// binary older than the tree beside it, which is exactly the confusion that
+/// put one commit in the artifacts and another in the binary.
+pub const ENGINE_BUILD_HEAD: &str = env!("ENGINE_BUILD_HEAD");
+/// When the build ran (ISO-8601 UTC), embedded by `build.rs`.
+pub const ENGINE_BUILD_TIME: &str = env!("ENGINE_BUILD_TIME");
+
+/// Whether `git status --porcelain` was non-empty when this binary was built —
+/// the sources it was compiled from are then in no commit at all.
+pub fn engine_build_dirty() -> bool {
+    env!("ENGINE_BUILD_DIRTY") == "true"
+}
+
+/// The engine checkout's HEAD at RUN time: what `engine_head` has always meant.
+///
+/// `HF_TEST_ENGINE_HEAD_OVERRIDE` replaces it, so a test can put the run-time
+/// head out of step with the build's without committing anything. It is read
+/// only when `debug_assertions` are on — a release binary, the one that writes
+/// evidence, ignores it entirely — and a run that honours it says so on stderr.
+pub fn engine_head() -> String {
+    if cfg!(debug_assertions) {
+        if let Ok(v) = std::env::var("HF_TEST_ENGINE_HEAD_OVERRIDE") {
+            if !v.is_empty() {
+                eprintln!("hf-stage0: HF_TEST_ENGINE_HEAD_OVERRIDE={v} (debug build; test only)");
+                return v;
+            }
+        }
+    }
+    git_head(&engine_root())
+}
+
+/// `sha256:<hex>` of the running binary itself, read once from
+/// `current_exe()`; `"unknown"` if it cannot be read. Two artifacts naming the
+/// same digest were written by the same bytes, whatever their heads say.
+pub fn engine_binary_sha256() -> &'static str {
+    static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHA.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| hf_core::sha256_file(&p).ok())
+            .map(|(_, digest)| digest)
+            .unwrap_or_else(|| "unknown".into())
+    })
+}

@@ -23,7 +23,11 @@ clap.workspace = true
 flate2.workspace = true
 tch.workspace = true
 
+[build-dependencies]
+hf-core.workspace = true
+
 [dev-dependencies]
+hf-core.workspace = true
 serde_json.workspace = true
 flate2.workspace = true
 

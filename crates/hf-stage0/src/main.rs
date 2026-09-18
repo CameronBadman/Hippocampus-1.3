@@ -8,7 +8,15 @@
 //! `training_authorized: false`; an output path naming a holdout is refused;
 //! `--fixture` trains on the synthetic world, on the CPU, and labels its
 //! output `_FIXTURE` with `evidence: false`. Both repositories' heads are
-//! recorded (`git_head` the foundation's, `engine_head` this one's).
+//! recorded (`git_head` the foundation's, `engine_head` this one's, read from
+//! the checkouts at RUN time), and beside them what the running binary was
+//! BUILT from: `engine_build_head`, `engine_build_dirty` and the binary's own
+//! `engine_binary_sha256`. A real run whose binary is not the tree's refuses
+//! unless `--allow-stale-engine` says the operator knows.
+
+// the probe's `json!` literal is one expansion deep per key, and the engine's
+// provenance keys take it past serde_json's default 128
+#![recursion_limit = "256"]
 
 mod data;
 mod eval;
@@ -103,6 +111,10 @@ struct Args {
     /// print the engine's provenance and exit
     #[arg(long)]
     engine_info: bool,
+    /// run although this binary was not built from the engine checkout's HEAD,
+    /// or was built from a dirty tree; recorded as `engine_stale_allowed`
+    #[arg(long)]
+    allow_stale_engine: bool,
     /// build the config's model at this embedding dimension on the CPU, print
     /// its trainable parameter count and exit; no data is read
     #[arg(long, value_name = "DIM")]
@@ -116,10 +128,40 @@ fn foundation_root(args: &Args) -> PathBuf {
         .unwrap_or_else(|| data::engine_root().join("../hippocampus-foundation"))
 }
 
-fn preflight(args: &Args, foundation: &Path) -> Result<(), HfError> {
+/// The stale-binary gate. `engine_head` is the engine checkout's HEAD as `git`
+/// reads it now; the binary running was built from `ENGINE_BUILD_HEAD`, and
+/// once the tree has moved on the artifact would name a commit whose code
+/// never ran. Band H when they disagree, or when the build's tree was dirty
+/// (its sources are in no commit at all), unless `--allow-stale-engine`.
+fn engine_preflight(args: &Args, engine_head: &str) -> Result<(), HfError> {
+    let stale = if data::engine_build_dirty() {
+        Some(format!(
+            "built from a dirty tree at {}",
+            data::ENGINE_BUILD_HEAD
+        ))
+    } else if data::ENGINE_BUILD_HEAD != engine_head {
+        Some(format!(
+            "built at {}, but the engine checkout is at {engine_head}",
+            data::ENGINE_BUILD_HEAD
+        ))
+    } else {
+        None
+    };
+    match stale {
+        Some(why) if !args.allow_stale_engine => Err(HfError::BandH(format!(
+            "stale engine binary: {why} (built {}); rebuild it (cargo build --release) \
+             or pass --allow-stale-engine",
+            data::ENGINE_BUILD_TIME
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn preflight(args: &Args, foundation: &Path, engine_head: &str) -> Result<(), HfError> {
     if args.fixture {
         return Ok(());
     }
+    engine_preflight(args, engine_head)?;
     let Some(pin) = &args.preregistration_commit else {
         return Err(HfError::Refused(
             "a real run needs --preregistration-commit".into(),
@@ -215,7 +257,11 @@ fn governed_by(config: &Value) -> Value {
 fn engine_info() -> Value {
     json!({
         "engine": "hippo-13 hf-stage0",
-        "engine_head": data::git_head(&data::engine_root()),
+        "engine_head": data::engine_head(),
+        "engine_build_head": data::ENGINE_BUILD_HEAD,
+        "engine_build_dirty": data::engine_build_dirty(),
+        "engine_build_time": data::ENGINE_BUILD_TIME,
+        "engine_binary_sha256": data::engine_binary_sha256(),
         "rust_toolchain": option_env!("RUSTUP_TOOLCHAIN").unwrap_or("rustup 1.95.0"),
         "cuda_available": tch::Cuda::is_available(),
         "cudnn_available": tch::Cuda::cudnn_is_available(),
@@ -366,7 +412,8 @@ fn run(args: Args) -> Result<(), HfError> {
         return Err(HfError::Refused("refusing a holdout path".into()));
     }
     let foundation = foundation_root(&args);
-    preflight(&args, &foundation)?;
+    let engine_head = data::engine_head();
+    preflight(&args, &foundation, &engine_head)?;
     let config = data::read_json(&config_path)?;
     if config.get("training_authorized") != Some(&Value::Bool(false)) {
         return Err(HfError::Refused(
@@ -451,7 +498,11 @@ fn run(args: Args) -> Result<(), HfError> {
     std::fs::create_dir_all(&output).map_err(|e| HfError::Invalid(e.to_string()))?;
     let provenance = json!({
         "git_head": data::git_head(&foundation),
-        "engine_head": data::git_head(&data::engine_root()),
+        "engine_head": engine_head,
+        "engine_build_head": data::ENGINE_BUILD_HEAD,
+        "engine_build_dirty": data::engine_build_dirty(),
+        "engine_binary_sha256": data::engine_binary_sha256(),
+        "engine_stale_allowed": args.allow_stale_engine,
         "engine": "hippo-13 hf-stage0",
     });
     if let Some(ck) = &args.reevaluate_checkpoint {
@@ -701,6 +752,10 @@ fn reevaluate(
         "checkpoint_seed": saved.get("seed"),
         "git_head": provenance["git_head"],
         "engine_head": provenance["engine_head"],
+        "engine_build_head": provenance["engine_build_head"],
+        "engine_build_dirty": provenance["engine_build_dirty"],
+        "engine_binary_sha256": provenance["engine_binary_sha256"],
+        "engine_stale_allowed": provenance["engine_stale_allowed"],
         "engine": provenance["engine"],
         "preregistration_commit": args.preregistration_commit,
         "family": d.family,
@@ -948,6 +1003,10 @@ fn train(
             "resumed_from": resumed,
             "git_head": provenance["git_head"],
             "engine_head": provenance["engine_head"],
+            "engine_build_head": provenance["engine_build_head"],
+            "engine_build_dirty": provenance["engine_build_dirty"],
+            "engine_binary_sha256": provenance["engine_binary_sha256"],
+            "engine_stale_allowed": provenance["engine_stale_allowed"],
             "training_authorized": false,
         })
     };
@@ -1063,6 +1122,10 @@ fn train(
         "git_head": head_at_start,
         "git_head_at_finish": data::git_head(foundation),
         "engine_head": provenance["engine_head"],
+        "engine_build_head": provenance["engine_build_head"],
+        "engine_build_dirty": provenance["engine_build_dirty"],
+        "engine_binary_sha256": provenance["engine_binary_sha256"],
+        "engine_stale_allowed": provenance["engine_stale_allowed"],
         "engine": provenance["engine"],
         "preregistration_commit": args.preregistration_commit,
         "started_at": started,
@@ -1121,6 +1184,10 @@ fn train(
             "preregistration_commit": args.preregistration_commit,
             "git_head": provenance["git_head"],
             "engine_head": provenance["engine_head"],
+            "engine_build_head": provenance["engine_build_head"],
+            "engine_build_dirty": provenance["engine_build_dirty"],
+            "engine_binary_sha256": provenance["engine_binary_sha256"],
+            "engine_stale_allowed": provenance["engine_stale_allowed"],
             "training_authorized": false,
         });
         final_ck.write(model, None, &meta)?;
