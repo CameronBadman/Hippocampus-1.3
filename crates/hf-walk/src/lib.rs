@@ -62,6 +62,19 @@ impl EpisodeIndex {
         embeddings: &hf_embed::EmbeddingMatrix,
         edim: usize,
     ) -> Result<Self, HfError> {
+        // This builder forms ONE query from ONE shown target and labels from a
+        // single-target `distance_to_target`. A k >= 2 record (6.0.0, carrying
+        // `target_nodes`) needs the max-over-unregistered reduction and the
+        // three extra columns of `K_TARGETS_DESIGN.md` §2, which §6 item 4
+        // leaves to its own work — so refuse it rather than read half of it.
+        if let Some(shown) = &episode.visible.target_nodes {
+            return Err(HfError::BandH(format!(
+                "{}: the record shows {} targets; the single-target feature builder \
+                 cannot read a k >= 2 episode (K_TARGETS_DESIGN.md §6 item 4)",
+                episode.episode_id,
+                shown.len()
+            )));
+        }
         let names: Vec<String> = episode
             .visible
             .nodes

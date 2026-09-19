@@ -26,6 +26,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const SCHEMA_VERSION_V5: &str = "5.0.0";
+/// The episode payloads of a k ≥ 2 split (`K_TARGETS_DESIGN.md` §6 item 1).
+/// A stage-0 visible payload may carry `target_nodes` only under this version,
+/// and must carry it: the version is what tells a reader the record shows more
+/// than one target. The split manifests keep `record_kind`
+/// `real_walk_split_manifest_v5` — the only thing Python's
+/// `validate_real_split_artifacts_v5` reads — and take this version beside it.
+/// *Disclosed:* Python's `validate_visible_v5` pins `schema_version` to 5.0.0
+/// **and** refuses any key outside its eleven, so it refuses a 6.0.0 record
+/// twice over; reading a k ≥ 2 split in Python needs a v6 reader.
+pub const SCHEMA_VERSION_V6: &str = "6.0.0";
 pub const STAGES: [&str; 2] = ["stage0_known_target", "stage1_described_target"];
 pub const SPLITS: [&str; 3] = ["train", "screen", "test-fixture"];
 pub const SPLIT_MANIFEST_KIND: &str = "real_walk_split_manifest_v5";
@@ -41,6 +51,21 @@ const VISIBLE_ALLOWLIST: [&str; 11] = [
     "stage",
     "start_node",
     "target_node",
+    "query",
+    "subgraph_size",
+    "removal_level",
+    "nodes",
+    "edges",
+];
+/// The 6.0.0 allow-list: v5's eleven plus `target_nodes`, and nothing else.
+const VISIBLE_ALLOWLIST_V6: [&str; 12] = [
+    "schema_version",
+    "record_kind",
+    "family",
+    "stage",
+    "start_node",
+    "target_node",
+    "target_nodes",
     "query",
     "subgraph_size",
     "removal_level",
@@ -83,6 +108,10 @@ pub struct Visible {
     pub start_node: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
+    /// Every shown target, in node-name order, on a 6.0.0 (k ≥ 2) record only;
+    /// `target_node` is its first entry, so a v1 reader still sees one target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_nodes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<Value>,
     pub subgraph_size: u32,
@@ -110,10 +139,22 @@ pub struct Hidden {
     pub removed_count: u32,
     pub unremovable_count: u32,
     pub nodes_on_surviving_path: Vec<String>,
+    /// The per-node distance to the **nearest** target (a k ≥ 2 record's
+    /// minimum over `target_set`); `distance_to_targets` carries the per-target
+    /// maps the minimum is taken over.
     pub distance_to_target: BTreeMap<String, u32>,
+    /// `{target: {node: distance}}` on a k ≥ 2 record, absent at k = 1 where
+    /// `distance_to_target` already is the one target's map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_to_targets: Option<BTreeMap<String, BTreeMap<String, u32>>>,
     pub sampler: Value,
+    /// Single-target greedy's expansions minus the single-target oracle's; on a
+    /// k ≥ 2 record this is the **maximum** of `greedy_overshoots`, which
+    /// carries one entry per target in `target_set` order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub greedy_overshoot: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub greedy_overshoots: Option<Vec<i64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_recipe: Option<String>,
     #[serde(flatten)]
@@ -135,15 +176,18 @@ pub struct RealEpisode {
     pub hidden: Hidden,
 }
 
-/// Python's `validate_visible_v5` on the raw value.
+/// Python's `validate_visible_v5` on the raw value, plus the 6.0.0 record:
+/// the same rules, the twelfth key `target_nodes`, and nothing else new.
 pub fn validate_visible(value: &Value) -> Result<(), HfError> {
     let obj = value
         .as_object()
         .ok_or_else(|| HfError::BandH("visible payload is not an object".into()))?;
     let get = |k: &str| obj.get(k).and_then(Value::as_str);
-    if get("schema_version") != Some(SCHEMA_VERSION_V5) {
+    let version = get("schema_version").unwrap_or("");
+    let v6 = version == SCHEMA_VERSION_V6;
+    if !v6 && version != SCHEMA_VERSION_V5 {
         return Err(HfError::BandH(
-            "visible payload schema version is not 5.0.0".into(),
+            "visible payload schema version is neither 5.0.0 nor 6.0.0".into(),
         ));
     }
     if get("record_kind") != Some(VISIBLE_KIND) {
@@ -172,11 +216,45 @@ pub fn validate_visible(value: &Value) -> Result<(), HfError> {
             "stage 1 visible payload must carry query".into(),
         ));
     }
+    let allowlist: &[&str] = if v6 {
+        &VISIBLE_ALLOWLIST_V6
+    } else {
+        &VISIBLE_ALLOWLIST
+    };
     for key in obj.keys() {
-        if !VISIBLE_ALLOWLIST.contains(&key.as_str()) {
+        if !allowlist.contains(&key.as_str()) {
             return Err(HfError::BandH(format!(
                 "visible payload carries a disallowed key {key:?}"
             )));
+        }
+    }
+    match obj.get("target_nodes") {
+        None if v6 => {
+            return Err(HfError::BandH(
+                "a 6.0.0 visible payload must carry target_nodes".into(),
+            ))
+        }
+        None => {}
+        Some(shown) => {
+            let names: Vec<&str> = shown
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if names.len() != shown.as_array().map_or(0, Vec::len) || names.len() < 2 {
+                return Err(HfError::BandH(
+                    "target_nodes must be two or more node names".into(),
+                ));
+            }
+            if !names.windows(2).all(|w| w[0] < w[1]) {
+                return Err(HfError::BandH(
+                    "target_nodes must be sorted and distinct".into(),
+                ));
+            }
+            if get("target_node") != Some(names[0]) {
+                return Err(HfError::BandH(
+                    "target_node must be the first of target_nodes".into(),
+                ));
+            }
         }
     }
     let nodes = obj
@@ -531,9 +609,20 @@ fn write_split_into(
     let mut hidden = GzStream::create(&hidden_path, MODE_HIDDEN)?;
     let mut count = 0u64;
     let mut removal_levels: BTreeMap<u64, u64> = BTreeMap::new();
+    // the split's version is its records': 6.0.0 as soon as one record shows
+    // more than one target, 5.0.0 for every v1 split
+    let mut schema_version = SCHEMA_VERSION_V5;
     for episode in episodes {
         let episode = episode?;
         validate_visible(&episode.visible)?;
+        if episode
+            .visible
+            .get("schema_version")
+            .and_then(Value::as_str)
+            == Some(SCHEMA_VERSION_V6)
+        {
+            schema_version = SCHEMA_VERSION_V6;
+        }
         let level = episode
             .visible
             .get("removal_level")
@@ -560,7 +649,7 @@ fn write_split_into(
         .map(|(k, v)| (k.to_string(), Value::from(v)))
         .collect();
     let mut common = Map::new();
-    common.insert("schema_version".into(), SCHEMA_VERSION_V5.into());
+    common.insert("schema_version".into(), schema_version.into());
     common.insert("record_kind".into(), SPLIT_MANIFEST_KIND.into());
     common.insert("family".into(), family.into());
     common.insert("stage".into(), stage.into());

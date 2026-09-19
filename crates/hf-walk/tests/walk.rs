@@ -525,3 +525,28 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
         ]
     );
 }
+
+/// A k ≥ 2 record is refused, not half-read: the builder makes one query from
+/// one shown target, and `K_TARGETS_DESIGN.md` §6 item 4's builder is not
+/// written. The guard is on the visible side, where the shown targets are.
+#[test]
+fn a_two_target_record_is_refused_by_the_single_target_builder() {
+    let (episodes, cache, _) = episodes();
+    let mut episode = episodes[0].clone();
+    EpisodeIndex::new(&episode, &cache, 8).expect("a k = 1 record still builds");
+    let first = episode.visible.target_node.clone().unwrap();
+    let second = episode.visible.nodes[1].node.clone();
+    let mut shown = vec![first, second];
+    shown.sort();
+    episode.visible.schema_version = hf_io::SCHEMA_VERSION_V6.into();
+    episode.visible.target_node = Some(shown[0].clone());
+    episode.visible.target_nodes = Some(shown);
+    let error = match EpisodeIndex::new(&episode, &cache, 8) {
+        Ok(_) => panic!("a k >= 2 record must be refused, not half-read"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{error}").contains("k >= 2"),
+        "expected the k >= 2 refusal, got {error}"
+    );
+}

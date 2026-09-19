@@ -43,6 +43,7 @@ fn main() -> anyhow::Result<()> {
         seed_label: s["seed_label"].as_str().unwrap().to_string(),
         hub_degree_cap: s["hub_degree_cap"].as_u64().map(|c| c as u32),
         screen_region: s["screen_region"].as_f64().unwrap_or(0.0),
+        targets: s["targets"].as_u64().unwrap_or(1) as u32,
         removal_rule: s["removal_rule"]
             .as_str()
             .unwrap_or("cheapest-first")

@@ -88,6 +88,13 @@ impl EpisodeGraph {
         }
     }
 
+    /// The single-target view of a committed episode. **k = 1 only**: it takes
+    /// `target_set[0]` and the whole of `surviving_paths`, which on a k >= 2
+    /// record is the union over targets — `oracle_trace` on that union would
+    /// expand whichever target's surviving paths are the shorter and call the
+    /// result an oracle. A k-target baseline is `K_TARGETS_DESIGN.md` §6 item
+    /// 3's own work (`k_similarity_greedy_trace`, `k_oracle_trace`); until it
+    /// exists, do not call this on a `targets = 2` split.
     pub fn from_episode(episode: &hf_io::RealEpisode) -> Self {
         let mut g = Self::new(
             &episode.visible.start_node,

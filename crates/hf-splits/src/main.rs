@@ -2,7 +2,9 @@
 //! screen split under one destination from an adapter's graph directory,
 //! structure-only, with the same flags; the greedy-path rule needs an
 //! embedding cache; `--greedy-share` applies to the train split only;
-//! `--train 0` writes no train split (the screen-extension mode).
+//! `--train 0` writes no train split (the screen-extension mode); `--targets 2`
+//! draws the k = 2 episode of `K_TARGETS_DESIGN.md` §1 and writes a 6.0.0
+//! split, `--targets 1` (the default) draws v1 exactly.
 //!
 //! `hf-splits prefix-check OLD NEW`: `real_walk_split_prefix_check.py` — the
 //! first `episode_count(OLD)` records of both streams of NEW equal OLD's,
@@ -65,6 +67,9 @@ struct WriteArgs {
     screen_region: f64,
     #[arg(long, default_value = "cheapest-first")]
     removal_rule: String,
+    /// targets per episode (K_TARGETS_DESIGN.md §1); 1 is v1 and draws as v1 does
+    #[arg(long, default_value_t = 1)]
+    targets: u32,
     /// the v5 embedding cache; required by greedy-path
     #[arg(long)]
     embeddings: Option<PathBuf>,
@@ -208,6 +213,7 @@ fn write(args: WriteArgs) -> Result<(), HfError> {
     config.cost_epsilon = args.cost_epsilon;
     config.hub_degree_cap = hub_cap;
     config.screen_region = args.screen_region;
+    config.targets = args.targets;
     config.removal_rule = args.removal_rule.clone();
     let embeddings = match (&args.embeddings, args.removal_rule.as_str()) {
         (Some(dir), _) => Some(hf_embed::EmbeddingMatrix::load(dir)?),

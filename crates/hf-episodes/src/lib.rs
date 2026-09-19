@@ -14,8 +14,13 @@
 //! payload, every hidden field, the six drop reasons, and the episode id.
 //!
 //! What is new (additive): sampling runs in parallel over attempt indices
-//! with the kept ordinals assigned in index order, and `target_set` is a list
-//! ready for k > 1 (k = 1 is what this sampler draws).
+//! with the kept ordinals assigned in index order, and `SamplerConfig.targets`
+//! draws k = 2 by `K_TARGETS_DESIGN.md` §1 — a second target at the same
+//! distance, rejected when either target lies inside a bounded path to the
+//! other, and the joint-cut removal that cuts greedy's route to each target
+//! with one protected survivor per target. `targets = 1` is v1 exactly: the
+//! field enters neither the draw key, the sampler block, nor the episode id,
+//! and every k = 1 payload is the byte the Python sampler wrote.
 
 pub mod fixture;
 
@@ -46,8 +51,18 @@ pub struct SamplerConfig {
     pub seed_label: String,
     pub hub_degree_cap: Option<u32>,
     pub screen_region: f64,
+    /// How many targets one episode draws (`K_TARGETS_DESIGN.md` §1). 1 is v1
+    /// and enters neither the draw key nor the episode id, so every pool
+    /// written before this field reproduces draw for draw.
+    #[serde(default = "one_target")]
+    pub targets: u32,
     pub removal_rule: String,
     pub greedy_share: f64,
+}
+
+/// The v1 target count, for a `sampler` block written before `targets` existed.
+fn one_target() -> u32 {
+    1
 }
 
 impl SamplerConfig {
@@ -62,6 +77,7 @@ impl SamplerConfig {
             seed_label: "real-walk-v1".into(),
             hub_degree_cap: None,
             screen_region: 0.0,
+            targets: 1,
             removal_rule: "cheapest-first".into(),
             greedy_share: 1.0,
         }
@@ -96,6 +112,12 @@ impl SamplerConfig {
         if matches!(self.hub_degree_cap, Some(0)) {
             return bad("hub degree cap must be >= 1".into());
         }
+        if !(1..=2).contains(&self.targets) {
+            return bad(format!(
+                "targets {} is not 1 or 2; K_TARGETS_DESIGN.md draws k = 2 and leaves k > 2 to its own re-run",
+                self.targets
+            ));
+        }
         if !(self.greedy_share > 0.0 && self.greedy_share <= 1.0) {
             return bad("greedy share must lie in (0, 1]".into());
         }
@@ -127,6 +149,9 @@ impl SamplerConfig {
                 python_float_repr(self.screen_region)
             ));
         }
+        if self.targets != 1 {
+            parts.push(format!("'targets': {}", self.targets));
+        }
         format!("{{{}}}", parts.join(", "))
     }
 
@@ -150,6 +175,9 @@ impl SamplerConfig {
             self.hub_degree_cap.map(Value::from).unwrap_or(Value::Null),
         );
         m.insert("screen_region".into(), self.screen_region.into());
+        if self.targets != 1 {
+            m.insert("targets".into(), self.targets.into());
+        }
         m.insert("removal_rule".into(), self.removal_rule.clone().into());
         m.insert("greedy_share".into(), self.greedy_share.into());
         Value::Object(m)
@@ -250,6 +278,10 @@ pub enum Dropped {
     PathSetOverCap,
     GreedyRouteMissing,
     SurvivorsMismatch,
+    NoSecondTargetAtDistance,
+    TargetsInterdependent,
+    RemovalLeftNoPath,
+    SurvivorNotRecovered,
 }
 
 impl Dropped {
@@ -261,6 +293,10 @@ impl Dropped {
             Dropped::PathSetOverCap => "path_set_over_cap",
             Dropped::GreedyRouteMissing => "greedy_route_missing",
             Dropped::SurvivorsMismatch => "survivors_mismatch",
+            Dropped::NoSecondTargetAtDistance => "no_second_target_at_distance",
+            Dropped::TargetsInterdependent => "targets_interdependent",
+            Dropped::RemovalLeftNoPath => "removal_left_no_path",
+            Dropped::SurvivorNotRecovered => "survivor_not_recovered",
         }
     }
 }
@@ -337,6 +373,31 @@ pub fn choose_removals(
     Ok((removed, survivors, unremovable))
 }
 
+/// The designated survivor of amendment 5's recipe: the path sharing the fewest
+/// edges with greedy's route, then the shortest, then the lexically first.
+fn greedy_survivor<'p>(paths: &'p [Vec<String>], route: &[String]) -> &'p Vec<String> {
+    let route_set: HashSet<Edge> = route
+        .windows(2)
+        .map(|w| (w[0].clone(), w[1].clone()))
+        .collect();
+    paths
+        .iter()
+        .min_by(|a, b| {
+            let ka = (
+                edges_of(a).intersection(&route_set).count(),
+                a.len(),
+                (*a).clone(),
+            );
+            let kb = (
+                edges_of(b).intersection(&route_set).count(),
+                b.len(),
+                (*b).clone(),
+            );
+            ka.cmp(&kb)
+        })
+        .expect("non-empty")
+}
+
 /// `choose_greedy_removals`: cut greedy's route nearest the target first,
 /// skipping the designated survivor's edges; unremovable = 1 when nothing was cut.
 pub fn choose_greedy_removals(
@@ -353,23 +414,7 @@ pub fn choose_greedy_removals(
         .windows(2)
         .map(|w| (w[0].clone(), w[1].clone()))
         .collect();
-    let route_set: HashSet<Edge> = route_edges.iter().cloned().collect();
-    let survivor = paths
-        .iter()
-        .min_by(|a, b| {
-            let ka = (
-                edges_of(a).intersection(&route_set).count(),
-                a.len(),
-                (*a).clone(),
-            );
-            let kb = (
-                edges_of(b).intersection(&route_set).count(),
-                b.len(),
-                (*b).clone(),
-            );
-            ka.cmp(&kb)
-        })
-        .expect("non-empty");
+    let survivor = greedy_survivor(paths, route);
     let protected = edges_of(survivor);
     let mut removed: HashSet<Edge> = HashSet::new();
     for edge in route_edges.iter().rev() {
@@ -392,6 +437,184 @@ pub fn choose_greedy_removals(
     }
     let unremovable = if removed.is_empty() { 1 } else { 0 };
     Ok((removed, survivors, unremovable))
+}
+
+/// `(removed edges, the designated survivors of each target, unremovable count)`.
+/// The survivor lists are per target and in `target_set` order; a k = 1 episode
+/// carries exactly one, which is v1's survivor list.
+pub type JointRemoval = (HashSet<Edge>, Vec<Vec<Vec<String>>>, u32);
+
+/// The joint cut of `K_TARGETS_DESIGN.md` §1, steps 1–3: designate one
+/// protected survivor per target **before any edge is cut**, then cut each
+/// target's single-target greedy route nearest that target first, up to `level`
+/// **new** edges each, skipping every designated survivor's edges and every
+/// edge already removed. Step 4 (one recomputation on the fully pruned graph)
+/// and step 5 (containment) are `episode_from`'s.
+///
+/// `unremovable` counts the targets whose cut removed nothing, as the
+/// single-target recipe counts its one.
+pub fn choose_joint_greedy_removals(
+    paths: &[Vec<Vec<String>>],
+    routes: &[Vec<String>],
+    level: u32,
+) -> Result<JointRemoval, HfError> {
+    if paths.is_empty() || paths.len() != routes.len() {
+        return Err(HfError::Invalid(
+            "the joint cut needs one path set and one route per target".into(),
+        ));
+    }
+    let mut designated: Vec<Vec<Vec<String>>> = Vec::with_capacity(paths.len());
+    for (ps, route) in paths.iter().zip(routes) {
+        if ps.is_empty() || route.len() < 2 {
+            return Err(HfError::Invalid(
+                "greedy removal needs paths and a registered route".into(),
+            ));
+        }
+        designated.push(vec![greedy_survivor(ps, route).clone()]);
+    }
+    let protected: HashSet<Edge> = designated
+        .iter()
+        .flatten()
+        .flat_map(|p| edges_of(p))
+        .collect();
+    let mut removed: HashSet<Edge> = HashSet::new();
+    let mut unremovable = 0u32;
+    for route in routes {
+        let route_edges: Vec<Edge> = route
+            .windows(2)
+            .map(|w| (w[0].clone(), w[1].clone()))
+            .collect();
+        let mut cut = 0u32;
+        for edge in route_edges.iter().rev() {
+            if cut >= level {
+                break;
+            }
+            if protected.contains(edge) || removed.contains(edge) {
+                continue;
+            }
+            removed.insert(edge.clone());
+            cut += 1;
+        }
+        if cut == 0 {
+            unremovable += 1;
+        }
+    }
+    Ok((removed, designated, unremovable))
+}
+
+/// Amendment 1's cheapest-first removal over k targets — the rule for an
+/// episode outside the greedy share. Which paths a cut aims at is fixed by the
+/// `(length, seeded hash)` order alone, before anything is protected, so the
+/// designation is not circular; every kept path of **every** target is then
+/// protected from **every** cut, which is the joint cut's cross-protection
+/// applied to the collateral the design note names (cutting one target's paths
+/// can otherwise remove another target's). At k = 1 it is v1's rule.
+pub fn choose_joint_removals(
+    paths: &[Vec<Vec<String>>],
+    level: u32,
+    seed_label: &str,
+    episode_key: &str,
+) -> Result<JointRemoval, HfError> {
+    if paths.is_empty() || paths.iter().any(Vec::is_empty) {
+        return Err(HfError::Invalid("no path to remove from".into()));
+    }
+    let mut aimed: Vec<Vec<&Vec<String>>> = Vec::with_capacity(paths.len());
+    let mut designated: Vec<Vec<Vec<String>>> = Vec::with_capacity(paths.len());
+    for ps in paths {
+        let mut ordered: Vec<(usize, u64, &Vec<String>)> = ps
+            .iter()
+            .map(|p| {
+                (
+                    p.len(),
+                    hash_int(&[seed_label, episode_key, &p.join("|")]),
+                    p,
+                )
+            })
+            .collect();
+        ordered.sort_by_key(|a| (a.0, a.1));
+        let n_remove = (level as usize).min(ordered.len() - 1);
+        let (to_remove, keep) = ordered.split_at(n_remove);
+        aimed.push(to_remove.iter().map(|(_, _, p)| *p).collect());
+        designated.push(keep.iter().map(|(_, _, p)| (*p).clone()).collect());
+    }
+    let protected: HashSet<Edge> = designated
+        .iter()
+        .flatten()
+        .flat_map(|p| edges_of(p))
+        .collect();
+    let mut removed: HashSet<Edge> = HashSet::new();
+    let mut unremovable = 0u32;
+    for (i, to_remove) in aimed.iter().enumerate() {
+        for path in to_remove {
+            let edges: Vec<Edge> = path
+                .windows(2)
+                .map(|w| (w[0].clone(), w[1].clone()))
+                .collect();
+            if edges.iter().any(|e| removed.contains(e)) {
+                continue;
+            }
+            let mut candidates: Vec<(u64, Edge)> = edges
+                .into_iter()
+                .filter(|e| !protected.contains(e))
+                .map(|e| (hash_int(&[seed_label, episode_key, &e.0, &e.1]), e))
+                .collect();
+            if candidates.is_empty() {
+                // every edge is protected, so the path outlives both cuts
+                unremovable += 1;
+                designated[i].push((*path).clone());
+                continue;
+            }
+            candidates.sort_by_key(|a| a.0);
+            removed.insert(candidates.swap_remove(0).1);
+        }
+        designated[i].sort_unstable();
+        designated[i].dedup();
+    }
+    Ok((removed, designated, unremovable))
+}
+
+/// Every node `c` for which `target` is an interior node of some simple
+/// `start → c` path of at most `bound` edges — §1's second rejection, the
+/// bound-aware one: the walk must expand `target` to continue to `c`, so it
+/// registered `target` on the way and k = 2 would collapse to k = 1 with a
+/// bonus. Exact, not the `d(s,x) + d(x,y) <= bound` relaxation: the suffix is
+/// enumerated only over nodes the prefix does not already use.
+fn beyond_target(
+    sub: &Subgraph,
+    target: NodeId,
+    paths_to_target: &[Vec<NodeId>],
+    bound: u32,
+) -> HashSet<NodeId> {
+    fn extend(
+        sub: &Subgraph,
+        node: NodeId,
+        left: u32,
+        on_path: &mut HashSet<NodeId>,
+        out: &mut HashSet<NodeId>,
+    ) {
+        if left == 0 {
+            return;
+        }
+        for tail in sub.out_neighbours(node) {
+            if on_path.contains(&tail) {
+                continue;
+            }
+            out.insert(tail);
+            on_path.insert(tail);
+            extend(sub, tail, left - 1, on_path, out);
+            on_path.remove(&tail);
+        }
+    }
+    let mut out = HashSet::new();
+    for p in paths_to_target {
+        let used = (p.len() - 1) as u32;
+        if used >= bound {
+            continue;
+        }
+        let mut on_path: HashSet<NodeId> = p.iter().copied().collect();
+        extend(sub, target, bound - used, &mut on_path, &mut out);
+    }
+    out
 }
 
 /// The start lists of a split, computed once per graph (`_split_starts` / `_member_starts`).
@@ -498,50 +721,139 @@ impl<'g> Sampler<'g> {
         let names = |p: &Vec<NodeId>| -> Vec<String> {
             p.iter().map(|n| self.graph.name(*n).to_string()).collect()
         };
-        let paths_named: Vec<Vec<String>> = paths.iter().map(names).collect();
+        // the further targets of §1 steps 2-4: the same draw device on the same
+        // candidate list, minus the targets already drawn, the interior nodes of
+        // their bounded path sets, and everything reachable only through them
+        let mut targets: Vec<NodeId> = vec![target];
+        let mut raw_paths: Vec<Vec<Vec<NodeId>>> = vec![paths];
+        if config.targets > 1 {
+            if candidates.len() < config.targets as usize {
+                return Ok(Err(Dropped::NoSecondTargetAtDistance));
+            }
+            let mut blocked: HashSet<NodeId> = HashSet::new();
+            for drawn in 1..config.targets as usize {
+                let last = targets[drawn - 1];
+                let last_paths = &raw_paths[drawn - 1];
+                blocked.insert(last);
+                blocked.extend(
+                    last_paths
+                        .iter()
+                        .flat_map(|p| p[1..p.len() - 1].iter().copied()),
+                );
+                blocked.extend(beyond_target(&sub, last, last_paths, bound));
+                // a Vec filtered from the sorted candidates: randrange indexes it
+                let filtered: Vec<NodeId> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|c| !blocked.contains(c))
+                    .collect();
+                if filtered.is_empty() {
+                    return Ok(Err(Dropped::TargetsInterdependent));
+                }
+                let next = filtered[rng.randrange(filtered.len() as u64) as usize];
+                let next_paths = sub.simple_paths(start, next, bound);
+                if next_paths.is_empty() {
+                    return Ok(Err(Dropped::NoPathWithinBound));
+                }
+                if next_paths.len() > config.max_paths as usize {
+                    return Ok(Err(Dropped::PathSetOverCap));
+                }
+                targets.push(next);
+                raw_paths.push(next_paths);
+            }
+            // T in node-name order, and everything downstream with it, so the
+            // episode is a function of the set and not of the draw
+            let mut order: Vec<usize> = (0..targets.len()).collect();
+            order.sort_by(|a, b| {
+                self.graph
+                    .name(targets[*a])
+                    .cmp(self.graph.name(targets[*b]))
+            });
+            targets = order.iter().map(|i| targets[*i]).collect();
+            raw_paths = order.iter().map(|i| raw_paths[*i].clone()).collect();
+        }
+        let path_sets: Vec<Vec<Vec<String>>> = raw_paths
+            .iter()
+            .map(|ps| ps.iter().map(&names).collect())
+            .collect();
         let greedy_member = greedy_rule
             && (config.greedy_share >= 1.0
                 || (hash_int(&[&config.seed_label, &key, "greedy-share"]) as f64 / TWO_POW_64)
                     < config.greedy_share);
-        let (removed, survivors, unremovable) = if greedy_member {
-            // similarity-greedy's route on the unpruned subgraph
-            let draft =
-                self.episode_graph(&sub, &ball, start, target, &HashSet::new(), &paths_named);
-            let trace = similarity_greedy_trace(&draft, embeddings.expect("checked"), None);
-            let route = trace.route(&draft.start, &draft.target);
-            if route.is_empty() {
-                return Ok(Err(Dropped::GreedyRouteMissing));
+        let (removed, survivors, unremovable): JointRemoval = if greedy_member {
+            // similarity-greedy's route to each target on the unpruned subgraph
+            let mut routes: Vec<Vec<String>> = Vec::with_capacity(targets.len());
+            for (i, t) in targets.iter().enumerate() {
+                let draft =
+                    self.episode_graph(&sub, &ball, start, *t, &HashSet::new(), &path_sets[i]);
+                let trace = similarity_greedy_trace(&draft, embeddings.expect("checked"), None);
+                let route = trace.route(&draft.start, &draft.target);
+                if route.is_empty() {
+                    return Ok(Err(Dropped::GreedyRouteMissing));
+                }
+                routes.push(route);
             }
-            choose_greedy_removals(&paths_named, &route, config.removal_level)?
+            if config.targets == 1 {
+                let (removed, survivors, unremovable) =
+                    choose_greedy_removals(&path_sets[0], &routes[0], config.removal_level)?;
+                (removed, vec![survivors], unremovable)
+            } else {
+                choose_joint_greedy_removals(&path_sets, &routes, config.removal_level)?
+            }
+        } else if config.targets == 1 {
+            let (removed, survivors, unremovable) = choose_removals(
+                &path_sets[0],
+                config.removal_level,
+                &config.seed_label,
+                &key,
+            )?;
+            (removed, vec![survivors], unremovable)
         } else {
-            choose_removals(&paths_named, config.removal_level, &config.seed_label, &key)?
+            choose_joint_removals(&path_sets, config.removal_level, &config.seed_label, &key)?
         };
-        let Some(mut sampled) = self.episode_from(
+        let mut sampled = match self.episode_from(
             split,
             index,
             &key,
             start,
-            target,
+            &targets,
             &sub,
             &ball,
-            &paths_named,
+            &path_sets,
             bound,
             &removed,
             &survivors,
             unremovable,
-        )?
-        else {
-            return Ok(Err(Dropped::SurvivorsMismatch));
+        )? {
+            Ok(sampled) => sampled,
+            Err(reason) => return Ok(Err(reason)),
         };
         if greedy_rule {
-            let g = self.episode_graph_of(&sampled);
-            let greedy = similarity_greedy_trace(&g, embeddings.expect("checked"), None).expansions;
-            let oracle = oracle_trace(&g).expansions;
+            // one single-target overshoot per target, on that target's own
+            // surviving paths and distances — never on the union, which would
+            // oracle whichever target's paths are shorter
+            let target_names: Vec<String> = targets
+                .iter()
+                .map(|t| self.graph.name(*t).to_string())
+                .collect();
+            let overshoots: Vec<i64> = target_names
+                .iter()
+                .map(|t| {
+                    let g = self.episode_graph_of(&sampled, t);
+                    let greedy =
+                        similarity_greedy_trace(&g, embeddings.expect("checked"), None).expansions;
+                    let oracle = oracle_trace(&g).expansions;
+                    greedy as i64 - oracle as i64
+                })
+                .collect();
             let hidden = sampled.hidden.as_object_mut().unwrap();
             hidden.insert(
                 "greedy_overshoot".into(),
-                (greedy as i64 - oracle as i64).into(),
+                (*overshoots.iter().max().expect("a target")).into(),
             );
+            if config.targets > 1 {
+                hidden.insert("greedy_overshoots".into(), overshoots.into());
+            }
             hidden.insert(
                 "removal_recipe".into(),
                 (if greedy_member {
@@ -601,7 +913,12 @@ impl<'g> Sampler<'g> {
         )
     }
 
-    fn episode_graph_of(&self, sampled: &Sampled) -> EpisodeGraph {
+    /// The single-target view of one sampled episode, for one named target: its
+    /// own surviving paths (the union split on each path's last node, which a
+    /// path to another target can never be) and its own distances. A union is
+    /// never passed whole — `oracle_trace` on one would oracle whichever
+    /// target's surviving paths are the shorter.
+    fn episode_graph_of(&self, sampled: &Sampled, target: &str) -> EpisodeGraph {
         let v = &sampled.visible;
         let h = &sampled.hidden;
         let edges = v["edges"].as_array().unwrap().iter().map(|e| {
@@ -610,13 +927,18 @@ impl<'g> Sampler<'g> {
                 e["target"].as_str().unwrap().to_string(),
             )
         });
-        let survivors: Vec<Vec<String>> =
-            serde_json::from_value(h["surviving_paths"].clone()).unwrap();
-        let distances: std::collections::HashMap<String, u32> =
-            serde_json::from_value(h["distance_to_target"].clone()).unwrap();
+        let union: Vec<Vec<String>> = serde_json::from_value(h["surviving_paths"].clone()).unwrap();
+        let survivors: Vec<Vec<String>> = union
+            .into_iter()
+            .filter(|p| p.last().map(String::as_str) == Some(target))
+            .collect();
+        let distances: std::collections::HashMap<String, u32> = match h.get("distance_to_targets") {
+            Some(by_target) => serde_json::from_value(by_target[target].clone()).unwrap(),
+            None => serde_json::from_value(h["distance_to_target"].clone()).unwrap(),
+        };
         EpisodeGraph::new(
             v["start_node"].as_str().unwrap(),
-            h["target_set"][0].as_str().unwrap(),
+            target,
             edges,
             survivors,
             distances,
@@ -630,31 +952,63 @@ impl<'g> Sampler<'g> {
         index: u64,
         key: &str,
         start: NodeId,
-        target: NodeId,
+        targets: &[NodeId],
         sub: &Subgraph,
         ball: &[NodeId],
-        paths: &[Vec<String>],
+        paths: &[Vec<Vec<String>>],
         bound: u32,
         removed: &HashSet<Edge>,
-        survivors: &[Vec<String>],
+        designated: &[Vec<Vec<String>>],
         unremovable: u32,
-    ) -> Result<Option<Sampled>, HfError> {
+    ) -> Result<Result<Sampled, Dropped>, HfError> {
         let config = &self.config;
-        // prune by node pair and recompute the survivors on the pruned subgraph
+        let k = targets.len();
+        let target = targets[0];
+        let target_names: Vec<String> = targets
+            .iter()
+            .map(|t| self.graph.name(*t).to_string())
+            .collect();
+        // prune by node pair and recompute the survivors on the FULLY pruned
+        // subgraph, once, as the joint cut's step 4 requires
         let pruned = sub.without_pairs(|h, t| {
             removed.contains(&(
                 self.graph.name(h).to_string(),
                 self.graph.name(t).to_string(),
             ))
         });
-        let recomputed: Vec<Vec<String>> = pruned
-            .simple_paths(start, target, bound)
+        let recomputed: Vec<Vec<Vec<String>>> = targets
             .iter()
-            .map(|p| p.iter().map(|n| self.graph.name(*n).to_string()).collect())
+            .map(|t| {
+                pruned
+                    .simple_paths(start, *t, bound)
+                    .iter()
+                    .map(|p| p.iter().map(|n| self.graph.name(*n).to_string()).collect())
+                    .collect()
+            })
             .collect();
-        if recomputed.is_empty() || recomputed != survivors {
-            return Ok(None);
-        }
+        let survivors: Vec<Vec<String>> = if k == 1 {
+            // v1's test: the recomputed set must EQUAL the designated survivors
+            if recomputed[0].is_empty() || recomputed[0] != designated[0] {
+                return Ok(Err(Dropped::SurvivorsMismatch));
+            }
+            designated[0].clone()
+        } else {
+            // the k-recipe's step 5: each target keeps a path, and each
+            // protected survivor is recovered — containment, not equality,
+            // since cutting one target's route may remove another's path
+            for (found, want) in recomputed.iter().zip(designated) {
+                if found.is_empty() {
+                    return Ok(Err(Dropped::RemovalLeftNoPath));
+                }
+                if want.iter().any(|p| !found.contains(p)) {
+                    return Ok(Err(Dropped::SurvivorNotRecovered));
+                }
+            }
+            let mut union: Vec<Vec<String>> = recomputed.iter().flatten().cloned().collect();
+            union.sort_unstable();
+            union.dedup();
+            union
+        };
         let edges = self.pruned_edges(sub, ball, removed);
         let edge_records: Vec<Value> = edges
             .iter()
@@ -673,8 +1027,14 @@ impl<'g> Sampler<'g> {
                 |n| json!({"node": self.graph.name(*n), "text": self.graph.text(*n).unwrap_or("")}),
             )
             .collect();
+        // k >= 2 shows a second target, which v5's allow-list has no key for
+        let schema_version = if k == 1 {
+            hf_io::SCHEMA_VERSION_V5
+        } else {
+            hf_io::SCHEMA_VERSION_V6
+        };
         let mut visible = json!({
-            "schema_version": hf_io::SCHEMA_VERSION_V5,
+            "schema_version": schema_version,
             "record_kind": hf_io::VISIBLE_KIND,
             "family": config.family,
             "stage": STAGE0,
@@ -685,9 +1045,28 @@ impl<'g> Sampler<'g> {
             "edges": edge_records,
         });
         visible["target_node"] = self.graph.name(target).into();
+        if k > 1 {
+            visible["target_nodes"] = target_names.clone().into();
+        }
+        // one distance map per target; `distance_to_target` is the per-node
+        // minimum over them, which keeps the committed type and is the one
+        // target's own map at k = 1
+        let distance_to_targets: Vec<BTreeMap<String, u32>> = targets
+            .iter()
+            .map(|t| {
+                pruned
+                    .distances_to(*t)
+                    .into_iter()
+                    .map(|(n, d)| (self.graph.name(n).to_string(), d))
+                    .collect()
+            })
+            .collect();
         let mut distance_to_target: BTreeMap<String, u32> = BTreeMap::new();
-        for (n, d) in pruned.distances_to(target) {
-            distance_to_target.insert(self.graph.name(n).to_string(), d);
+        for map in &distance_to_targets {
+            for (n, d) in map {
+                let entry = distance_to_target.entry(n.clone()).or_insert(*d);
+                *entry = (*entry).min(*d);
+            }
         }
         let mut on_surviving: Vec<String> = survivors.iter().flatten().cloned().collect();
         on_surviving.sort_unstable();
@@ -697,18 +1076,21 @@ impl<'g> Sampler<'g> {
             .map(|(h, t)| vec![h.clone(), t.clone()])
             .collect();
         removal_set.sort_unstable();
-        let hidden = json!({
-            "schema_version": hf_io::SCHEMA_VERSION_V5,
+        let path_set: Vec<Vec<String>> = paths.iter().flatten().cloned().collect();
+        let by_target: BTreeMap<&String, &BTreeMap<String, u32>> =
+            target_names.iter().zip(&distance_to_targets).collect();
+        let mut hidden = json!({
+            "schema_version": schema_version,
             "record_kind": hf_io::HIDDEN_KIND,
             "family": config.family,
             "stage": STAGE0,
             "split": split,
             "index": index,
             "start_node": self.graph.name(start),
-            "target_set": [self.graph.name(target)],
+            "target_set": target_names.clone(),
             "target_distance": config.target_distance,
             "cost_bound": bound,
-            "path_set": paths,
+            "path_set": path_set,
             "surviving_paths": survivors,
             "removal_set": removal_set,
             "removed_count": removed.len(),
@@ -717,11 +1099,17 @@ impl<'g> Sampler<'g> {
             "distance_to_target": distance_to_target,
             "sampler": config.as_value(),
         });
+        if k > 1 {
+            hidden["distance_to_targets"] = json!(by_target);
+        }
         let mut episode_id = format!(
             "{}-{split}-{index:06}-{:08x}",
             config.family,
             hash_int(&[key]) % (1u64 << 32)
         );
+        if config.targets != 1 {
+            episode_id.push_str(&format!("-t{}", config.targets));
+        }
         if config.removal_rule != "cheapest-first" {
             episode_id.push('-');
             episode_id.push_str(&config.removal_rule);
@@ -730,7 +1118,7 @@ impl<'g> Sampler<'g> {
             }
         }
         hf_io::validate_visible(&visible)?;
-        Ok(Some(Sampled {
+        Ok(Ok(Sampled {
             episode_id,
             visible,
             hidden,

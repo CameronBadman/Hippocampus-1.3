@@ -232,3 +232,77 @@ fn rust_round_trip_matches_python_framing_and_validates_in_python() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The 6.0.0 visible record of a k ≥ 2 split: `target_nodes` beside
+/// `target_node`, refused under 5.0.0, required under 6.0.0, and `target_set`
+/// still refused under both.
+#[test]
+fn the_v6_visible_record_admits_target_nodes_and_nothing_else() {
+    let base = |version: &str| {
+        serde_json::json!({
+            "schema_version": version,
+            "record_kind": "real_walk_episode_visible",
+            "family": "fixture",
+            "stage": "stage0_known_target",
+            "start_node": "n1",
+            "target_node": "n2",
+            "subgraph_size": 3,
+            "removal_level": 2,
+            "nodes": [{"node": "n1", "text": ""}, {"node": "n2", "text": ""}],
+            "edges": [{"edge_id": 0, "source": "n1", "target": "n2", "relation": Value::Null}],
+        })
+    };
+    // v5 is untouched: it takes no target_nodes and no other version exists
+    hf_io::validate_visible(&base("5.0.0")).unwrap();
+    let mut v5 = base("5.0.0");
+    v5["target_nodes"] = serde_json::json!(["n2", "n3"]);
+    assert!(
+        hf_io::validate_visible(&v5).is_err(),
+        "v5 takes eleven keys"
+    );
+    assert!(hf_io::validate_visible(&base("5.1.0")).is_err());
+    // v6 requires target_nodes, sorted, distinct, and led by target_node
+    assert!(
+        hf_io::validate_visible(&base("6.0.0")).is_err(),
+        "a 6.0.0 record must show more than one target"
+    );
+    let with = |nodes: Value| {
+        let mut v = base("6.0.0");
+        v["target_nodes"] = nodes;
+        v
+    };
+    hf_io::validate_visible(&with(serde_json::json!(["n2", "n3"]))).unwrap();
+    assert!(hf_io::validate_visible(&with(serde_json::json!(["n3", "n2"]))).is_err());
+    assert!(hf_io::validate_visible(&with(serde_json::json!(["n2", "n2"]))).is_err());
+    assert!(hf_io::validate_visible(&with(serde_json::json!(["n2"]))).is_err());
+    assert!(hf_io::validate_visible(&with(serde_json::json!(["n1", "n2"]))).is_err());
+    assert!(hf_io::validate_visible(&with(serde_json::json!([1, 2]))).is_err());
+    // the leak keys are refused under both versions
+    for version in ["5.0.0", "6.0.0"] {
+        let mut v = base(version);
+        v["target_nodes"] = serde_json::json!(["n2", "n3"]);
+        v["target_set"] = serde_json::json!(["n2", "n3"]);
+        assert!(
+            hf_io::validate_visible(&v).is_err(),
+            "{version} leaks target_set"
+        );
+    }
+    // a v6 record's typed form keeps both fields and round-trips
+    let value = with(serde_json::json!(["n2", "n3"]));
+    let typed: hf_io::Visible = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(typed.target_node.as_deref(), Some("n2"));
+    assert_eq!(
+        typed.target_nodes.as_deref(),
+        Some(&["n2".to_string(), "n3".to_string()][..])
+    );
+    assert_eq!(
+        canon0(&serde_json::to_value(&typed).unwrap()),
+        canon0(&value)
+    );
+    // a v5 record carries no target_nodes key at all
+    let typed: hf_io::Visible = serde_json::from_value(base("5.0.0")).unwrap();
+    assert_eq!(
+        canon0(&serde_json::to_value(&typed).unwrap()),
+        canon0(&base("5.0.0"))
+    );
+}
