@@ -485,3 +485,228 @@ fn targets_two_writes_a_v6_split_and_keeps_the_prefix_property() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --------------------------------------------------------------------------
+// `hf-splits baselines`: the model-free k baselines off one split directory
+
+fn write_fixture_split(
+    root: &std::path::Path,
+    gdir: &std::path::Path,
+    dest: &std::path::Path,
+    targets: &str,
+    screen: usize,
+) {
+    let _ = root;
+    let out = run(&[
+        "write",
+        "--family",
+        "fixture",
+        "--graph-dir",
+        gdir.to_str().unwrap(),
+        "--subgraph-size",
+        "64",
+        "--target-distance",
+        "3",
+        "--removal-level",
+        "2",
+        "--targets",
+        targets,
+        "--train",
+        "0",
+        "--screen",
+        &screen.to_string(),
+        "--chunk",
+        "3",
+        "--destination",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn read_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// One JSON line per episode, with the fields `K_TARGETS_DESIGN.md` §9 item 5
+/// is read from: the examination order, the per-target registrations, the
+/// recall at `B_fix`, the frozen variant beside it, and `o_k` inside its own
+/// sandwich. No model is loaded and none is named: the manifest records
+/// `model: null` and `training_authorized: false`.
+#[test]
+fn baselines_read_the_k_traces_off_a_k2_split() {
+    let root = tmp("baselines-k2");
+    let (gdir, cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "2", 6);
+    let split = dest.join("screen");
+    let rows_path = root.join("rows").join("k_rows.jsonl");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        split.to_str().unwrap(),
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--output",
+        rows_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (episodes, _) = hf_io::read_split(&split).unwrap();
+    let rows = read_rows(&rows_path);
+    assert_eq!(rows.len(), episodes.len(), "one row per episode");
+    let embeddings = hf_embed::EmbeddingMatrix::load(&cache).unwrap();
+    for (row, e) in rows.iter().zip(&episodes) {
+        assert_eq!(row["record_kind"], "k_baseline_row");
+        assert_eq!(row["episode_id"], e.episode_id);
+        assert_eq!(row["start_node"], e.visible.start_node);
+        let targets = row["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2, "a k = 2 row names both targets");
+        // B_fix is the RUNG's n / 2, not the realised ball's
+        assert_eq!(row["subgraph_size"], 64);
+        assert_eq!(row["b_fix"], 32);
+        let registered = row["k_greedy_registered_at"].as_array().unwrap();
+        assert_eq!(registered.len(), 2, "one registration slot per target");
+        let examined = row["k_greedy_examined"].as_array().unwrap();
+        assert_eq!(
+            examined[0], e.visible.start_node,
+            "the start is expanded first"
+        );
+        assert_eq!(
+            examined.len() as u64,
+            row["k_greedy_expansions"].as_u64().unwrap()
+        );
+        // the recall the strata are formed on, recomputed from the row itself
+        let b_fix = row["b_fix"].as_u64().unwrap();
+        let hit = registered
+            .iter()
+            .filter(|r| r.as_u64().is_some_and(|at| at <= b_fix))
+            .count();
+        assert_eq!(
+            row["k_greedy_recall_at_budget"].as_f64().unwrap(),
+            hit as f64 / 2.0,
+            "recall over k is the share of targets registered by B_fix"
+        );
+        // the k-oracle inside its own admissible sandwich
+        let o_k = row["k_oracle_expansions"].as_u64().unwrap();
+        assert!(o_k >= row["k_oracle_lower_bound"].as_u64().unwrap());
+        assert!(o_k <= row["k_oracle_upper_bound"].as_u64().unwrap());
+        assert!(
+            row["k_oracle_pruned_nodes"].as_u64().unwrap() >= 1,
+            "|V'| counts the start"
+        );
+        assert!(row["k_oracle_exact"].is_boolean());
+        // the frozen variant is a walk of its own, keyed once at push
+        let g = hf_policies::EpisodeGraph::from_episode_k(e);
+        let frozen = hf_policies::k_greedy_frozen_trace(&g, &embeddings);
+        assert_eq!(
+            row["k_greedy_frozen_expansions"].as_u64().unwrap(),
+            frozen.expansions as u64
+        );
+    }
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("rows").join("k_rows.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["record_kind"], "k_baseline_manifest");
+    assert_eq!(manifest["training_authorized"], false);
+    assert_eq!(manifest["model"], serde_json::Value::Null);
+    assert_eq!(manifest["checkpoint"], serde_json::Value::Null);
+    assert_eq!(manifest["b_fix"], 32);
+    assert_eq!(manifest["episodes_read"], rows.len());
+    assert_eq!(manifest["targets_per_episode"], serde_json::json!([2]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The golden the reader leans on: at k = 1 the rows the CLI writes are v1's
+/// `similarity_greedy` walk — the SAME examination order, node for node, and
+/// the same expansion count. `crates/hf-policies/tests/k_targets.rs` proves the
+/// two traces equal field for field on the fixture episodes; this one proves
+/// the CLI writes that trace and not another.
+#[test]
+fn at_one_target_the_rows_are_v1_similarity_greedys_own_walk() {
+    let root = tmp("baselines-k1");
+    let (gdir, cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 6);
+    let split = dest.join("screen");
+    let rows_path = root.join("k1.jsonl");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        split.to_str().unwrap(),
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--output",
+        rows_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (episodes, _) = hf_io::read_split(&split).unwrap();
+    let embeddings = hf_embed::EmbeddingMatrix::load(&cache).unwrap();
+    let rows = read_rows(&rows_path);
+    assert_eq!(rows.len(), episodes.len());
+    let mut checked = 0;
+    for (row, e) in rows.iter().zip(&episodes) {
+        let v1 = hf_policies::EpisodeGraph::from_episode(e);
+        let trace = hf_policies::similarity_greedy_trace(&v1, &embeddings, None);
+        let examined: Vec<String> = row["k_greedy_examined"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(examined, trace.examined, "{}", e.episode_id);
+        assert_eq!(
+            row["k_greedy_expansions"].as_u64().unwrap(),
+            trace.expansions as u64
+        );
+        assert_eq!(row["targets"].as_array().unwrap().len(), 1);
+        // and the frozen variant is the same walk again at k = 1: there is no
+        // registration before the end, so there is nothing to re-key
+        assert_eq!(row["k_greedy_frozen_examined"], row["k_greedy_examined"]);
+        checked += 1;
+    }
+    assert!(checked > 0, "the fixture split was empty");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The standing refusal, on every path the subcommand takes.
+#[test]
+fn baselines_refuses_a_holdout_path() {
+    let root = tmp("baselines-holdout");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        root.join("holdout").join("train").to_str().unwrap(),
+        "--embeddings",
+        root.join("cache").to_str().unwrap(),
+        "--output",
+        root.join("rows.jsonl").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "a holdout path exits 2");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        root.join("pool").join("train").to_str().unwrap(),
+        "--embeddings",
+        root.join("cache").to_str().unwrap(),
+        "--output",
+        root.join("heldout-rows.jsonl").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "a heldout output exits 2");
+    let _ = std::fs::remove_dir_all(&root);
+}

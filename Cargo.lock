@@ -546,6 +546,7 @@ dependencies = [
  "hf-graph",
  "hf-io",
  "hf-policies",
+ "serde",
  "serde_json",
 ]
 

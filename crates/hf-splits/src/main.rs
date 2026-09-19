@@ -6,6 +6,14 @@
 //! draws the k = 2 episode of `K_TARGETS_DESIGN.md` §1 and writes a 6.0.0
 //! split, `--targets 1` (the default) draws v1 exactly.
 //!
+//! `hf-splits baselines`: the model-free k baselines of
+//! `K_TARGETS_DESIGN.md` §3 read off ONE split directory — k-greedy with its
+//! recompute rule, `k-greedy-frozen` beside it and the branch-and-bound
+//! k-oracle — one JSON line per episode, plus a sidecar manifest. It trains
+//! nothing, loads no model and links no libtorch: it is `hf-stage0`'s
+//! `evaluate` baseline half without the learned walk, which is the only part
+//! that needs a checkpoint.
+//!
 //! `hf-splits prefix-check OLD NEW`: `real_walk_split_prefix_check.py` — the
 //! first `episode_count(OLD)` records of both streams of NEW equal OLD's,
 //! record for record (digests differ by construction and are not the check);
@@ -34,6 +42,8 @@ struct Cli {
 enum Command {
     /// sample and write train/ and screen/ under a destination
     Write(WriteArgs),
+    /// read the k baselines off one split directory, one JSON line per episode
+    Baselines(BaselinesArgs),
     /// check that NEW's first records reproduce OLD's, stream by stream
     PrefixCheck {
         old: PathBuf,
@@ -89,6 +99,27 @@ struct WriteArgs {
     /// keep the RNG-independent hub cap here instead of computing it (tests)
     #[arg(long)]
     hub_cap: Option<u32>,
+}
+
+#[derive(Parser, Debug)]
+struct BaselinesArgs {
+    /// ONE split directory — the `train` directory itself, not its parent
+    #[arg(long)]
+    split_dir: PathBuf,
+    /// the v5 embedding cache the similarity key reads
+    #[arg(long)]
+    embeddings: PathBuf,
+    /// the JSONL of rows; `<stem>.manifest.json` is written beside it
+    #[arg(long)]
+    output: PathBuf,
+    /// `K_TARGETS_DESIGN.md` §4's fixed budget; the default is the rung's
+    /// `n / 2` read off each episode's own sampler block, and a run where the
+    /// episodes disagree is refused rather than averaged
+    #[arg(long)]
+    b_fix: Option<u32>,
+    /// read only the first N episodes (0 = every one)
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
 }
 
 fn read_json(path: &Path) -> Result<Value, HfError> {
@@ -284,6 +315,191 @@ fn normalise_sampler(mut v: Value, notes: &mut Vec<String>) -> Value {
     v
 }
 
+/// One episode's baseline row: the k-greedy examination order and its
+/// per-target registrations, the frozen variant beside it, and the k-oracle's
+/// `o_k` with the budget's own verdict on it.
+///
+/// `k_greedy` is `K_TARGETS_DESIGN.md` §3 item 1's baseline — the key is
+/// `(-max over UNREGISTERED t of cos(node, t), counter)` with the whole
+/// frontier re-keyed at every registration — and at k = 1 it is v1's
+/// `similarity_greedy_trace`, trace field for trace field
+/// (`crates/hf-policies/tests/k_targets.rs`).
+#[derive(serde::Serialize)]
+struct BaselineRow<'a> {
+    record_kind: &'static str,
+    episode_id: &'a str,
+    start_node: &'a str,
+    targets: &'a [String],
+    /// the RUNG's `n` (the sampler block's `subgraph_size`), not the realised ball
+    subgraph_size: u32,
+    /// the realised ball, as the visible edge list and node list show it
+    ball_nodes: usize,
+    b_fix: u32,
+    k_greedy_examined: &'a [String],
+    k_greedy_registered_at: &'a [Option<u32>],
+    k_greedy_expansions: u32,
+    k_greedy_recall_at_budget: Option<f64>,
+    k_greedy_stop_reason: &'a str,
+    k_greedy_frozen_examined: &'a [String],
+    k_greedy_frozen_registered_at: &'a [Option<u32>],
+    k_greedy_frozen_expansions: u32,
+    k_greedy_frozen_recall_at_budget: Option<f64>,
+    k_greedy_frozen_stop_reason: &'a str,
+    /// `o_k`: the k-oracle's expansion count, minimal only where `k_oracle_exact`
+    k_oracle_expansions: u32,
+    k_oracle_exact: bool,
+    k_oracle_lower_bound: u32,
+    k_oracle_upper_bound: u32,
+    k_oracle_searched: u64,
+    /// `|V'|`: the nodes the k-oracle searches (every node on any surviving
+    /// path to any target, plus the start)
+    k_oracle_pruned_nodes: usize,
+    /// the hidden scalar — at k >= 2 the MAXIMUM of the per-target
+    /// single-target overshoots, never `g_k - o_k`, which needs the k-oracle
+    greedy_overshoot: Option<i64>,
+    greedy_overshoots: Option<&'a Vec<i64>>,
+    removed_count: u32,
+    /// `|nodes_on_surviving_path|` — the union of the per-target path sets
+    nodes_on_surviving_path: usize,
+}
+
+/// The k baselines of `K_TARGETS_DESIGN.md` §3 on one split directory.
+///
+/// No model, no checkpoint, no training: every baseline here is model-free and
+/// reads the visible adjacency plus the hidden labels `hf-stage0`'s own
+/// baseline half already reads. The split directory is taken whole — the
+/// caller names the ONE directory to read, and a holdout path is refused on
+/// every argument.
+fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
+    use std::io::Write;
+    for path in [&args.split_dir, &args.embeddings, &args.output] {
+        refuse_holdout(path)?;
+    }
+    let (episodes, artifacts) = hf_io::read_split(&args.split_dir)?;
+    let embeddings = hf_embed::EmbeddingMatrix::load(&args.embeddings)?;
+    let take = if args.limit == 0 {
+        episodes.len()
+    } else {
+        args.limit.min(episodes.len())
+    };
+    let episodes = &episodes[..take];
+    if episodes.is_empty() {
+        return Err(HfError::Invalid(format!(
+            "{}: no episodes to read",
+            args.split_dir.display()
+        )));
+    }
+    // B_fix is ONE number per rung (§4), so a split whose episodes disagree is
+    // refused rather than averaged; --b-fix names it explicitly instead.
+    let mut derived: BTreeSet<u32> = BTreeSet::new();
+    for e in episodes {
+        derived.insert(hf_policies::rung_ball_size(e) / 2);
+    }
+    let b_fix = match args.b_fix {
+        Some(b) => b,
+        None => {
+            if derived.len() != 1 {
+                return Err(HfError::BandH(format!(
+                    "the split's episodes derive more than one B_fix ({derived:?}); name it with --b-fix"
+                )));
+            }
+            *derived.iter().next().expect("one")
+        }
+    };
+    let parent = args
+        .output
+        .parent()
+        .ok_or_else(|| HfError::Invalid("--output has no parent".into()))?;
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent).map_err(|e| HfError::Invalid(e.to_string()))?;
+    }
+    let mut file =
+        std::fs::File::create(&args.output).map_err(|e| HfError::Invalid(e.to_string()))?;
+    let mut targets_per_episode: BTreeSet<usize> = BTreeSet::new();
+    let mut exact = 0u64;
+    for e in episodes {
+        let g = hf_policies::EpisodeGraph::from_episode_k(e);
+        targets_per_episode.insert(g.target_count());
+        let greedy = hf_policies::k_greedy_trace(&g, &embeddings);
+        let frozen = hf_policies::k_greedy_frozen_trace(&g, &embeddings);
+        let oracle = hf_policies::k_oracle(&g);
+        if oracle.exact {
+            exact += 1;
+        }
+        let row = BaselineRow {
+            record_kind: "k_baseline_row",
+            episode_id: &e.episode_id,
+            start_node: &e.visible.start_node,
+            targets: &g.targets,
+            subgraph_size: g.subgraph_size,
+            ball_nodes: e.visible.nodes.len(),
+            b_fix,
+            k_greedy_examined: &greedy.examined,
+            k_greedy_registered_at: &greedy.registered_at_by_target,
+            k_greedy_expansions: greedy.expansions,
+            k_greedy_recall_at_budget: greedy.recall_at_budget(b_fix),
+            k_greedy_stop_reason: &greedy.stop_reason,
+            k_greedy_frozen_examined: &frozen.examined,
+            k_greedy_frozen_registered_at: &frozen.registered_at_by_target,
+            k_greedy_frozen_expansions: frozen.expansions,
+            k_greedy_frozen_recall_at_budget: frozen.recall_at_budget(b_fix),
+            k_greedy_frozen_stop_reason: &frozen.stop_reason,
+            k_oracle_expansions: oracle.trace.expansions,
+            k_oracle_exact: oracle.exact,
+            k_oracle_lower_bound: oracle.lower_bound,
+            k_oracle_upper_bound: oracle.upper_bound,
+            k_oracle_searched: oracle.searched,
+            k_oracle_pruned_nodes: oracle.pruned_nodes,
+            greedy_overshoot: e.hidden.greedy_overshoot,
+            greedy_overshoots: e.hidden.greedy_overshoots.as_ref(),
+            removed_count: e.hidden.removed_count,
+            nodes_on_surviving_path: e.hidden.nodes_on_surviving_path.len(),
+        };
+        let line = serde_json::to_string(&row).map_err(|e| HfError::Invalid(e.to_string()))?;
+        writeln!(file, "{line}").map_err(|e| HfError::Invalid(e.to_string()))?;
+    }
+    file.flush().map_err(|e| HfError::Invalid(e.to_string()))?;
+    let manifest_path = parent.join(format!(
+        "{}.manifest.json",
+        args.output
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "baselines".into())
+    ));
+    let manifest = json!({
+        "record_kind": "k_baseline_manifest",
+        "engine": "hippo-13 hf-splits baselines",
+        "policies": ["k_greedy", "k_greedy_frozen", "k_oracle"],
+        "split_dir": args.split_dir.to_string_lossy(),
+        "split_schema_version": artifacts.public.get("schema_version").cloned().unwrap_or(Value::Null),
+        "visible_sha256": artifacts.public.get("visible_sha256").cloned().unwrap_or(Value::Null),
+        "episode_count_in_split": artifacts.public.get("episode_count").cloned().unwrap_or(Value::Null),
+        "episodes_read": episodes.len(),
+        "targets_per_episode": targets_per_episode.iter().copied().collect::<Vec<usize>>(),
+        "b_fix": b_fix,
+        "b_fix_source": if args.b_fix.is_some() { "flag" } else { "rung_ball_size / 2" },
+        "oracle_state_budget": hf_policies::ORACLE_STATE_BUDGET,
+        "oracle_time_limit_ms": hf_policies::ORACLE_TIME_LIMIT.as_millis() as u64,
+        "oracle_exact_episodes": exact,
+        "embeddings": args.embeddings.to_string_lossy(),
+        "rows": args.output.file_name().map(|s| s.to_string_lossy().to_string()),
+        "model": Value::Null,
+        "checkpoint": Value::Null,
+        "training_authorized": false,
+    });
+    std::fs::write(
+        &manifest_path,
+        hf_core::files::python_json_pretty(&manifest),
+    )
+    .map_err(|e| HfError::Invalid(e.to_string()))?;
+    println!(
+        "baselines: {} episodes, B_fix {b_fix}, k-oracle exact on {exact} -> {}",
+        episodes.len(),
+        args.output.display()
+    );
+    Ok(())
+}
+
 fn prefix_check(old: &Path, new: &Path, embeddings: Option<&Path>) -> Result<bool, HfError> {
     let mut notes = Vec::new();
     let old_art = hf_io::validate_split_artifacts(old)?;
@@ -350,6 +566,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Write(args) => write(args),
+        Command::Baselines(args) => baselines(args),
         Command::PrefixCheck {
             old,
             new,
