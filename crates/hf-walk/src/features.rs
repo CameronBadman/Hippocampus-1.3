@@ -60,6 +60,12 @@ pub fn stop_row(
 
 pub trait FeatureSet: Sync {
     fn name(&self) -> &'static str;
+    /// Whether the set reduces every query-dependent channel over the
+    /// unregistered targets, and so may read a k >= 2 record. A set that forms
+    /// one query from one target must not (`K_TARGETS_DESIGN.md` §6 item 4).
+    fn k_aware(&self) -> bool {
+        false
+    }
     fn candidate_dim(&self, edim: usize) -> usize;
     fn context_dim(&self, edim: usize) -> usize;
     /// Width of the query token, or `None` when the set has no query token
@@ -209,7 +215,66 @@ impl FeatureSet for RelationalV6 {
         expanded: &[Local],
         parent_of: &HashMap<Local, Local>,
     ) -> DecisionItem {
-        relational_build(index, frontier, expanded, parent_of, None)
+        relational_build(index, frontier, expanded, parent_of, None, false)
+    }
+}
+
+/// `relational-v6` over k targets (`K_TARGETS_DESIGN.md` §2(d)): **every**
+/// channel that reads the query — `cos(c,q)`, `cos(p,q)`, `cos(m,q)`, the rank
+/// and z-score derived from `cos(c,q)`, the structure block's repeats of the
+/// first two, and the context token's `cos(x,q)` — becomes the **maximum over
+/// the currently unregistered targets** of the per-target cosine, and three
+/// scalars join the candidate row: the **minimum** over the unregistered
+/// targets of `cos(c, t)`, the **spread** `max − min`, and the
+/// **unregistered share** `|unregistered| / k`.
+///
+/// The row is `12 + STRUCTURE_DIM = 19` wide whatever k is, and the three new
+/// columns sit at 9..12, between the relational block and the structure block,
+/// so removing them gives `relational-v6`'s row back. At k = 1 the maximum and
+/// the minimum are the one target's cosine, computed by the same call on the
+/// same vector, the spread is 0 and the share is 1 — the reduction is the
+/// identity, which `tests/k_walk.rs` checks bit for bit.
+///
+/// Width-agnostic is not distribution-agnostic: the share's support and the
+/// maximum's distribution both move with k (§2's disclosure).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RelationalV6K;
+
+/// The nine relational columns, the three k columns, and the structure block.
+pub const RELATIONAL_K_CANDIDATE_DIM: usize = 12 + STRUCTURE_DIM;
+/// Where the three k columns start in the candidate row.
+pub const RELATIONAL_K_EXTRA_AT: usize = 9;
+
+impl FeatureSet for RelationalV6K {
+    fn name(&self) -> &'static str {
+        "relational-v6-k"
+    }
+    fn k_aware(&self) -> bool {
+        true
+    }
+    fn candidate_dim(&self, _edim: usize) -> usize {
+        RELATIONAL_K_CANDIDATE_DIM
+    }
+    fn context_dim(&self, _edim: usize) -> usize {
+        RELATIONAL_CONTEXT_DIM
+    }
+    fn query_dim(&self, _edim: usize) -> Option<usize> {
+        None
+    }
+    fn pair_dim(&self) -> usize {
+        RELATIONAL_PAIR_DIM
+    }
+    fn cosine_column(&self, _edim: usize) -> usize {
+        0
+    }
+    fn build(
+        &self,
+        index: VisibleIndex<'_>,
+        frontier: &[Entry],
+        expanded: &[Local],
+        parent_of: &HashMap<Local, Local>,
+    ) -> DecisionItem {
+        relational_build(index, frontier, expanded, parent_of, None, true)
     }
 }
 
@@ -260,7 +325,7 @@ impl FeatureSet for RelationalV6Prev {
         parent_of: &HashMap<Local, Local>,
     ) -> DecisionItem {
         let previous = PreviousNodes::of(expanded, parent_of);
-        relational_build(index, frontier, expanded, parent_of, Some(&previous))
+        relational_build(index, frontier, expanded, parent_of, Some(&previous), false)
     }
 }
 
@@ -294,14 +359,16 @@ impl PreviousNodes {
 }
 
 /// The shared relational builder: `previous` is `None` for `relational-v6` and
-/// carries the two previous-node columns for `relational-v6-prev`. The
-/// candidate row is the same either way.
+/// carries the two previous-node columns for `relational-v6-prev`; `reduce` is
+/// `relational-v6-k`'s max-over-unregistered reduction with its three extra
+/// columns. The candidate row is otherwise the same.
 fn relational_build(
     index: VisibleIndex<'_>,
     frontier: &[Entry],
     expanded: &[Local],
     parent_of: &HashMap<Local, Local>,
     previous: Option<&PreviousNodes>,
+    reduce: bool,
 ) -> DecisionItem {
     let n = frontier.len();
     let edim = index.edim();
@@ -314,14 +381,42 @@ fn relational_build(
         Some(_) => RELATIONAL_PREV_CONTEXT_DIM,
         None => RELATIONAL_CONTEXT_DIM,
     };
-    let uq: Vec<f32> = {
-        let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        q.iter().map(|x| x / norm).collect()
+    let cdim = if reduce {
+        RELATIONAL_K_CANDIDATE_DIM
+    } else {
+        RELATIONAL_CANDIDATE_DIM
     };
-    let cos_cq: Vec<f32> = frontier
+    // every channel that reads `q`: one vector at k = 1, the max over the
+    // unregistered targets under the reduction
+    let cos_q = |v: &[f32]| -> f32 {
+        if reduce {
+            index.cos_query_max(v)
+        } else {
+            cosine(v, q)
+        }
+    };
+    let uq: Vec<f32> = crate::visible::unit_query(q);
+    let unit_dot_q = |uv: &[f32]| -> f32 {
+        if reduce {
+            index.unit_dot_query_max(uv)
+        } else {
+            uv.iter().zip(&uq).map(|(a, b)| a * b).sum()
+        }
+    };
+    // `cos(c, q)` and, under the reduction, its minimum over the same set
+    let cos_cq_pairs: Vec<(f32, f32)> = frontier
         .iter()
-        .map(|e| cosine(index.emb(e.node), q))
+        .map(|e| {
+            let c = index.emb(e.node);
+            if reduce {
+                index.cos_query_min_max(c)
+            } else {
+                let v = cosine(c, q);
+                (v, v)
+            }
+        })
         .collect();
+    let cos_cq: Vec<f32> = cos_cq_pairs.iter().map(|(_, hi)| *hi).collect();
     // rank (0 = highest cosine) normalised, and z-score within the frontier
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|a, b| {
@@ -339,7 +434,7 @@ fn relational_build(
     }
     let mean = cos_cq.iter().sum::<f32>() / n.max(1) as f32;
     let sd = (cos_cq.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / n.max(1) as f32).sqrt();
-    let mut cand = Vec::with_capacity(n * RELATIONAL_CANDIDATE_DIM);
+    let mut cand = Vec::with_capacity(n * cdim);
     let mut pair = Vec::with_capacity(n * expanded.len() * pair_dim);
     for (i, e) in frontier.iter().enumerate() {
         let c = index.emb(e.node);
@@ -371,14 +466,14 @@ fn relational_build(
                 pair.push(prev.recency[k]);
             }
         }
-        let cos_pq = cosine(p, q);
+        let cos_pq = cos_q(p);
         let cos_cp = cosine(c, p);
         cand.extend_from_slice(&[
             cos_cq[i],
             cos_pq,
             cos_cp,
             cosine(c, &e.path_mean),
-            cosine(&e.path_mean, q),
+            cos_q(&e.path_mean),
             cos_cs,
             rank[i],
             if sd > 0.0 {
@@ -392,12 +487,16 @@ fn relational_build(
                 max_cos_expanded
             },
         ]);
+        if reduce {
+            let (lo, hi) = cos_cq_pairs[i];
+            cand.extend_from_slice(&[lo, hi - lo, index.unregistered_share()]);
+        }
         cand.extend_from_slice(&structure_features(index, e, n, cos_cq[i], cos_pq, cos_cp));
     }
     let mut ctx = Vec::with_capacity(expanded.len() * ctx_dim);
     for (k, &x) in expanded.iter().enumerate() {
         let ux = index.unit(x);
-        let cos_xq: f32 = ux.iter().zip(&uq).map(|(a, b)| a * b).sum();
+        let cos_xq: f32 = unit_dot_q(ux);
         // the running path mean is per frontier entry; for a context token use
         // the mean over the expansion order so far, a visible quantity
         let mut m = vec![0f32; edim];

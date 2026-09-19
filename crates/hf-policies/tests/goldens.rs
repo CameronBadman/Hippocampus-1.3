@@ -74,7 +74,7 @@ fn traces_match_policies_v5_on_every_fixture_episode() {
                 assert_eq!(trace.parents, parents, "{policy} parents");
                 if let Some(route) = want["route"].as_array() {
                     let route: Vec<&str> = route.iter().map(|v| v.as_str().unwrap()).collect();
-                    assert_eq!(trace.route(&g.start, &g.target), route, "{policy} route");
+                    assert_eq!(trace.route(&g.start, g.target()), route, "{policy} route");
                 } else {
                     assert_eq!(
                         policy, "bidirectional_bfs",

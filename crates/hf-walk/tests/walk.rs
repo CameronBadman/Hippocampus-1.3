@@ -329,13 +329,16 @@ fn abandonment_episode() -> EpisodeIndex {
         episode_id: "hand-built".into(),
         names,
         start: 0,
-        target_shown: Some(4),
+        // no shown target, so nothing registers and the walk exhausts — the
+        // episode exists to be walked to the end, not to be completed
+        targets_shown: Vec::new(),
         hidden_targets: Vec::new(),
         out: vec![vec![1, 3], vec![2], vec![], vec![4], vec![]],
         edim: 2,
         emb,
         unit,
-        query: vec![1.0, 0.0],
+        queries: vec![1.0, 0.0],
+        unit_queries: vec![1.0, 0.0],
         on_path: vec![false; 5],
         distance: vec![None; 5],
         removed_count: 0,
@@ -493,13 +496,17 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
         [
             "names",
             "start",
-            "target_shown",
+            "targets_shown",
             "out",
             "edim",
             "emb",
             "unit",
-            "query"
-        ]
+            "queries",
+            "unit_queries",
+            "unregistered"
+        ],
+        "the k fields are the shown targets, their queries and the walk's own \
+         registration mask — nothing the sampler kept back"
     );
     let mut methods: Vec<&str> = source
         .lines()
@@ -510,6 +517,8 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
     assert_eq!(
         methods,
         [
+            "cos_query_max",
+            "cos_query_min_max",
             "degree",
             "edim",
             "emb",
@@ -519,34 +528,49 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
             "node_count",
             "out",
             "query",
+            "query_of",
             "start",
+            "target_count",
             "target_shown",
-            "unit"
+            "targets_shown",
+            "unit",
+            "unit_dot_query_max",
+            "unit_query",
+            "unit_query_of",
+            "unregistered",
+            "unregistered_share"
         ]
     );
 }
 
-/// A k ≥ 2 record is refused, not half-read: the builder makes one query from
-/// one shown target, and `K_TARGETS_DESIGN.md` §6 item 4's builder is not
-/// written. The guard is on the visible side, where the shown targets are.
+/// A k >= 2 record now BUILDS: `EpisodeIndex` carries one query per shown
+/// target and the walk registers per target. The refusal of §6 item 4 moved to
+/// the one place that pairs a record with a feature set, and
+/// `tests/k_walk.rs::a_two_target_record_is_refused_by_a_single_target_feature_set`
+/// is where it is now tested; here we only check the index itself reads both.
 #[test]
-fn a_two_target_record_is_refused_by_the_single_target_builder() {
+fn a_two_target_record_builds_one_query_per_shown_target() {
     let (episodes, cache, _) = episodes();
     let mut episode = episodes[0].clone();
-    EpisodeIndex::new(&episode, &cache, 8).expect("a k = 1 record still builds");
+    let one = EpisodeIndex::new(&episode, &cache, 8).expect("a k = 1 record still builds");
+    assert_eq!(one.target_count(), 1);
     let first = episode.visible.target_node.clone().unwrap();
     let second = episode.visible.nodes[1].node.clone();
     let mut shown = vec![first, second];
     shown.sort();
     episode.visible.schema_version = hf_io::SCHEMA_VERSION_V6.into();
     episode.visible.target_node = Some(shown[0].clone());
-    episode.visible.target_nodes = Some(shown);
-    let error = match EpisodeIndex::new(&episode, &cache, 8) {
-        Ok(_) => panic!("a k >= 2 record must be refused, not half-read"),
-        Err(e) => e,
-    };
-    assert!(
-        format!("{error}").contains("k >= 2"),
-        "expected the k >= 2 refusal, got {error}"
-    );
+    episode.visible.target_nodes = Some(shown.clone());
+    let two = EpisodeIndex::new(&episode, &cache, 8).expect("a k = 2 record builds");
+    assert_eq!(two.target_count(), 2);
+    for (t, name) in shown.iter().enumerate() {
+        let local = two.names.iter().position(|n| n == name).unwrap() as u32;
+        assert_eq!(two.targets_shown[t], local);
+        assert_eq!(
+            two.query_of(t),
+            two.emb(local),
+            "one query per shown target"
+        );
+    }
+    assert_eq!(two.query(), two.query_of(0), "v1's query is the first");
 }

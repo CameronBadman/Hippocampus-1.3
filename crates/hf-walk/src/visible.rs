@@ -2,43 +2,62 @@
 //!
 //! `VisibleIndex` borrows the visible arrays of an `EpisodeIndex` — the node
 //! names, the adjacency in `edge_id` order, the raw and unit embeddings, the
-//! query, the start and the shown target — and holds nothing else. It keeps
-//! slices rather than a reference to the index, so a builder cannot reach the
-//! private payload of an episode even from inside this crate, where a private
-//! field of a parent module would otherwise be in scope. `FeatureSet::build`
-//! takes this view and only this view.
+//! shown targets with their queries, the start — and the walk's own
+//! registration mask, which is derived from the shown targets and the walk's
+//! examination history and from nothing else. It keeps slices rather than a
+//! reference to the index, so a builder cannot reach the private payload of an
+//! episode even from inside this crate, where a private field of a parent
+//! module would otherwise be in scope. `FeatureSet::build` takes this view and
+//! only this view.
 //!
-//! Every accessor here is a function of the visible split alone. Nothing that
-//! the sampler kept back is reachable through it, by construction rather than
-//! by convention: the fields below are the whole of its state.
+//! Every accessor here is a function of the visible split and the walk's own
+//! state alone. Nothing that the sampler kept back is reachable through it, by
+//! construction rather than by convention: the fields below are the whole of
+//! its state.
+//!
+//! The query reduction of `K_TARGETS_DESIGN.md` §2(d) lives here, so that the
+//! feature builders and the walk's own cosine column read one implementation:
+//! every `cos(·, q)` is the **maximum over the currently unregistered targets**
+//! of the per-target cosine, and the candidate row also carries the minimum and
+//! the unregistered share. At k = 1 the maximum over the one target is that
+//! target's cosine, computed by the same `cosine` call on the same vector, so
+//! the reduction is the identity.
 
-use crate::{EpisodeIndex, Local};
+use crate::{cosine, EpisodeIndex, Local};
 
-/// The visible half of one indexed episode, borrowed.
+/// The visible half of one indexed episode, borrowed, with the walk's
+/// registration mask over the shown targets.
 #[derive(Clone, Copy, Debug)]
 pub struct VisibleIndex<'a> {
     names: &'a [String],
     start: Local,
-    target_shown: Option<Local>,
+    targets_shown: &'a [Local],
     out: &'a [Vec<Local>],
     edim: usize,
     emb: &'a [f32],
     unit: &'a [f32],
-    query: &'a [f32],
+    queries: &'a [f32],
+    unit_queries: &'a [f32],
+    unregistered: &'a [bool],
 }
 
 impl<'a> VisibleIndex<'a> {
-    /// Borrow the visible arrays of an indexed episode.
-    pub fn new(index: &'a EpisodeIndex) -> Self {
+    /// Borrow the visible arrays of an indexed episode together with the
+    /// walk's unregistered mask (one flag per shown target, `true` while the
+    /// target has not yet been examined).
+    pub fn new(index: &'a EpisodeIndex, unregistered: &'a [bool]) -> Self {
+        debug_assert_eq!(unregistered.len(), index.targets_shown.len());
         Self {
             names: &index.names,
             start: index.start,
-            target_shown: index.target_shown,
+            targets_shown: &index.targets_shown,
             out: &index.out,
             edim: index.edim,
             emb: &index.emb,
             unit: &index.unit,
-            query: &index.query,
+            queries: &index.queries,
+            unit_queries: &index.unit_queries,
+            unregistered,
         }
     }
 
@@ -62,9 +81,34 @@ impl<'a> VisibleIndex<'a> {
         self.start
     }
 
-    /// The shown target, when the episode has one.
+    /// The first shown target, when the episode has one.
     pub fn target_shown(&self) -> Option<Local> {
-        self.target_shown
+        self.targets_shown.first().copied()
+    }
+
+    /// Every shown target, in record order.
+    pub fn targets_shown(&self) -> &'a [Local] {
+        self.targets_shown
+    }
+
+    /// How many targets the record shows (`k`).
+    pub fn target_count(&self) -> usize {
+        self.targets_shown.len()
+    }
+
+    /// The unregistered mask over the shown targets, in the same order.
+    pub fn unregistered(&self) -> &'a [bool] {
+        self.unregistered
+    }
+
+    /// `|unregistered| / k` — the candidate row's third extra column. One
+    /// when the record shows no target at all.
+    pub fn unregistered_share(&self) -> f32 {
+        let k = self.target_count();
+        if k == 0 {
+            return 1.0;
+        }
+        self.unregistered.iter().filter(|u| **u).count() as f32 / k as f32
     }
 
     /// One node's out-neighbours, in `edge_id` order.
@@ -92,8 +136,73 @@ impl<'a> VisibleIndex<'a> {
         &self.unit[node as usize * self.edim..(node as usize + 1) * self.edim]
     }
 
-    /// The query vector (the shown target's embedding at stage 0).
+    /// The query vector: the first shown target's embedding at stage 0.
     pub fn query(&self) -> &'a [f32] {
-        self.query
+        &self.queries[..self.edim]
     }
+
+    /// The `t`-th shown target's query vector.
+    pub fn query_of(&self, t: usize) -> &'a [f32] {
+        &self.queries[t * self.edim..(t + 1) * self.edim]
+    }
+
+    /// The `t`-th shown target's unit-normalised query vector.
+    pub fn unit_query_of(&self, t: usize) -> &'a [f32] {
+        &self.unit_queries[t * self.edim..(t + 1) * self.edim]
+    }
+
+    /// The reduction's index set: the unregistered targets, or — when every
+    /// target is registered, which completion makes unreachable at a decision
+    /// — all of them, so no channel is ever a maximum over nothing.
+    fn reduced_over(&self) -> impl Iterator<Item = usize> + '_ {
+        let any = self.unregistered.iter().any(|u| *u);
+        (0..self.target_count()).filter(move |t| !any || self.unregistered[*t])
+    }
+
+    /// `(min, max)` over the unregistered targets of `cosine(v, q_t)`.
+    pub fn cos_query_min_max(&self, v: &[f32]) -> (f32, f32) {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for t in self.reduced_over() {
+            let c = cosine(v, self.query_of(t));
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        if hi == f32::NEG_INFINITY {
+            (0.0, 0.0)
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// `max` over the unregistered targets of `cosine(v, q_t)`.
+    pub fn cos_query_max(&self, v: &[f32]) -> f32 {
+        self.cos_query_min_max(v).1
+    }
+
+    /// `max` over the unregistered targets of the **unit** dot product
+    /// `unit(v) · unit(q_t)` — the context token's own arithmetic, which
+    /// differs from `cosine` in its accumulation and so is reduced separately.
+    pub fn unit_dot_query_max(&self, unit_v: &[f32]) -> f32 {
+        let mut hi = f32::NEG_INFINITY;
+        for t in self.reduced_over() {
+            let d: f32 = unit_v
+                .iter()
+                .zip(self.unit_query_of(t))
+                .map(|(a, b)| a * b)
+                .sum();
+            hi = hi.max(d);
+        }
+        if hi == f32::NEG_INFINITY {
+            0.0
+        } else {
+            hi
+        }
+    }
+}
+
+/// `q / ||q||` with the builders' floor, in f32 — the context token's
+/// normalisation, kept in one place so every reduction over it agrees.
+pub fn unit_query(q: &[f32]) -> Vec<f32> {
+    let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    q.iter().map(|x| x / norm).collect()
 }

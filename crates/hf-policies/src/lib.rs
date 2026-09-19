@@ -13,10 +13,20 @@
 //!   `+2.0`, the counter incrementing at every priority call (the start's
 //!   included), the query being the target's own vector at stage 0.
 
+pub mod ktargets;
+
 use std::collections::{HashMap, HashSet, VecDeque};
+
+pub use ktargets::{
+    all_k_traces, bidirectional_sequential_trace, k_blind_exhaust_trace, k_greedy_frozen_trace,
+    k_greedy_trace, k_oracle, k_oracle_trace, KOracle, K_POLICY_NAMES,
+};
 
 pub const STOP_REGISTERED: &str = "target_registered";
 pub const STOP_EXHAUSTED: &str = "exhausted";
+/// The k-oracle's search budget (`K_TARGETS_DESIGN.md` §3 item 3).
+pub const ORACLE_STATE_BUDGET: u64 = 1_000_000;
+pub const ORACLE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A vector lookup by node id in float64 — the fixture path's `dict` of
 /// Python floats is exact here; a float32 cache is widened (Python computes
@@ -43,7 +53,9 @@ impl Embeddings for HashMap<String, Vec<f64>> {
 #[derive(Clone, Debug)]
 pub struct EpisodeGraph {
     pub start: String,
-    pub target: String,
+    /// The episode's targets, in the record's order (node-name order at k >= 2);
+    /// one entry at k = 1, where `target()` is v1's `target`.
+    pub targets: Vec<String>,
     pub out: HashMap<String, Vec<String>>,
     /// Sources in first-appearance order — Python's dict insertion order, which
     /// fixes the backward side's queue order in the bidirectional walk.
@@ -53,6 +65,13 @@ pub struct EpisodeGraph {
     pub target_distance: u32,
     pub removal_level: u32,
     pub removed_count: u32,
+    /// The RUNG's ball size `n`, from which the default fixed budget
+    /// `B_fix = n / 2` of `K_TARGETS_DESIGN.md` §4 is taken — the sampler
+    /// block's `subgraph_size` on a committed episode (40 at rung 3, 80 at
+    /// rung 4), NOT the realised ball, which is smaller wherever the region
+    /// filter or the hub cap left fewer nodes. §4 fixes `B_fix` at 20 and 40,
+    /// one number per rung, so the strata are not a function of ball size.
+    pub subgraph_size: u32,
 }
 
 impl EpisodeGraph {
@@ -75,9 +94,65 @@ impl EpisodeGraph {
         for tails in out.values_mut() {
             tails.sort_unstable();
         }
+        Self::assemble(
+            start,
+            vec![target.to_string()],
+            out,
+            head_order,
+            surviving_paths,
+            distance_to_target,
+        )
+    }
+
+    /// The k-target view: the same adjacency, every target in the record's
+    /// order, and the union of the surviving paths.
+    pub fn new_k(
+        start: &str,
+        targets: Vec<String>,
+        edges: impl IntoIterator<Item = (String, String)>,
+        surviving_paths: Vec<Vec<String>>,
+        distance_to_target: HashMap<String, u32>,
+    ) -> Self {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        let mut head_order = Vec::new();
+        for (source, tail) in edges {
+            if !out.contains_key(&source) {
+                head_order.push(source.clone());
+            }
+            out.entry(source).or_default().push(tail);
+        }
+        for tails in out.values_mut() {
+            tails.sort_unstable();
+        }
+        Self::assemble(
+            start,
+            targets,
+            out,
+            head_order,
+            surviving_paths,
+            distance_to_target,
+        )
+    }
+
+    fn assemble(
+        start: &str,
+        targets: Vec<String>,
+        out: HashMap<String, Vec<String>>,
+        head_order: Vec<String>,
+        surviving_paths: Vec<Vec<String>>,
+        distance_to_target: HashMap<String, u32>,
+    ) -> Self {
+        // the ball as the edge list shows it, the fallback when no record says
+        let mut nodes: HashSet<&str> = HashSet::from([start]);
+        for (head, tails) in &out {
+            nodes.insert(head.as_str());
+            nodes.extend(tails.iter().map(String::as_str));
+        }
+        nodes.extend(targets.iter().map(String::as_str));
+        let subgraph_size = nodes.len() as u32;
         Self {
             start: start.to_string(),
-            target: target.to_string(),
+            targets,
             out,
             head_order,
             surviving_paths,
@@ -85,16 +160,32 @@ impl EpisodeGraph {
             target_distance: 0,
             removal_level: 0,
             removed_count: 0,
+            subgraph_size,
         }
+    }
+
+    /// The first target — v1's `target` field, and the whole of a k = 1 episode.
+    pub fn target(&self) -> &str {
+        &self.targets[0]
+    }
+
+    /// How many targets the episode carries.
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// `K_TARGETS_DESIGN.md` §4's fixed budget `B_fix = n / 2`.
+    pub fn b_fix(&self) -> u32 {
+        self.subgraph_size / 2
     }
 
     /// The single-target view of a committed episode. **k = 1 only**: it takes
     /// `target_set[0]` and the whole of `surviving_paths`, which on a k >= 2
     /// record is the union over targets — `oracle_trace` on that union would
     /// expand whichever target's surviving paths are the shorter and call the
-    /// result an oracle. A k-target baseline is `K_TARGETS_DESIGN.md` §6 item
-    /// 3's own work (`k_similarity_greedy_trace`, `k_oracle_trace`); until it
-    /// exists, do not call this on a `targets = 2` split.
+    /// result an oracle. The k-target baselines are `from_episode_k`'s
+    /// (`k_greedy_trace`, `k_oracle_trace`, `bidirectional_sequential_trace`);
+    /// this one is v1's reader and stays v1's.
     pub fn from_episode(episode: &hf_io::RealEpisode) -> Self {
         let mut g = Self::new(
             &episode.visible.start_node,
@@ -112,13 +203,45 @@ impl EpisodeGraph {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
         );
-        g.target_distance = episode.hidden.target_distance;
-        g.removal_level = episode.visible.removal_level;
-        g.removed_count = episode.hidden.removed_count;
+        g.fill_from(episode);
         g
     }
 
-    fn tails(&self, node: &str) -> &[String] {
+    /// The k-target view of a committed episode: every target of `target_set`
+    /// in the record's order, and the UNION of the surviving paths, which is
+    /// what `K_TARGETS_DESIGN.md` §3 item 3 prunes the k-oracle's ball to.
+    /// `distance_to_target` is the record's per-node minimum over targets; the
+    /// k baselines take their own per-target distances from the graph, so no
+    /// reader here mistakes a union for one target's.
+    pub fn from_episode_k(episode: &hf_io::RealEpisode) -> Self {
+        let mut g = Self::new_k(
+            &episode.visible.start_node,
+            episode.hidden.target_set.clone(),
+            episode
+                .visible
+                .edges
+                .iter()
+                .map(|e| (e.source.clone(), e.target.clone())),
+            episode.hidden.surviving_paths.clone(),
+            episode
+                .hidden
+                .distance_to_target
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+        );
+        g.fill_from(episode);
+        g
+    }
+
+    fn fill_from(&mut self, episode: &hf_io::RealEpisode) {
+        self.target_distance = episode.hidden.target_distance;
+        self.removal_level = episode.visible.removal_level;
+        self.removed_count = episode.hidden.removed_count;
+        self.subgraph_size = rung_ball_size(episode);
+    }
+
+    pub(crate) fn tails(&self, node: &str) -> &[String] {
         self.out.get(node).map(Vec::as_slice).unwrap_or(&[])
     }
 }
@@ -128,26 +251,60 @@ impl EpisodeGraph {
 pub struct WalkTrace {
     pub examined: Vec<String>,
     pub expansions: u32,
+    /// The expansions completed when the LAST target registered — v1's
+    /// `registered_at` at k = 1, where the last is the only one.
     pub registered_at: Option<u32>,
+    /// The expansions completed when each target registered, in `targets`
+    /// order; one entry at k = 1.
+    pub registered_at_by_target: Vec<Option<u32>>,
     pub stop_reason: String,
     pub parents: HashMap<String, String>,
 }
 
 impl WalkTrace {
     fn new() -> Self {
+        Self::with_targets(1)
+    }
+
+    pub(crate) fn with_targets(k: usize) -> Self {
         Self {
             stop_reason: STOP_EXHAUSTED.into(),
+            registered_at_by_target: vec![None; k],
             ..Default::default()
         }
     }
 
     fn register(&mut self) {
         self.registered_at = Some(self.expansions);
+        self.registered_at_by_target = vec![Some(self.expansions)];
         self.stop_reason = STOP_REGISTERED.into();
     }
 
     pub fn registered(&self) -> bool {
         self.registered_at.is_some()
+    }
+
+    /// How many targets registered.
+    pub fn registered_targets(&self) -> usize {
+        self.registered_at_by_target
+            .iter()
+            .filter(|r| r.is_some())
+            .count()
+    }
+
+    /// `K_TARGETS_DESIGN.md` §4's recall over k at a fixed budget: the share of
+    /// targets registered within `budget` expansions.
+    pub fn recall_at_budget(&self, budget: u32) -> Option<f64> {
+        let k = self.registered_at_by_target.len();
+        if k == 0 {
+            return None;
+        }
+        let hit = self
+            .registered_at_by_target
+            .iter()
+            .filter(|r| r.is_some_and(|at| at <= budget))
+            .count();
+        Some(hit as f64 / k as f64)
     }
 
     /// The route: the parent chain of the node whose expansion registered the target.
@@ -179,8 +336,9 @@ fn forward_walk(
     let mut trace = WalkTrace::new();
     let mut frontier: Vec<(Key, String, u32)> = vec![(priority(&g.start, 0), g.start.clone(), 0)];
     let mut seen: HashSet<String> = HashSet::from([g.start.clone()]);
-    if g.start == g.target {
+    if g.start == *g.target() {
         trace.registered_at = Some(0);
+        trace.registered_at_by_target = vec![Some(0)];
         trace.stop_reason = STOP_REGISTERED.into();
         return trace;
     }
@@ -193,7 +351,7 @@ fn forward_walk(
         trace.expansions += 1;
         trace.examined.push(node.clone());
         for tail in g.tails(&node) {
-            if *tail == g.target {
+            if *tail == *g.target() {
                 trace.register();
                 return trace;
             }
@@ -254,15 +412,16 @@ pub fn bidirectional_bfs_trace(g: &EpisodeGraph) -> WalkTrace {
         }
     }
     let mut trace = WalkTrace::new();
-    if g.start == g.target {
+    if g.start == *g.target() {
         trace.registered_at = Some(0);
+        trace.registered_at_by_target = vec![Some(0)];
         trace.stop_reason = STOP_REGISTERED.into();
         return trace;
     }
     let mut forward: VecDeque<&str> = VecDeque::from([g.start.as_str()]);
-    let mut backward: VecDeque<&str> = VecDeque::from([g.target.as_str()]);
+    let mut backward: VecDeque<&str> = VecDeque::from([g.target()]);
     let mut seen_f: HashSet<&str> = HashSet::from([g.start.as_str()]);
-    let mut seen_b: HashSet<&str> = HashSet::from([g.target.as_str()]);
+    let mut seen_b: HashSet<&str> = HashSet::from([g.target()]);
     while !forward.is_empty() || !backward.is_empty() {
         let side_forward =
             (forward.len() <= backward.len() && !forward.is_empty()) || backward.is_empty();
@@ -272,7 +431,7 @@ pub fn bidirectional_bfs_trace(g: &EpisodeGraph) -> WalkTrace {
                 trace.expansions += 1;
                 trace.examined.push(node.to_string());
                 for tail in g.tails(node) {
-                    if *tail == g.target || seen_b.contains(tail.as_str()) {
+                    if *tail == *g.target() || seen_b.contains(tail.as_str()) {
                         trace.register();
                         return trace;
                     }
@@ -328,7 +487,7 @@ pub fn similarity_greedy_trace(
 ) -> WalkTrace {
     let q: Vec<f64> = match query
         .map(<[f64]>::to_vec)
-        .or_else(|| embeddings.vector(&g.target))
+        .or_else(|| embeddings.vector(g.target()))
     {
         Some(q) => q,
         None => return blind_exhaust_trace(g),
@@ -369,7 +528,25 @@ pub fn all_traces(g: &EpisodeGraph, embeddings: &dyn Embeddings) -> Vec<(&'stati
     ]
 }
 
-/// `policy_row_v5`.
+/// The rung's `n`: the sampler block's `subgraph_size`, falling back to the
+/// realised ball of the visible payload when a record carries no sampler block.
+pub fn rung_ball_size(episode: &hf_io::RealEpisode) -> u32 {
+    episode
+        .hidden
+        .sampler
+        .get("subgraph_size")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(episode.visible.subgraph_size)
+}
+
+/// `policy_row_v5`, with `K_TARGETS_DESIGN.md` §6 item 3's k fields.
+///
+/// `registered` is **all k registered**, which at k = 1 is v1's field. The
+/// three k fields are written **only on a k >= 2 episode**: a k = 1 row is v5
+/// key for key and value for value, which every committed reader and the
+/// policy goldens depend on. §6 item 3 lists them flat; the k = 1 identity
+/// makes them conditional, and this is where that is decided.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct PolicyRow {
     pub registered: bool,
@@ -380,9 +557,26 @@ pub struct PolicyRow {
     pub target_distance: u32,
     pub removal_level: u32,
     pub removed_count: u32,
+    /// How many targets registered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_targets: Option<usize>,
+    /// The expansions completed when each target registered, in `targets` order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_at: Option<Vec<Option<u32>>>,
+    /// §4's recall over k at the fixed budget: targets registered / k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_at_budget: Option<f64>,
 }
 
+/// The row at the default fixed budget `B_fix = n / 2` (§4).
 pub fn policy_row(g: &EpisodeGraph, trace: &WalkTrace) -> PolicyRow {
+    policy_row_at(g, trace, g.b_fix())
+}
+
+/// The row with the budget named: `B_fix` is a **coverage choice**, re-readable
+/// at another value without re-drawing a pool.
+pub fn policy_row_at(g: &EpisodeGraph, trace: &WalkTrace, budget: u32) -> PolicyRow {
+    let k = g.target_count() > 1;
     PolicyRow {
         registered: trace.registered_at.is_some(),
         expansions: trace.expansions,
@@ -392,5 +586,12 @@ pub fn policy_row(g: &EpisodeGraph, trace: &WalkTrace) -> PolicyRow {
         target_distance: g.target_distance,
         removal_level: g.removal_level,
         removed_count: g.removed_count,
+        registered_targets: k.then(|| trace.registered_targets()),
+        registered_at: k.then(|| trace.registered_at_by_target.clone()),
+        recall_at_budget: if k {
+            trace.recall_at_budget(budget)
+        } else {
+            None
+        },
     }
 }

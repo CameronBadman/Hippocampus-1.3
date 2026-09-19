@@ -8,16 +8,22 @@
 //! are `exhaust` (stop on registration or an empty frontier) and `learned`
 //! (the stop head, consulted after each decision and before the expansion).
 //!
-//! Three feature sets are shipped behind one trait: `RawV5`, the Python
+//! At k >= 2 the record shows every target, registration is per target and
+//! the walk completes when **all** of them are registered, so at least one is
+//! unregistered at every decision; `RelationalV6K` reduces every channel that
+//! reads the query over that unregistered set (`K_TARGETS_DESIGN.md` §2).
+//!
+//! Four feature sets are shipped behind one trait: `RawV5`, the Python
 //! candidate row (`[c, q, path_mean, parent]` + seven structure features, raw
 //! context and query embeddings, the `[cos, is-parent]` pair channel);
 //! `RelationalV6`, the redesign, in which no raw embedding coordinate enters
 //! any channel; and `RelationalV6Prev`, that redesign with the
 //! selective-previous-nodes channels on the context token and the pair
-//! channel. A builder receives a `VisibleIndex` — the borrowed visible arrays
-//! of one episode — so no feature can be a function of what the sampler kept
-//! back. The scorer is a trait so the walk is tested with stubs and driven by
-//! the libtorch model in `hf-model`.
+//! channel; and `RelationalV6K`, that redesign over k targets. A builder
+//! receives a `VisibleIndex` — the borrowed visible arrays of one episode and
+//! the walk's own registration mask — so no feature can be a function of what
+//! the sampler kept back. The scorer is a trait so the walk is tested with
+//! stubs and driven by the libtorch model in `hf-model`.
 
 pub mod features;
 pub mod visible;
@@ -27,7 +33,9 @@ use std::collections::{HashMap, HashSet};
 use hf_core::HfError;
 use serde::Serialize;
 
-pub use features::{FeatureSet, RawV5, RelationalV6, RelationalV6Prev, STOP_DIM, STRUCTURE_DIM};
+pub use features::{
+    FeatureSet, RawV5, RelationalV6, RelationalV6K, RelationalV6Prev, STOP_DIM, STRUCTURE_DIM,
+};
 pub use visible::VisibleIndex;
 
 /// A node's index within one episode's subgraph.
@@ -40,13 +48,19 @@ pub struct EpisodeIndex {
     pub episode_id: String,
     pub names: Vec<String>,
     pub start: Local,
-    pub target_shown: Option<Local>,
+    /// Every shown target, in the record's order (`target_nodes`, which is
+    /// node-name order, led by `target_node`); one entry at k = 1.
+    pub targets_shown: Vec<Local>,
     pub hidden_targets: Vec<Local>,
     pub out: Vec<Vec<Local>>,
     pub edim: usize,
     pub emb: Vec<f32>,
     pub unit: Vec<f32>,
-    pub query: Vec<f32>,
+    /// One query per shown target, flattened: the target's own embedding at
+    /// stage 0. `queries[..edim]` is v1's single query.
+    pub queries: Vec<f32>,
+    /// Each query unit-normalised, the context token's own arithmetic.
+    pub unit_queries: Vec<f32>,
     /// `nodes_on_surviving_path` membership, per local node.
     pub on_path: Vec<bool>,
     /// `distance_to_target` per local node, `None` when unreachable.
@@ -62,19 +76,6 @@ impl EpisodeIndex {
         embeddings: &hf_embed::EmbeddingMatrix,
         edim: usize,
     ) -> Result<Self, HfError> {
-        // This builder forms ONE query from ONE shown target and labels from a
-        // single-target `distance_to_target`. A k >= 2 record (6.0.0, carrying
-        // `target_nodes`) needs the max-over-unregistered reduction and the
-        // three extra columns of `K_TARGETS_DESIGN.md` §2, which §6 item 4
-        // leaves to its own work — so refuse it rather than read half of it.
-        if let Some(shown) = &episode.visible.target_nodes {
-            return Err(HfError::BandH(format!(
-                "{}: the record shows {} targets; the single-target feature builder \
-                 cannot read a k >= 2 episode (K_TARGETS_DESIGN.md §6 item 4)",
-                episode.episode_id,
-                shown.len()
-            )));
-        }
         let names: Vec<String> = episode
             .visible
             .nodes
@@ -129,26 +130,36 @@ impl EpisodeIndex {
             }
         }
         let start = lookup(&episode.visible.start_node)?;
-        let target_shown = episode
-            .visible
-            .target_node
-            .as_deref()
-            .map(lookup)
-            .transpose()?;
+        // The shown targets, from the VISIBLE side only: `target_nodes` on a
+        // k >= 2 record (6.0.0), `target_node` otherwise. The walk's
+        // registration mask is built from these, never from what the sampler
+        // kept back (`K_TARGETS_DESIGN.md` §2, last paragraph).
+        let shown: Vec<&str> = match &episode.visible.target_nodes {
+            Some(t) => t.iter().map(String::as_str).collect(),
+            None => episode.visible.target_node.as_deref().into_iter().collect(),
+        };
+        let targets_shown = shown
+            .iter()
+            .map(|t| lookup(t))
+            .collect::<Result<Vec<_>, _>>()?;
         let hidden_targets = episode
             .hidden
             .target_set
             .iter()
             .map(|t| lookup(t))
             .collect::<Result<Vec<_>, _>>()?;
-        let query = match target_shown {
-            Some(t) => emb[t as usize * edim..(t as usize + 1) * edim].to_vec(),
-            None => {
-                return Err(HfError::Invalid(
-                    "stage 1 walks need a query; not implemented".into(),
-                ))
-            }
-        };
+        if targets_shown.is_empty() {
+            return Err(HfError::Invalid(
+                "stage 1 walks need a query; not implemented".into(),
+            ));
+        }
+        let mut queries = Vec::with_capacity(targets_shown.len() * edim);
+        let mut unit_queries = Vec::with_capacity(targets_shown.len() * edim);
+        for t in &targets_shown {
+            let q = &emb[*t as usize * edim..(*t as usize + 1) * edim];
+            queries.extend_from_slice(q);
+            unit_queries.extend_from_slice(&visible::unit_query(q));
+        }
         let on_set: HashSet<&str> = episode
             .hidden
             .nodes_on_surviving_path
@@ -164,13 +175,14 @@ impl EpisodeIndex {
             episode_id: episode.episode_id.clone(),
             names,
             start,
-            target_shown,
+            targets_shown,
             hidden_targets,
             out,
             edim,
             emb,
             unit,
-            query,
+            queries,
+            unit_queries,
             on_path,
             distance,
             removed_count: episode.hidden.removed_count,
@@ -188,6 +200,26 @@ impl EpisodeIndex {
 
     pub fn unit(&self, node: Local) -> &[f32] {
         &self.unit[node as usize * self.edim..(node as usize + 1) * self.edim]
+    }
+
+    /// The first shown target, v1's `target_shown`.
+    pub fn target_shown(&self) -> Option<Local> {
+        self.targets_shown.first().copied()
+    }
+
+    /// How many targets the record shows (`k`).
+    pub fn target_count(&self) -> usize {
+        self.targets_shown.len()
+    }
+
+    /// The `t`-th shown target's query vector.
+    pub fn query_of(&self, t: usize) -> &[f32] {
+        &self.queries[t * self.edim..(t + 1) * self.edim]
+    }
+
+    /// The query: the first shown target's embedding at stage 0.
+    pub fn query(&self) -> &[f32] {
+        self.query_of(0)
     }
 }
 
@@ -297,7 +329,10 @@ impl StopRule {
 pub struct WalkResult {
     pub expanded: Vec<Local>,
     pub decisions: Vec<Decision>,
+    /// The expansion count at which **every** shown target was registered.
     pub registered_at: Option<usize>,
+    /// Per shown target, the expansion count at which it was registered.
+    pub registered_at_by_target: Vec<Option<usize>>,
     pub stop_reason: &'static str,
     pub examined: usize,
     pub residuals: Option<Vec<Vec<f32>>>,
@@ -314,6 +349,30 @@ impl WalkResult {
     pub fn expansions(&self) -> usize {
         self.expanded.len()
     }
+
+    /// How many of the shown targets registered, at the walk's own stop.
+    pub fn registered_targets(&self) -> usize {
+        self.registered_at_by_target
+            .iter()
+            .filter(|r| r.is_some())
+            .count()
+    }
+
+    /// `K_TARGETS_DESIGN.md` §4's recall over k at a fixed budget: the share
+    /// of targets registered within `budget` expansions. `None` when the
+    /// record shows no target.
+    pub fn recall_at_budget(&self, budget: usize) -> Option<f64> {
+        let k = self.registered_at_by_target.len();
+        if k == 0 {
+            return None;
+        }
+        let hit = self
+            .registered_at_by_target
+            .iter()
+            .filter(|r| r.is_some_and(|at| at <= budget))
+            .count();
+        Some(hit as f64 / k as f64)
+    }
 }
 
 struct State<'a> {
@@ -323,7 +382,11 @@ struct State<'a> {
     /// The discovery parent of every expanded node (the start has none).
     parent_of: HashMap<Local, Local>,
     frontier: Vec<Entry>,
+    /// One flag per **shown** target (`K_TARGETS_DESIGN.md` §2: the mask comes
+    /// from the visible side and the walk's own examination history).
     registered: Vec<bool>,
+    /// The expansion count at which each shown target registered.
+    registered_at_by_target: Vec<Option<usize>>,
     registered_at: Option<usize>,
     stop_reason: &'static str,
     examined: usize,
@@ -343,7 +406,8 @@ impl<'a> State<'a> {
             seen: HashSet::from([index.start]),
             parent_of: HashMap::new(),
             frontier: Vec::new(),
-            registered: vec![false; index.hidden_targets.len()],
+            registered: vec![false; index.targets_shown.len()],
+            registered_at_by_target: vec![None; index.targets_shown.len()],
             registered_at: None,
             stop_reason: "exhausted",
             examined: 0,
@@ -365,17 +429,25 @@ impl<'a> State<'a> {
         s
     }
 
+    /// Completion is **all k registered** — and a record that shows no target
+    /// is never complete, so an empty mask is false rather than vacuously true.
     fn all_registered(&self) -> bool {
-        self.registered.iter().all(|r| *r)
+        !self.registered.is_empty() && self.registered.iter().all(|r| *r)
+    }
+
+    /// The reduction's mask: `true` where the target is still unregistered.
+    fn unregistered(&self) -> Vec<bool> {
+        self.registered.iter().map(|r| !*r).collect()
     }
 
     fn push_children(&mut self, node: Local, depth: u32, path_mean: &[f32]) {
         let index = self.index;
         for &child in &index.out[node as usize] {
             self.examined += 1;
-            if let Some(t) = index.hidden_targets.iter().position(|t| *t == child) {
+            if let Some(t) = index.targets_shown.iter().position(|t| *t == child) {
                 if !self.registered[t] {
                     self.registered[t] = true;
+                    self.registered_at_by_target[t] = Some(self.expanded.len());
                     if self.all_registered() && self.registered_at.is_none() {
                         self.registered_at = Some(self.expanded.len());
                     }
@@ -402,7 +474,7 @@ impl<'a> State<'a> {
     }
 
     fn check_registered(&mut self) {
-        if self.registered_at.is_some() && self.index.target_shown.is_some() {
+        if self.registered_at.is_some() && !self.index.targets_shown.is_empty() {
             self.stop_reason = "target_registered";
             self.live = false;
         }
@@ -416,6 +488,7 @@ impl<'a> State<'a> {
             expanded: self.expanded,
             decisions: self.decisions,
             registered_at: self.registered_at,
+            registered_at_by_target: self.registered_at_by_target,
             stop_reason: self.stop_reason,
             examined: self.examined,
             residuals: if with_prior {
@@ -477,6 +550,21 @@ pub fn walk_batch(
     scorer: &mut dyn Scorer,
     options: WalkOptions,
 ) -> Result<Vec<WalkResult>, HfError> {
+    // A feature set that forms one query from one target cannot read a k >= 2
+    // episode: the refusal of `K_TARGETS_DESIGN.md` §6 item 4, moved from the
+    // index (which now builds every record) to the one place that pairs a
+    // record with a feature set.
+    if !features.k_aware() {
+        if let Some(i) = indexes.iter().find(|i| i.target_count() > 1) {
+            return Err(HfError::BandH(format!(
+                "{}: the record shows {} targets; the single-target feature set {:?} \
+                 cannot read a k >= 2 episode (K_TARGETS_DESIGN.md §6 item 4)",
+                i.episode_id,
+                i.target_count(),
+                features.name()
+            )));
+        }
+    }
     let mut states: Vec<State> = indexes
         .iter()
         .map(|i| State::new(i, options.record_candidates))
@@ -497,16 +585,15 @@ pub fn walk_batch(
             live.par_iter()
                 .map(|&i| {
                     let s = &states[i];
-                    let item = features.build(
-                        VisibleIndex::new(s.index),
-                        &s.frontier,
-                        &s.expanded,
-                        &s.parent_of,
-                    );
+                    let mask = s.unregistered();
+                    let visible = VisibleIndex::new(s.index, &mask);
+                    let item = features.build(visible, &s.frontier, &s.expanded, &s.parent_of);
+                    // the greedy prior's column, the stop row's best cosine and
+                    // the dump's cosines all read the SAME reduction the row does
                     let cosines: Vec<f32> = s
                         .frontier
                         .iter()
-                        .map(|e| cosine(s.index.emb(e.node), &s.index.query))
+                        .map(|e| visible.cos_query_max(s.index.emb(e.node)))
                         .collect();
                     (item, cosines)
                 })

@@ -138,9 +138,25 @@ pub fn evaluate(
 ) -> Result<Evaluation, HfError> {
     let features = model.features();
     let with_prior = model.config.greedy_prior;
+    // a split is drawn at one k; the baselines are v1's at k = 1 and
+    // `K_TARGETS_DESIGN.md` §3's at k >= 2, and the per-episode row names them
+    let k_split = episodes
+        .first()
+        .is_some_and(|e| e.hidden.target_set.len() > 1);
+    let policy_names: &[&str] = if k_split {
+        &hf_policies::K_POLICY_NAMES
+    } else {
+        &hf_policies::POLICY_NAMES
+    };
+    // the similarity baseline, whose recall at B_fix defines §4's strata:
+    // v1's `similarity_greedy`, k-greedy at k >= 2, which equals it at k = 1
+    let greedy_at = policy_names
+        .iter()
+        .position(|n| *n == "similarity_greedy" || *n == "k_greedy")
+        .expect("a similarity baseline in every list");
     let mut learned_rows: Vec<RuleRow> = Vec::with_capacity(episodes.len());
     let mut exhaust_rows: Vec<RuleRow> = Vec::with_capacity(episodes.len());
-    let mut baseline_rows: Vec<Vec<RuleRow>> = vec![Vec::new(); 4];
+    let mut baseline_rows: Vec<Vec<RuleRow>> = vec![Vec::new(); policy_names.len()];
     let mut rows: Vec<Value> = Vec::with_capacity(episodes.len());
     let mut candidates = Vec::new();
     for chunk in episodes.chunks(EVAL_BATCH) {
@@ -173,8 +189,16 @@ pub fn evaluate(
             },
         )?;
         for (i, e) in chunk.iter().enumerate() {
-            let g = hf_policies::EpisodeGraph::from_episode(e);
-            let traces = hf_policies::all_traces(&g, embeddings);
+            let g = if k_split {
+                hf_policies::EpisodeGraph::from_episode_k(e)
+            } else {
+                hf_policies::EpisodeGraph::from_episode(e)
+            };
+            let traces = if k_split {
+                hf_policies::all_k_traces(&g, embeddings)
+            } else {
+                hf_policies::all_traces(&g, embeddings)
+            };
             let index = &indexes[i];
             let lw = &learned[i];
             let xw = &exhaust[i];
@@ -209,6 +233,40 @@ pub fn evaluate(
                     .unwrap_or(Value::Null),
             );
             row.insert("removed_count".into(), e.hidden.removed_count.into());
+            // K_TARGETS_DESIGN.md §4: recall over k at the fixed budget
+            // B_fix = n / 2, read at the walk's own stop under `exhaust`, and
+            // the per-target registration the strata and the rank reading need.
+            // The STRATA are k-greedy's recall, formed at read time from
+            // `similarity_greedy_recall_at_budget`, which §4 names; the key
+            // keeps v1's name so a committed reader finds it.
+            // n is the RUNG's ball size (the sampler block's `subgraph_size`:
+            // 20 at rung 3, 40 at rung 4), not the realised ball, so B_fix is
+            // one number per rung as §4 fixes it
+            let b_fix = hf_policies::rung_ball_size(e) / 2;
+            row.insert("budget_at_recall".into(), b_fix.into());
+            row.insert(
+                "recall_at_budget".into(),
+                xw.recall_at_budget(b_fix as usize)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            row.insert("registered_targets".into(), xw.registered_targets().into());
+            row.insert(
+                "registered_at".into(),
+                xw.registered_at_by_target
+                    .iter()
+                    .map(|r| r.map(Value::from).unwrap_or(Value::Null))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            row.insert(
+                "similarity_greedy_recall_at_budget".into(),
+                traces[greedy_at]
+                    .1
+                    .recall_at_budget(b_fix)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
             row.insert(
                 "walk_expanded".into(),
                 xw.expanded
@@ -219,7 +277,7 @@ pub fn evaluate(
             );
             row.insert(
                 "similarity_greedy_examined".into(),
-                traces[2]
+                traces[greedy_at]
                     .1
                     .examined
                     .iter()
@@ -274,12 +332,12 @@ pub fn evaluate(
     report.insert("learned".into(), summarise(&learned_rows)?);
     report.insert("exhaust".into(), summarise(&exhaust_rows)?);
     let mut baselines = Map::new();
-    for (k, name) in hf_policies::POLICY_NAMES.iter().enumerate() {
+    for (k, name) in policy_names.iter().enumerate() {
         baselines.insert((*name).to_string(), summarise(&baseline_rows[k])?);
     }
     report.insert("baselines".into(), Value::Object(baselines));
     for (rule, walked) in [("learned", &learned_rows), ("exhaust", &exhaust_rows)] {
-        for (k, name) in hf_policies::POLICY_NAMES.iter().enumerate() {
+        for (k, name) in policy_names.iter().enumerate() {
             report.insert(
                 format!("{rule}_vs_{name}"),
                 paired(walked, &baseline_rows[k]),

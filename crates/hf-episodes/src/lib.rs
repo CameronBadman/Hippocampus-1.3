@@ -787,7 +787,7 @@ impl<'g> Sampler<'g> {
                 let draft =
                     self.episode_graph(&sub, &ball, start, *t, &HashSet::new(), &path_sets[i]);
                 let trace = similarity_greedy_trace(&draft, embeddings.expect("checked"), None);
-                let route = trace.route(&draft.start, &draft.target);
+                let route = trace.route(&draft.start, draft.target());
                 if route.is_empty() {
                     return Ok(Err(Dropped::GreedyRouteMissing));
                 }
