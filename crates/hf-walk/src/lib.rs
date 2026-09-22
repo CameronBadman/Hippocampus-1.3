@@ -41,23 +41,89 @@ pub use visible::VisibleIndex;
 /// A node's index within one episode's subgraph.
 pub type Local = u32;
 
+/// Where the walk's query vector comes from.
+///
+/// `TargetEmbedding` is stage 0 and the default: the query is the SHOWN
+/// target's own embedding row, so the record names what is being looked for.
+/// `EpisodeQuery` is stage 1: the visible payload shows no target at all and
+/// the query is the episode's own question vector, read from a sidecar
+/// embedding cache keyed by episode id. Under it the target reaches the engine
+/// through the hidden payload only, for registration and the losses' labels —
+/// `VisibleIndex` is handed an empty list of shown targets, so no feature
+/// builder can be a function of the target's identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuerySource {
+    #[default]
+    TargetEmbedding,
+    EpisodeQuery,
+}
+
+impl QuerySource {
+    pub fn parse(s: &str) -> Result<Self, HfError> {
+        match s {
+            "target_embedding" => Ok(Self::TargetEmbedding),
+            "episode_query" => Ok(Self::EpisodeQuery),
+            other => Err(HfError::Invalid(format!(
+                "unknown query source {other:?}; it is \"target_embedding\" or \"episode_query\""
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TargetEmbedding => "target_embedding",
+            Self::EpisodeQuery => "episode_query",
+        }
+    }
+}
+
+/// The query's provenance for one run: the source and, under `episode_query`,
+/// the sidecar cache the vectors are read from (an ordinary v5 embedding cache
+/// whose "node" ids are EPISODE ids).
+#[derive(Clone, Copy, Default)]
+pub struct QueryVectors<'a> {
+    pub source: QuerySource,
+    pub cache: Option<&'a hf_embed::EmbeddingMatrix>,
+}
+
+impl<'a> QueryVectors<'a> {
+    /// Stage 0: the query is the shown target's own row, no sidecar.
+    pub fn target_embedding() -> Self {
+        Self::default()
+    }
+
+    /// Stage 1: the query is this episode's own question vector.
+    pub fn episode_query(cache: &'a hf_embed::EmbeddingMatrix) -> Self {
+        Self {
+            source: QuerySource::EpisodeQuery,
+            cache: Some(cache),
+        }
+    }
+}
+
 /// One episode, indexed for the walk: adjacency in `edge_id` order, raw and
 /// unit embeddings (zero when the cache lacks the node), the query (the shown
-/// target's embedding at stage 0), and the hidden truth the losses need.
+/// target's embedding at stage 0, the episode's own question vector under
+/// `episode_query`), and the hidden truth the losses need.
 pub struct EpisodeIndex {
     pub episode_id: String,
     pub names: Vec<String>,
     pub start: Local,
     /// Every shown target, in the record's order (`target_nodes`, which is
-    /// node-name order, led by `target_node`); one entry at k = 1.
+    /// node-name order, led by `target_node`); one entry at k = 1, and NONE
+    /// under `episode_query`, where the visible payload shows no target.
     pub targets_shown: Vec<Local>,
     pub hidden_targets: Vec<Local>,
+    /// Where `queries` came from; `registration_targets` follows it.
+    pub query_source: QuerySource,
     pub out: Vec<Vec<Local>>,
     pub edim: usize,
     pub emb: Vec<f32>,
     pub unit: Vec<f32>,
     /// One query per shown target, flattened: the target's own embedding at
-    /// stage 0. `queries[..edim]` is v1's single query.
+    /// stage 0. `queries[..edim]` is v1's single query. Under `episode_query`
+    /// there is exactly one, the episode's own question vector, and it belongs
+    /// to no target.
     pub queries: Vec<f32>,
     /// Each query unit-normalised, the context token's own arithmetic.
     pub unit_queries: Vec<f32>,
@@ -70,11 +136,25 @@ pub struct EpisodeIndex {
 }
 
 impl EpisodeIndex {
-    /// `RealEpisodeIndex(episode, embeddings, embedding_dimension)`.
+    /// `RealEpisodeIndex(episode, embeddings, embedding_dimension)` at stage 0:
+    /// the query is the shown target's own embedding row.
     pub fn new(
         episode: &hf_io::RealEpisode,
         embeddings: &hf_embed::EmbeddingMatrix,
         edim: usize,
+    ) -> Result<Self, HfError> {
+        Self::new_with_query(episode, embeddings, edim, QueryVectors::target_embedding())
+    }
+
+    /// The same index with the query's provenance named. Under
+    /// `QuerySource::EpisodeQuery` the record must be a stage-1 one — it may
+    /// show no target, it must carry exactly one hidden target, and its query
+    /// vector must be in the sidecar cache under its own episode id.
+    pub fn new_with_query(
+        episode: &hf_io::RealEpisode,
+        embeddings: &hf_embed::EmbeddingMatrix,
+        edim: usize,
+        queries: QueryVectors<'_>,
     ) -> Result<Self, HfError> {
         let names: Vec<String> = episode
             .visible
@@ -138,7 +218,7 @@ impl EpisodeIndex {
             Some(t) => t.iter().map(String::as_str).collect(),
             None => episode.visible.target_node.as_deref().into_iter().collect(),
         };
-        let targets_shown = shown
+        let mut targets_shown = shown
             .iter()
             .map(|t| lookup(t))
             .collect::<Result<Vec<_>, _>>()?;
@@ -148,18 +228,80 @@ impl EpisodeIndex {
             .iter()
             .map(|t| lookup(t))
             .collect::<Result<Vec<_>, _>>()?;
-        if targets_shown.is_empty() {
-            return Err(HfError::Invalid(
-                "stage 1 walks need a query; not implemented".into(),
-            ));
-        }
-        let mut queries = Vec::with_capacity(targets_shown.len() * edim);
-        let mut unit_queries = Vec::with_capacity(targets_shown.len() * edim);
-        for t in &targets_shown {
-            let q = &emb[*t as usize * edim..(*t as usize + 1) * edim];
-            queries.extend_from_slice(q);
-            unit_queries.extend_from_slice(&visible::unit_query(q));
-        }
+        let query_source = queries.source;
+        let (queries, unit_queries) = match query_source {
+            QuerySource::TargetEmbedding => {
+                if queries.cache.is_some() {
+                    return Err(HfError::Invalid(
+                        "a query sidecar was given but the query source is target_embedding".into(),
+                    ));
+                }
+                if targets_shown.is_empty() {
+                    return Err(HfError::Invalid(format!(
+                        "{}: the visible payload shows no target; a stage-1 walk needs \
+                         data.query_source = \"episode_query\" and a query sidecar",
+                        episode.episode_id
+                    )));
+                }
+                let mut q = Vec::with_capacity(targets_shown.len() * edim);
+                let mut u = Vec::with_capacity(targets_shown.len() * edim);
+                for t in &targets_shown {
+                    let row = &emb[*t as usize * edim..(*t as usize + 1) * edim];
+                    q.extend_from_slice(row);
+                    u.extend_from_slice(&visible::unit_query(row));
+                }
+                (q, u)
+            }
+            QuerySource::EpisodeQuery => {
+                // stage 1 only: the record must show no target, and `hf-io`
+                // already refuses a stage-1 payload carrying `target_node`.
+                // The refusal is repeated here because an index is also built
+                // from records held in memory, which no reader has validated.
+                if episode.visible.stage != hf_io::STAGES[1] {
+                    return Err(HfError::BandH(format!(
+                        "{}: query_source episode_query needs a {} record, not {:?}",
+                        episode.episode_id,
+                        hf_io::STAGES[1],
+                        episode.visible.stage
+                    )));
+                }
+                if !targets_shown.is_empty() {
+                    return Err(HfError::BandH(format!(
+                        "{}: the visible payload names a target under query_source \
+                         episode_query; the target is the hidden payload's alone",
+                        episode.episode_id
+                    )));
+                }
+                if hidden_targets.len() != 1 {
+                    return Err(HfError::BandH(format!(
+                        "{}: query_source episode_query is k = 1 only; this record carries \
+                         {} targets",
+                        episode.episode_id,
+                        hidden_targets.len()
+                    )));
+                }
+                let cache = queries.cache.ok_or_else(|| {
+                    HfError::Invalid(
+                        "query_source episode_query needs a query embedding cache".into(),
+                    )
+                })?;
+                let row = cache.get(&episode.episode_id).ok_or_else(|| {
+                    HfError::BandH(format!(
+                        "the query cache holds no vector for episode {}",
+                        episode.episode_id
+                    ))
+                })?;
+                if row.len() < edim {
+                    return Err(HfError::BandH(format!(
+                        "the query of episode {} has width {} < {edim}",
+                        episode.episode_id,
+                        row.len()
+                    )));
+                }
+                targets_shown = Vec::new();
+                (row[..edim].to_vec(), visible::unit_query(&row[..edim]))
+            }
+        };
         let on_set: HashSet<&str> = episode
             .hidden
             .nodes_on_surviving_path
@@ -177,6 +319,7 @@ impl EpisodeIndex {
             start,
             targets_shown,
             hidden_targets,
+            query_source,
             out,
             edim,
             emb,
@@ -207,9 +350,28 @@ impl EpisodeIndex {
         self.targets_shown.first().copied()
     }
 
-    /// How many targets the record shows (`k`).
+    /// How many targets the record shows (`k`); zero under `episode_query`.
     pub fn target_count(&self) -> usize {
         self.targets_shown.len()
+    }
+
+    /// How many queries the row reads: `k` at stage 0, one under
+    /// `episode_query`. It is the width of the walk's registration mask and
+    /// the index set every query channel reduces over.
+    pub fn query_count(&self) -> usize {
+        self.queries.len().checked_div(self.edim).unwrap_or(0)
+    }
+
+    /// The targets the walk registers on: the SHOWN targets at stage 0, which
+    /// is what `K_TARGETS_DESIGN.md` §2 requires of a record that names them;
+    /// the episode's one hidden target under `episode_query`, where nothing
+    /// visible names it. The mask built from these lives in the walk's own
+    /// state and never enters `VisibleIndex`.
+    pub fn registration_targets(&self) -> &[Local] {
+        match self.query_source {
+            QuerySource::TargetEmbedding => &self.targets_shown,
+            QuerySource::EpisodeQuery => &self.hidden_targets,
+        }
     }
 
     /// The `t`-th shown target's query vector.
@@ -217,7 +379,8 @@ impl EpisodeIndex {
         &self.queries[t * self.edim..(t + 1) * self.edim]
     }
 
-    /// The query: the first shown target's embedding at stage 0.
+    /// The query: the first shown target's embedding at stage 0, the episode's
+    /// own question vector under `episode_query`.
     pub fn query(&self) -> &[f32] {
         self.query_of(0)
     }
@@ -382,8 +545,11 @@ struct State<'a> {
     /// The discovery parent of every expanded node (the start has none).
     parent_of: HashMap<Local, Local>,
     frontier: Vec<Entry>,
-    /// One flag per **shown** target (`K_TARGETS_DESIGN.md` §2: the mask comes
-    /// from the visible side and the walk's own examination history).
+    /// One flag per **registration** target (`K_TARGETS_DESIGN.md` §2: at
+    /// stage 0 the mask comes from the visible side and the walk's own
+    /// examination history; under `episode_query` nothing visible names the
+    /// target, so it comes from the hidden payload and stays HERE, outside
+    /// `VisibleIndex`, where no feature builder can reach it).
     registered: Vec<bool>,
     /// The expansion count at which each shown target registered.
     registered_at_by_target: Vec<Option<usize>>,
@@ -406,8 +572,8 @@ impl<'a> State<'a> {
             seen: HashSet::from([index.start]),
             parent_of: HashMap::new(),
             frontier: Vec::new(),
-            registered: vec![false; index.targets_shown.len()],
-            registered_at_by_target: vec![None; index.targets_shown.len()],
+            registered: vec![false; index.registration_targets().len()],
+            registered_at_by_target: vec![None; index.registration_targets().len()],
             registered_at: None,
             stop_reason: "exhausted",
             examined: 0,
@@ -435,16 +601,32 @@ impl<'a> State<'a> {
         !self.registered.is_empty() && self.registered.iter().all(|r| *r)
     }
 
-    /// The reduction's mask: `true` where the target is still unregistered.
+    /// The reduction's mask, one flag per QUERY: `true` where the query's
+    /// target is still unregistered. At stage 0 there is one query per shown
+    /// target and this is `!registered` entry for entry — the vector the walk
+    /// has always handed the view. Under `episode_query` the one query has the
+    /// one hidden target's flag; a hand-built index with a query and no
+    /// registration target leaves it unregistered, which is what a walk that
+    /// can never complete means.
     fn unregistered(&self) -> Vec<bool> {
-        self.registered.iter().map(|r| !*r).collect()
+        let mut mask = vec![true; self.index.query_count()];
+        for (t, r) in self.registered.iter().enumerate() {
+            if let Some(flag) = mask.get_mut(t) {
+                *flag = !*r;
+            }
+        }
+        mask
     }
 
     fn push_children(&mut self, node: Local, depth: u32, path_mean: &[f32]) {
         let index = self.index;
         for &child in &index.out[node as usize] {
             self.examined += 1;
-            if let Some(t) = index.targets_shown.iter().position(|t| *t == child) {
+            if let Some(t) = index
+                .registration_targets()
+                .iter()
+                .position(|t| *t == child)
+            {
                 if !self.registered[t] {
                     self.registered[t] = true;
                     self.registered_at_by_target[t] = Some(self.expanded.len());
@@ -474,7 +656,7 @@ impl<'a> State<'a> {
     }
 
     fn check_registered(&mut self) {
-        if self.registered_at.is_some() && !self.index.targets_shown.is_empty() {
+        if self.registered_at.is_some() && !self.index.registration_targets().is_empty() {
             self.stop_reason = "target_registered";
             self.live = false;
         }
@@ -561,6 +743,24 @@ pub fn walk_batch(
                  cannot read a k >= 2 episode (K_TARGETS_DESIGN.md §6 item 4)",
                 i.episode_id,
                 i.target_count(),
+                features.name()
+            )));
+        }
+    }
+    // A set that copies the query vector into the rows would put the raw
+    // QUESTION into every candidate row and into the query token, which is not
+    // the one variable stage 1 changes; refused here, where a record meets a
+    // feature set, as the k refusal above is.
+    if features.embeds_query_vector() {
+        if let Some(i) = indexes
+            .iter()
+            .find(|i| i.query_source == QuerySource::EpisodeQuery)
+        {
+            return Err(HfError::Refused(format!(
+                "{}: the feature set {:?} copies the raw query vector into every candidate \
+                 row and into the query token; under query_source episode_query that vector \
+                 is the question itself, so it is refused",
+                i.episode_id,
                 features.name()
             )));
         }

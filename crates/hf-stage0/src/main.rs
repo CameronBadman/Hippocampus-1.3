@@ -65,6 +65,19 @@ struct Args {
     graph_dir: Option<PathBuf>,
     #[arg(long)]
     embeddings_dir: Option<PathBuf>,
+    /// an ordinary v5 embedding cache whose ids are EPISODE ids: the question
+    /// vectors of a stage-1 split. It needs `data.query_source:
+    /// "episode_query"` in the config, and every episode the run reads must be
+    /// in it.
+    #[arg(long)]
+    query_embeddings_dir: Option<PathBuf>,
+    /// refuse (exit 2) when the share of the run's DISTINCT visible nodes
+    /// present in --embeddings-dir is below this; a node the cache lacks is a
+    /// silent zero vector otherwise. It covers the node cache of the training
+    /// family over train, screen and screen2; the question vectors are not
+    /// covered by it — a missing episode id exits 2 whatever this says.
+    #[arg(long)]
+    expect_embedding_coverage: Option<f64>,
     #[arg(long)]
     splits_dir: Option<PathBuf>,
     #[arg(long)]
@@ -253,6 +266,24 @@ fn clip_max_norm(training: &Value) -> Result<Option<f64>, HfError> {
     }
 }
 
+/// `data.query_source`: where the walk's query comes from.
+///
+/// ABSENT — every config written before the key existed — is
+/// `"target_embedding"`, the shown target's own embedding row, so every
+/// existing config runs exactly as it did. `"episode_query"` is stage 1: the
+/// query is the episode's own question vector, read from the sidecar named by
+/// `--query-embeddings-dir`. Anything else is a broken config, refused here
+/// rather than rounded into the default.
+fn query_source(config: &Value) -> Result<hf_walk::QuerySource, HfError> {
+    match config.get("data").and_then(|d| d.get("query_source")) {
+        None | Some(Value::Null) => Ok(hf_walk::QuerySource::TargetEmbedding),
+        Some(Value::String(s)) => hf_walk::QuerySource::parse(s),
+        Some(other) => Err(HfError::Invalid(format!(
+            "data.query_source must be a string, not {other}"
+        ))),
+    }
+}
+
 /// The rule a run is governed by: the config names it. The v1 rule is the
 /// default the runner has always written, kept for a config that names none.
 fn governed_by(config: &Value) -> Value {
@@ -428,6 +459,48 @@ fn run(args: Args) -> Result<(), HfError> {
             "a stage 0 config must state training_authorized: false".into(),
         ));
     }
+    let query_source = query_source(&config)?;
+    // the stage-1 combinations that cannot mean anything, refused before a
+    // path is opened or a pool is read
+    match (query_source, args.query_embeddings_dir.is_some()) {
+        (hf_walk::QuerySource::EpisodeQuery, false) => {
+            return Err(HfError::Invalid(
+                "data.query_source \"episode_query\" needs --query-embeddings-dir".into(),
+            ))
+        }
+        (hf_walk::QuerySource::TargetEmbedding, true) => {
+            return Err(HfError::Invalid(
+                "--query-embeddings-dir needs data.query_source \"episode_query\" in the config"
+                    .into(),
+            ))
+        }
+        _ => {}
+    }
+    if query_source == hf_walk::QuerySource::EpisodeQuery {
+        if let Some(d) = &args.query_embeddings_dir {
+            hf_core::refuse_holdout(d)?;
+        }
+        if args.fixture {
+            return Err(HfError::Refused(
+                "the fixture world samples stage-0 episodes; it has no questions to read".into(),
+            ));
+        }
+        if args.heldout_splits_dir.is_some() {
+            return Err(HfError::Refused(
+                "a held-out family's split is stage 0 and its episodes are in no query \
+                 sidecar; read it in its own run"
+                    .into(),
+            ));
+        }
+        if config["model"].get("feature_set").and_then(Value::as_str) == Some("raw-v5") {
+            return Err(HfError::Refused(
+                "the feature set raw-v5 copies the raw query vector into every candidate row \
+                 and into the query token; under query_source episode_query that vector is \
+                 the question itself"
+                    .into(),
+            ));
+        }
+    }
     let deterministic = if args.deterministic {
         if std::env::var_os("CUBLAS_WORKSPACE_CONFIG").is_none() {
             std::env::set_var("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
@@ -462,6 +535,9 @@ fn run(args: Args) -> Result<(), HfError> {
         screen_episodes: args.screen_episodes,
         fixture: args.fixture,
         model_seed,
+        query_source,
+        query_embeddings_dir: args.query_embeddings_dir.as_deref(),
+        expect_embedding_coverage: args.expect_embedding_coverage,
     };
     let d = data::load(&inputs, &config)?;
     let model_config = ModelConfig::from_value(&config["model"], d.dim as i64)?;
@@ -642,7 +718,14 @@ fn reevaluate(
                           episodes: &[hf_io::RealEpisode],
                           emb: &hf_embed::EmbeddingMatrix|
      -> Result<Value, HfError> {
-        let ev = eval::evaluate(model, episodes, emb, d.dim, args.dump_candidates)?;
+        let ev = eval::evaluate(
+            model,
+            episodes,
+            emb,
+            d.dim,
+            args.dump_candidates,
+            d.query_vectors(),
+        )?;
         eval::write_evaluation_rows(
             args.output.as_ref().expect("required"),
             split,
@@ -768,6 +851,10 @@ fn reevaluate(
         "preregistration_commit": args.preregistration_commit,
         "family": d.family,
         "capacity": capacity,
+        "query_source": d.query_source.as_str(),
+        "query_embeddings": args.query_embeddings_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "query_embedding_manifest": d.query_embedding_manifest,
+        "embedding_coverage": d.embedding_coverage,
         "screen_episodes": d.screen.len(),
         "screen_dropped": d.screen_dropped,
         "split_manifests": d.split_manifests,
@@ -1053,7 +1140,7 @@ fn train(
         }
         let indexes: Vec<EpisodeIndex> = batch
             .iter()
-            .map(|e| EpisodeIndex::new(e, &d.embeddings, d.dim))
+            .map(|e| EpisodeIndex::new_with_query(e, &d.embeddings, d.dim, d.query_vectors()))
             .collect::<Result<_, _>>()?;
         let refs: Vec<&EpisodeIndex> = indexes.iter().collect();
         optimiser.zero_grad();
@@ -1175,20 +1262,41 @@ fn train(
         }
         last_finite = Some(update);
         if update % args.eval_every == 0 || update == updates {
-            let ev = eval::evaluate(model, &d.screen, &d.embeddings, d.dim, false)?;
+            let ev = eval::evaluate(
+                model,
+                &d.screen,
+                &d.embeddings,
+                d.dim,
+                false,
+                d.query_vectors(),
+            )?;
             eval::write_evaluation_rows(output, "screen", &Value::from(update), &ev.rows)?;
             let mut report = ev.report;
             report["update"] = update.into();
             evaluations.push(report.clone());
             if !d.screen2.is_empty() {
-                let ev2 = eval::evaluate(model, &d.screen2, &d.embeddings, d.dim, false)?;
+                let ev2 = eval::evaluate(
+                    model,
+                    &d.screen2,
+                    &d.embeddings,
+                    d.dim,
+                    false,
+                    d.query_vectors(),
+                )?;
                 eval::write_evaluation_rows(output, "screen2", &Value::from(update), &ev2.rows)?;
                 let mut r2 = ev2.report;
                 r2["update"] = update.into();
                 evaluations_screen2.push(r2);
             }
             if let Some(h) = &d.heldout {
-                let evh = eval::evaluate(model, &h.episodes, &h.embeddings, d.dim, false)?;
+                let evh = eval::evaluate(
+                    model,
+                    &h.episodes,
+                    &h.embeddings,
+                    d.dim,
+                    false,
+                    d.query_vectors(),
+                )?;
                 eval::write_evaluation_rows(output, "heldout", &Value::from(update), &evh.rows)?;
                 let mut rh = evh.report;
                 rh["update"] = update.into();
@@ -1257,6 +1365,10 @@ fn train(
         "clip_max_norm": clip_max_norm_value,
         "graph_manifest": d.graph_manifest,
         "embedding_manifest": d.embedding_manifest,
+        "query_source": d.query_source.as_str(),
+        "query_embeddings": args.query_embeddings_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "query_embedding_manifest": d.query_embedding_manifest,
+        "embedding_coverage": d.embedding_coverage,
         "capacity": capacity,
         "updates": updates,
         "train_episodes": d.train.len(),

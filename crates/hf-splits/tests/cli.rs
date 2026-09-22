@@ -710,3 +710,348 @@ fn baselines_refuses_a_holdout_path() {
     assert_eq!(out.status.code(), Some(2), "a heldout output exits 2");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Rewrite a stage-0 split directory as the stage-1 one a teacher would write:
+/// the visible payload drops `target_node` and gains `query`, and the hidden
+/// payload — the targets, the paths, the labels — is carried across unchanged.
+/// Returns the new split directory and the episode ids in file order.
+fn as_stage1_split(source: &std::path::Path, destination: &std::path::Path) -> Vec<String> {
+    let (episodes, artifacts) = hf_io::read_split(source).unwrap();
+    let mut ids = Vec::new();
+    let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+        .iter()
+        .map(|e| {
+            ids.push(e.episode_id.clone());
+            let mut visible = serde_json::to_value(&e.visible).unwrap();
+            let object = visible.as_object_mut().unwrap();
+            object.remove("target_node");
+            object.insert("stage".into(), hf_io::STAGES[1].into());
+            object.insert(
+                "query".into(),
+                serde_json::json!(format!("what does {} lead to?", e.visible.start_node)),
+            );
+            Ok(hf_io::EpisodeOut {
+                episode_id: e.episode_id.clone(),
+                visible,
+                hidden: serde_json::to_value(&e.hidden).unwrap(),
+            })
+        })
+        .collect();
+    hf_io::write_split(
+        "fixture",
+        hf_io::STAGES[1],
+        "screen",
+        destination,
+        out,
+        &artifacts.graph,
+        &artifacts.public["sampler"],
+    )
+    .unwrap();
+    ids
+}
+
+/// A question-vector sidecar: an ordinary v5 cache whose ids are EPISODE ids,
+/// written by the node cache's encoder unless `digest` says otherwise.
+fn write_query_cache(dir: &std::path::Path, ids: &[String], digest: &str, dimension: u32) {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("vectors.jsonl")).unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        let v: Vec<f64> = (0..dimension)
+            .map(|j| ((i as f64 + 1.0) * 0.37 + j as f64 * 0.11).sin())
+            .collect();
+        hf_embed::append_vector(&mut f, id, &v).unwrap();
+    }
+    let m = hf_embed::Manifest {
+        record_kind: hf_embed::MANIFEST_KIND.into(),
+        model: "fixture".into(),
+        model_digest: digest.into(),
+        base_url: "none".into(),
+        dimension,
+        count: ids.len() as u64,
+        text_char_limit: 6000,
+        text_sha256: None,
+        truncated: Default::default(),
+        training_authorized: false,
+        extra: Default::default(),
+    };
+    hf_embed::write_manifest(dir, &m).unwrap();
+}
+
+/// `--query-embeddings-dir`: greedy walks on the QUESTION and every row gains
+/// `question_greedy_overshoot` — greedy's expansions minus the single-target
+/// oracle's, the sampler's own definition of `greedy_overshoot` with the
+/// question in the target's place. The row's value is recomputed here from the
+/// policies directly, so the CLI is checked against the definition and not
+/// against itself.
+#[test]
+fn baselines_on_the_question_write_the_overshoot_the_strata_are_re_derived_from() {
+    let root = tmp("baselines-question");
+    let (gdir, cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 6);
+    let stage1 = root.join("stage1");
+    let ids = as_stage1_split(&dest.join("screen"), &stage1);
+    let qdir = root.join("queries");
+    write_query_cache(&qdir, &ids, "fixture", 8);
+    let rows_path = root.join("question.jsonl");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        stage1.to_str().unwrap(),
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--query-embeddings-dir",
+        qdir.to_str().unwrap(),
+        "--expect-embedding-coverage",
+        "1.0",
+        "--output",
+        rows_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (episodes, _) = hf_io::read_split(&stage1).unwrap();
+    let embeddings = hf_embed::EmbeddingMatrix::load(&cache).unwrap();
+    let queries = hf_embed::EmbeddingMatrix::load(&qdir).unwrap();
+    let rows = read_rows(&rows_path);
+    assert_eq!(rows.len(), episodes.len());
+    let mut moved = 0;
+    for (row, e) in rows.iter().zip(&episodes) {
+        let g = hf_policies::EpisodeGraph::from_episode(e);
+        let q: Vec<f64> = queries
+            .get(&e.episode_id)
+            .unwrap()
+            .iter()
+            .map(|x| *x as f64)
+            .collect();
+        let greedy = hf_policies::similarity_greedy_trace(&g, &embeddings, Some(&q));
+        let oracle = hf_policies::oracle_trace(&g);
+        assert_eq!(
+            row["question_greedy_expansions"].as_u64().unwrap(),
+            greedy.expansions as u64,
+            "{}",
+            e.episode_id
+        );
+        assert_eq!(
+            row["oracle_expansions"].as_u64().unwrap(),
+            oracle.expansions as u64
+        );
+        assert_eq!(
+            row["question_greedy_overshoot"].as_i64().unwrap(),
+            greedy.expansions as i64 - oracle.expansions as i64,
+            "greedy on the question minus the oracle"
+        );
+        // and it is NOT the walk on the target's own vector, which is what a
+        // carried stage-0 label would have been
+        let on_target = hf_policies::similarity_greedy_trace(&g, &embeddings, None);
+        if on_target.expansions != greedy.expansions {
+            moved += 1;
+        }
+    }
+    assert!(
+        moved > 0,
+        "the question changed no walk; the comparison would be vacuous"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("question.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["query_source"], "episode_query");
+    assert_eq!(manifest["embedding_coverage"], 1.0);
+    assert_eq!(manifest["expect_embedding_coverage"], 1.0);
+    assert_eq!(manifest["query_embedding_manifest"]["dimension"], 8);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Without the flag the row is the one the k baselines have always written:
+/// none of the question keys appears, and the manifest says which source it
+/// read. Beside it, the DEFINITION the question overshoot re-uses, checked
+/// against the sampler's own stored `greedy_overshoot` on a greedy-path split.
+#[test]
+fn without_the_flag_the_rows_are_unchanged_and_the_overshoot_definition_holds() {
+    let root = tmp("baselines-definition");
+    let (gdir, cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    let out = run(&[
+        "write",
+        "--family",
+        "fixture",
+        "--graph-dir",
+        gdir.to_str().unwrap(),
+        "--subgraph-size",
+        "64",
+        "--target-distance",
+        "3",
+        "--removal-level",
+        "2",
+        "--removal-rule",
+        "greedy-path",
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--train",
+        "0",
+        "--screen",
+        "6",
+        "--chunk",
+        "3",
+        "--destination",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let split = dest.join("screen");
+    let rows_path = root.join("plain.jsonl");
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        split.to_str().unwrap(),
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--output",
+        rows_path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = read_rows(&rows_path);
+    for row in &rows {
+        for key in [
+            "question_greedy_expansions",
+            "question_greedy_registered_at",
+            "question_greedy_stop_reason",
+            "oracle_expansions",
+            "question_greedy_overshoot",
+        ] {
+            assert!(
+                row.get(key).is_none(),
+                "{key} is written only with the flag"
+            );
+        }
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("plain.manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["query_source"], "target_embedding");
+    // the definition: the sampler's stored label is greedy on the TARGET's own
+    // vector minus the single-target oracle, which is what the question row
+    // recomputes with the question in the target's place
+    let (episodes, _) = hf_io::read_split(&split).unwrap();
+    let embeddings = hf_embed::EmbeddingMatrix::load(&cache).unwrap();
+    let mut checked = 0;
+    for e in &episodes {
+        let stored = e.hidden.greedy_overshoot.expect("a greedy-path split");
+        let g = hf_policies::EpisodeGraph::from_episode(e);
+        let greedy = hf_policies::similarity_greedy_trace(&g, &embeddings, None);
+        let oracle = hf_policies::oracle_trace(&g);
+        assert_eq!(
+            stored,
+            greedy.expansions as i64 - oracle.expansions as i64,
+            "{}",
+            e.episode_id
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The three refusals the sidecar brings, each exit 2: a question cache from
+/// another encoder, an episode it does not cover, and a node-coverage floor
+/// the node cache cannot meet.
+#[test]
+fn the_question_sidecar_refuses_another_encoder_a_missing_episode_and_thin_coverage() {
+    let root = tmp("baselines-refusals");
+    let (gdir, cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 6);
+    let stage1 = root.join("stage1");
+    let ids = as_stage1_split(&dest.join("screen"), &stage1);
+    let base = |qdir: &std::path::Path, extra: &[&str]| -> std::process::Output {
+        let rows = root.join("rows.jsonl");
+        let mut args: Vec<String> = vec![
+            "baselines".into(),
+            "--split-dir".into(),
+            stage1.to_string_lossy().into(),
+            "--embeddings".into(),
+            cache.to_string_lossy().into(),
+            "--query-embeddings-dir".into(),
+            qdir.to_string_lossy().into(),
+            "--output".into(),
+            rows.to_string_lossy().into(),
+        ];
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    let wrong = root.join("queries-wrong-encoder");
+    write_query_cache(&wrong, &ids, "another-encoder", 8);
+    let out = base(&wrong, &[]);
+    assert_eq!(out.status.code(), Some(2), "another encoder exits 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("another-encoder"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let narrow = root.join("queries-narrow");
+    write_query_cache(&narrow, &ids, "fixture", 4);
+    let out = base(&narrow, &[]);
+    assert_eq!(out.status.code(), Some(2), "a narrower question exits 2");
+    let partial = root.join("queries-partial");
+    write_query_cache(&partial, &ids[..1], "fixture", 8);
+    let out = base(&partial, &[]);
+    assert_eq!(out.status.code(), Some(2), "a missing episode exits 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no vector for episode"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // a floor the node cache cannot meet: a cache holding one node only
+    let thin = root.join("thin");
+    std::fs::create_dir_all(&thin).unwrap();
+    let (episodes, _) = hf_io::read_split(&stage1).unwrap();
+    let one = episodes[0].visible.nodes[0].node.clone();
+    let mut f = std::fs::File::create(thin.join("vectors.jsonl")).unwrap();
+    hf_embed::append_vector(&mut f, &one, &[0.5; 8]).unwrap();
+    drop(f);
+    hf_embed::write_manifest(
+        &thin,
+        &hf_embed::Manifest {
+            record_kind: hf_embed::MANIFEST_KIND.into(),
+            model: "fixture".into(),
+            model_digest: "fixture".into(),
+            base_url: "none".into(),
+            dimension: 8,
+            count: 1,
+            text_char_limit: 6000,
+            text_sha256: None,
+            truncated: Default::default(),
+            training_authorized: false,
+            extra: Default::default(),
+        },
+    )
+    .unwrap();
+    let out = run(&[
+        "baselines",
+        "--split-dir",
+        stage1.to_str().unwrap(),
+        "--embeddings",
+        thin.to_str().unwrap(),
+        "--output",
+        root.join("thin.jsonl").to_str().unwrap(),
+        "--expect-embedding-coverage",
+        "1.0",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "thin coverage exits 2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--expect-embedding-coverage"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

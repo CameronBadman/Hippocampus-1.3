@@ -515,14 +515,28 @@ pub const POLICY_NAMES: [&str; 4] = [
     "oracle",
 ];
 
-/// Every baseline on one episode, in `POLICY_NAMES` order.
+/// Every baseline on one episode, in `POLICY_NAMES` order, with the target's
+/// own vector as similarity-greedy's query (stage 0).
 pub fn all_traces(g: &EpisodeGraph, embeddings: &dyn Embeddings) -> Vec<(&'static str, WalkTrace)> {
+    all_traces_with_query(g, embeddings, None)
+}
+
+/// The same list with similarity-greedy's query NAMED: `None` is the target's
+/// own vector, which is stage 0 and what `all_traces` passes; `Some(q)` is the
+/// episode's question vector, the opponent a stage-1 reading is against. Only
+/// similarity-greedy reads a query at all — blind, bidirectional and the
+/// oracle are unchanged by it.
+pub fn all_traces_with_query(
+    g: &EpisodeGraph,
+    embeddings: &dyn Embeddings,
+    query: Option<&[f64]>,
+) -> Vec<(&'static str, WalkTrace)> {
     vec![
         ("blind_exhaust", blind_exhaust_trace(g)),
         ("bidirectional_bfs", bidirectional_bfs_trace(g)),
         (
             "similarity_greedy",
-            similarity_greedy_trace(g, embeddings, None),
+            similarity_greedy_trace(g, embeddings, query),
         ),
         ("oracle", oracle_trace(g)),
     ]

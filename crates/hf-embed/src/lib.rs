@@ -348,6 +348,45 @@ impl EmbeddingMatrix {
     }
 }
 
+/// Refuse a query sidecar that did not come from the node cache's encoder.
+///
+/// Every stage-1 channel is `cos(question, node)`, which is meaningless unless
+/// both vectors were written by the same model at the same width: a 384-wide
+/// question against 768-wide nodes, or a question from another encoder, would
+/// read as a walk whose compass is noise rather than as a failure. The two
+/// manifests must agree on `dimension` and on `model_digest`.
+pub fn same_encoder(nodes: &Manifest, queries: &Manifest) -> Result<(), HfError> {
+    if nodes.dimension != queries.dimension {
+        return Err(HfError::BandH(format!(
+            "the query cache is {} wide and the node cache {}",
+            queries.dimension, nodes.dimension
+        )));
+    }
+    if nodes.model_digest != queries.model_digest {
+        return Err(HfError::BandH(format!(
+            "the query cache was written by {} ({}) and the node cache by {} ({}); \
+             a cosine between two encoders' vectors is not a similarity",
+            queries.model, queries.model_digest, nodes.model, nodes.model_digest
+        )));
+    }
+    Ok(())
+}
+
+/// How many of the given ids the cache holds, over how many DISTINCT ids were
+/// given: `(present, total)`. A node the cache lacks is a silent zero vector
+/// wherever an episode is indexed, which is what `--expect-embedding-coverage`
+/// exists to catch before a run reads the result as evidence.
+pub fn coverage<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    matrix: &EmbeddingMatrix,
+) -> (usize, usize) {
+    // a pool of 40,000 episodes names about 1.6 M nodes; the set is the
+    // distinct ones, and hashing beats ordering here since only the count is read
+    let distinct: HashMap<&str, ()> = ids.into_iter().map(|n| (n, ())).collect();
+    let present = distinct.keys().filter(|n| matrix.contains(n)).count();
+    (present, distinct.len())
+}
+
 /// Cosine between two vectors, `0.0` when either norm is zero — the Python `cosine`.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0f64;

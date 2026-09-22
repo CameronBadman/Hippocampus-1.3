@@ -109,6 +109,18 @@ struct BaselinesArgs {
     /// the v5 embedding cache the similarity key reads
     #[arg(long)]
     embeddings: PathBuf,
+    /// an ordinary v5 embedding cache whose ids are EPISODE ids: the question
+    /// vectors of a stage-1 split. With it every row gains the greedy walk on
+    /// the question and `question_greedy_overshoot`; the manifest records
+    /// `query_source: episode_query`.
+    #[arg(long)]
+    query_embeddings_dir: Option<PathBuf>,
+    /// refuse (exit 2) when the share of the split's DISTINCT visible nodes
+    /// present in --embeddings is below this; a missing node is a silent zero
+    /// vector otherwise. The question vectors are not covered by it: a missing
+    /// episode id exits 2 whatever this says.
+    #[arg(long)]
+    expect_embedding_coverage: Option<f64>,
     /// the JSONL of rows; `<stem>.manifest.json` is written beside it
     #[arg(long)]
     output: PathBuf,
@@ -361,6 +373,23 @@ struct BaselineRow<'a> {
     removed_count: u32,
     /// `|nodes_on_surviving_path|` — the union of the per-target path sets
     nodes_on_surviving_path: usize,
+    /// Similarity-greedy walking on the EPISODE'S QUESTION, and the
+    /// single-target oracle beside it — written only under
+    /// `--query-embeddings-dir`, so a run without it writes v1's row byte for
+    /// byte. `question_greedy_overshoot` is greedy's expansions minus the
+    /// oracle's, the sampler's own definition of `greedy_overshoot` with the
+    /// question in the target's place (`hf-episodes/src/lib.rs`), which is what
+    /// makes the stage-1 strata a re-derivation rather than a carried label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question_greedy_expansions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question_greedy_registered_at: Option<Option<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question_greedy_stop_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_expansions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question_greedy_overshoot: Option<i64>,
 }
 
 /// The k baselines of `K_TARGETS_DESIGN.md` §3 on one split directory.
@@ -375,8 +404,30 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
     for path in [&args.split_dir, &args.embeddings, &args.output] {
         refuse_holdout(path)?;
     }
+    if let Some(q) = &args.query_embeddings_dir {
+        refuse_holdout(q)?;
+    }
     let (episodes, artifacts) = hf_io::read_split(&args.split_dir)?;
     let embeddings = hf_embed::EmbeddingMatrix::load(&args.embeddings)?;
+    let embedding_manifest = hf_embed::read_manifest(&args.embeddings)?;
+    // the question vectors, keyed by episode id, and the encoder agreement
+    // every `cos(question, node)` rests on
+    let (queries, query_manifest) = match &args.query_embeddings_dir {
+        None => (None, Value::Null),
+        Some(dir) => {
+            let manifest = hf_embed::read_manifest(dir)?;
+            hf_embed::same_encoder(&embedding_manifest, &manifest)?;
+            (
+                Some(hf_embed::EmbeddingMatrix::load(dir)?),
+                serde_json::to_value(&manifest).map_err(|e| HfError::Invalid(e.to_string()))?,
+            )
+        }
+    };
+    let query_source = if queries.is_some() {
+        "episode_query"
+    } else {
+        "target_embedding"
+    };
     let take = if args.limit == 0 {
         episodes.len()
     } else {
@@ -388,6 +439,28 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
             "{}: no episodes to read",
             args.split_dir.display()
         )));
+    }
+    // the node coverage the caller demanded, over the DISTINCT visible nodes
+    // of the episodes actually read
+    let (present, distinct) = hf_embed::coverage(
+        episodes
+            .iter()
+            .flat_map(|e| e.visible.nodes.iter().map(|n| n.node.as_str())),
+        &embeddings,
+    );
+    let node_coverage = if distinct == 0 {
+        1.0
+    } else {
+        present as f64 / distinct as f64
+    };
+    if let Some(floor) = args.expect_embedding_coverage {
+        println!("embedding coverage {node_coverage:.6} ({present} of {distinct} nodes)");
+        if node_coverage < floor {
+            return Err(HfError::BandH(format!(
+                "embedding coverage {node_coverage:.6} ({present} of {distinct} distinct nodes) \
+                 is below the --expect-embedding-coverage floor {floor}"
+            )));
+        }
     }
     // B_fix is ONE number per rung (§4), so a split whose episodes disagree is
     // refused rather than averaged; --b-fix names it explicitly instead.
@@ -426,6 +499,37 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
         if oracle.exact {
             exact += 1;
         }
+        // the question walk: similarity-greedy with the episode's own query in
+        // the target's place, against the SINGLE-target oracle the sampler's
+        // `greedy_overshoot` is measured against
+        let question = match &queries {
+            None => None,
+            Some(cache) => {
+                if g.target_count() != 1 {
+                    return Err(HfError::BandH(format!(
+                        "{}: --query-embeddings-dir reads a k = 1 split; this episode \
+                         carries {} targets",
+                        e.episode_id,
+                        g.target_count()
+                    )));
+                }
+                let q: Vec<f64> = cache
+                    .get(&e.episode_id)
+                    .ok_or_else(|| {
+                        HfError::BandH(format!(
+                            "the query cache holds no vector for episode {}",
+                            e.episode_id
+                        ))
+                    })?
+                    .iter()
+                    .map(|x| *x as f64)
+                    .collect();
+                let single = hf_policies::EpisodeGraph::from_episode(e);
+                let walk = hf_policies::similarity_greedy_trace(&single, &embeddings, Some(&q));
+                let floor = hf_policies::oracle_trace(&single);
+                Some((walk, floor))
+            }
+        };
         let row = BaselineRow {
             record_kind: "k_baseline_row",
             episode_id: &e.episode_id,
@@ -454,6 +558,13 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
             greedy_overshoots: e.hidden.greedy_overshoots.as_ref(),
             removed_count: e.hidden.removed_count,
             nodes_on_surviving_path: e.hidden.nodes_on_surviving_path.len(),
+            question_greedy_expansions: question.as_ref().map(|(w, _)| w.expansions),
+            question_greedy_registered_at: question.as_ref().map(|(w, _)| w.registered_at),
+            question_greedy_stop_reason: question.as_ref().map(|(w, _)| w.stop_reason.as_str()),
+            oracle_expansions: question.as_ref().map(|(_, o)| o.expansions),
+            question_greedy_overshoot: question
+                .as_ref()
+                .map(|(w, o)| w.expansions as i64 - o.expansions as i64),
         };
         let line = serde_json::to_string(&row).map_err(|e| HfError::Invalid(e.to_string()))?;
         writeln!(file, "{line}").map_err(|e| HfError::Invalid(e.to_string()))?;
@@ -481,6 +592,13 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
         "oracle_state_budget": hf_policies::ORACLE_STATE_BUDGET,
         "oracle_time_limit_ms": hf_policies::ORACLE_TIME_LIMIT.as_millis() as u64,
         "oracle_exact_episodes": exact,
+        "query_source": query_source,
+        "query_embeddings": args.query_embeddings_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "query_embedding_manifest": query_manifest,
+        "embedding_manifest": serde_json::to_value(&embedding_manifest).map_err(|e| HfError::Invalid(e.to_string()))?,
+        "embedding_coverage": node_coverage,
+        "embedding_coverage_nodes": [present, distinct],
+        "expect_embedding_coverage": args.expect_embedding_coverage,
         "embeddings": args.embeddings.to_string_lossy(),
         "rows": args.output.file_name().map(|s| s.to_string_lossy().to_string()),
         "model": Value::Null,

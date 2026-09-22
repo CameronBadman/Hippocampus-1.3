@@ -9,6 +9,7 @@ use hf_core::HfError;
 use hf_embed::EmbeddingMatrix;
 use hf_episodes::{sample_split, Sampler, SamplerConfig};
 use hf_io::RealEpisode;
+use hf_walk::{QuerySource, QueryVectors};
 use serde_json::{json, Map, Value};
 
 pub struct Heldout {
@@ -25,6 +26,13 @@ pub struct Data {
     pub screen: Vec<RealEpisode>,
     pub screen2: Vec<RealEpisode>,
     pub embeddings: EmbeddingMatrix,
+    /// Where this run's query comes from, and — under `episode_query` — the
+    /// sidecar of question vectors keyed by episode id.
+    pub query_source: QuerySource,
+    pub queries: Option<EmbeddingMatrix>,
+    /// What the run read of both caches, for the artifacts.
+    pub query_embedding_manifest: Value,
+    pub embedding_coverage: Value,
     pub graph_manifest: Value,
     pub embedding_manifest: Value,
     pub split_manifests: Map<String, Value>,
@@ -144,6 +152,85 @@ pub struct Inputs<'a> {
     pub screen_episodes: usize,
     pub fixture: bool,
     pub model_seed: u64,
+    /// `data.query_source`, already parsed from the config.
+    pub query_source: QuerySource,
+    /// The sidecar of question vectors, keyed by EPISODE id.
+    pub query_embeddings_dir: Option<&'a Path>,
+    /// The node-coverage floor `--expect-embedding-coverage` demands.
+    pub expect_embedding_coverage: Option<f64>,
+}
+
+impl Data {
+    /// The query provenance to hand every index this run builds.
+    pub fn query_vectors(&self) -> QueryVectors<'_> {
+        QueryVectors {
+            source: self.query_source,
+            cache: self.queries.as_ref(),
+        }
+    }
+}
+
+/// The share of the given episodes' DISTINCT visible nodes that the cache
+/// holds, refused against the floor when one was named. A node the cache lacks
+/// is a silent zero vector in every feature it touches.
+fn check_coverage(
+    label: &str,
+    episodes: &[&[RealEpisode]],
+    embeddings: &EmbeddingMatrix,
+    floor: Option<f64>,
+) -> Result<Value, HfError> {
+    let (present, distinct) = hf_embed::coverage(
+        episodes
+            .iter()
+            .flat_map(|split| split.iter())
+            .flat_map(|e| e.visible.nodes.iter().map(|n| n.node.as_str())),
+        embeddings,
+    );
+    let share = if distinct == 0 {
+        1.0
+    } else {
+        present as f64 / distinct as f64
+    };
+    if let Some(floor) = floor {
+        println!("[{label}] embedding coverage {share:.6} ({present} of {distinct} nodes)");
+        if share < floor {
+            return Err(HfError::BandH(format!(
+                "[{label}] embedding coverage {share:.6} ({present} of {distinct} distinct \
+                 nodes) is below the --expect-embedding-coverage floor {floor}"
+            )));
+        }
+    }
+    Ok(json!({"present": present, "distinct": distinct, "share": share, "expected": floor}))
+}
+
+/// The question vectors of every episode this run will index: the cache is the
+/// node cache's encoder, and every episode id is in it (a missing one exits 2
+/// here rather than at the first update).
+fn load_queries(
+    dir: &Path,
+    embeddings_dir: &Path,
+    episodes: &[&[RealEpisode]],
+) -> Result<(EmbeddingMatrix, Value), HfError> {
+    let nodes = hf_embed::read_manifest(embeddings_dir)?;
+    let manifest = hf_embed::read_manifest(dir)?;
+    hf_embed::same_encoder(&nodes, &manifest)?;
+    let matrix = EmbeddingMatrix::load(dir)?;
+    let missing: Vec<&str> = episodes
+        .iter()
+        .flat_map(|split| split.iter())
+        .map(|e| e.episode_id.as_str())
+        .filter(|id| !matrix.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(HfError::BandH(format!(
+            "{}: {} of the run's episodes have no query vector (first: {})",
+            dir.display(),
+            missing.len(),
+            missing[0]
+        )));
+    }
+    let value = serde_json::to_value(&manifest).map_err(|e| HfError::Invalid(e.to_string()))?;
+    Ok((matrix, value))
 }
 
 /// The fixture world: sampled in-process, CPU, never evidence.
@@ -154,8 +241,8 @@ fn fixture_data(inputs: &Inputs, block: &Value) -> Result<Data, HfError> {
     let mut s = Sampler::new(&graph, sampler.clone())?;
     s.prepare("train")?;
     s.prepare("screen")?;
-    let train = sample_split(&s, "train", inputs.train_episodes.unwrap_or(2000), None, 64)?;
-    let screen = sample_split(&s, "screen", inputs.screen_episodes, None, 64)?;
+    let sampled_train = sample_split(&s, "train", inputs.train_episodes.unwrap_or(2000), None, 64)?;
+    let sampled_screen = sample_split(&s, "screen", inputs.screen_episodes, None, 64)?;
     let mut names: Vec<String> = embeddings.keys().cloned().collect();
     names.sort();
     let mut data = Vec::with_capacity(names.len() * 8);
@@ -172,26 +259,42 @@ fn fixture_data(inputs: &Inputs, block: &Value) -> Result<Data, HfError> {
         "text_coverage": 1.0,
         "training_authorized": false,
     });
+    let train: Vec<RealEpisode> = sampled_train
+        .episodes
+        .into_iter()
+        .map(sampled_to_episode)
+        .collect::<Result<_, _>>()?;
+    let screen: Vec<RealEpisode> = sampled_screen
+        .episodes
+        .into_iter()
+        .map(sampled_to_episode)
+        .collect::<Result<_, _>>()?;
+    // the fixture world embeds every node it builds, so the share is 1.0 —
+    // the flag is honoured here too rather than silently ignored on this path
+    let embedding_coverage = check_coverage(
+        "fixture",
+        &[&train, &screen],
+        &matrix,
+        inputs.expect_embedding_coverage,
+    )?;
     Ok(Data {
         family: "fixture".into(),
         dim: 8,
-        train: train
-            .episodes
-            .into_iter()
-            .map(sampled_to_episode)
-            .collect::<Result<_, _>>()?,
-        screen: screen
-            .episodes
-            .into_iter()
-            .map(sampled_to_episode)
-            .collect::<Result<_, _>>()?,
+        train,
+        screen,
         screen2: Vec::new(),
         embeddings: matrix,
+        // the fixture world samples stage-0 episodes, so it is the default
+        // source; `--query-embeddings-dir` is refused with `--fixture`
+        query_source: QuerySource::TargetEmbedding,
+        queries: None,
+        query_embedding_manifest: Value::Null,
+        embedding_coverage,
         graph_manifest,
         embedding_manifest: json!({"model": "fixture-random", "model_digest": "fixture", "dimension": 8}),
         split_manifests: Map::new(),
-        train_dropped: drops_value(&train.drops),
-        screen_dropped: drops_value(&screen.drops),
+        train_dropped: drops_value(&sampled_train.drops),
+        screen_dropped: drops_value(&sampled_screen.drops),
         screen2_dropped: json!({}),
         heldout: None,
         sampler,
@@ -262,6 +365,16 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
             "no episodes: train dropped {train_dropped}, screen dropped {screen_dropped}"
         )));
     }
+    let read: Vec<&[RealEpisode]> = vec![&train, &screen, &screen2];
+    let embedding_coverage =
+        check_coverage(family, &read, &embeddings, inputs.expect_embedding_coverage)?;
+    let (queries, query_embedding_manifest) = match inputs.query_embeddings_dir {
+        None => (None, Value::Null),
+        Some(dir) => {
+            let (matrix, manifest) = load_queries(dir, edir, &read)?;
+            (Some(matrix), manifest)
+        }
+    };
     let heldout = match inputs.heldout_splits_dir {
         None => None,
         Some(h_root) => {
@@ -314,6 +427,10 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
         screen,
         screen2,
         embeddings,
+        query_source: inputs.query_source,
+        queries,
+        query_embedding_manifest,
+        embedding_coverage,
         graph_manifest,
         embedding_manifest,
         split_manifests,

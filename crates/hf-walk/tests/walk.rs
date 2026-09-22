@@ -333,6 +333,9 @@ fn abandonment_episode() -> EpisodeIndex {
         // episode exists to be walked to the end, not to be completed
         targets_shown: Vec::new(),
         hidden_targets: Vec::new(),
+        // stage 0's source with no target to take a query from: the one query
+        // below is hand-written, and no target registers under either source
+        query_source: hf_walk::QuerySource::TargetEmbedding,
         out: vec![vec![1, 3], vec![2], vec![], vec![4], vec![]],
         edim: 2,
         emb,
@@ -506,7 +509,10 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
             "unregistered"
         ],
         "the k fields are the shown targets, their queries and the walk's own \
-         registration mask — nothing the sampler kept back"
+         registration mask — nothing the sampler kept back. UNCHANGED by \
+         query_source: under episode_query `targets_shown` is EMPTY and the \
+         mask is built outside this view from what the record kept back, so \
+         the view gains no field and loses none"
     );
     let mut methods: Vec<&str> = source
         .lines()
@@ -528,6 +534,10 @@ fn the_visible_view_exposes_nothing_the_sampler_kept_back() {
             "node_count",
             "out",
             "query",
+            // added deliberately with `data.query_source` (Track Q, Q2): the
+            // count the query channels reduce over, which is `k` at stage 0
+            // and one under `episode_query`, where no target is shown
+            "query_count",
             "query_of",
             "start",
             "target_count",

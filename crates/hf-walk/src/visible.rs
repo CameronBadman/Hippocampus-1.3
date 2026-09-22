@@ -22,6 +22,13 @@
 //! the unregistered share. At k = 1 the maximum over the one target is that
 //! target's cosine, computed by the same `cosine` call on the same vector, so
 //! the reduction is the identity.
+//!
+//! The reduction runs over the QUERIES, one flag of the mask each. At stage 0
+//! there is one query per shown target and the two counts are equal, so this
+//! is the reduction the walk has always made. Under `episode_query` there is
+//! one query — the episode's own question vector — and no shown target at all:
+//! `targets_shown()` is empty, `query_count()` is one, and the mask the walk
+//! hands in is built from what the record kept back, outside this view.
 
 use crate::{cosine, EpisodeIndex, Local};
 
@@ -43,10 +50,10 @@ pub struct VisibleIndex<'a> {
 
 impl<'a> VisibleIndex<'a> {
     /// Borrow the visible arrays of an indexed episode together with the
-    /// walk's unregistered mask (one flag per shown target, `true` while the
+    /// walk's unregistered mask (one flag per query, `true` while that query's
     /// target has not yet been examined).
     pub fn new(index: &'a EpisodeIndex, unregistered: &'a [bool]) -> Self {
-        debug_assert_eq!(unregistered.len(), index.targets_shown.len());
+        debug_assert_eq!(unregistered.len(), index.query_count());
         Self {
             names: &index.names,
             start: index.start,
@@ -91,20 +98,27 @@ impl<'a> VisibleIndex<'a> {
         self.targets_shown
     }
 
-    /// How many targets the record shows (`k`).
+    /// How many targets the record shows (`k`); none under `episode_query`.
     pub fn target_count(&self) -> usize {
         self.targets_shown.len()
     }
 
-    /// The unregistered mask over the shown targets, in the same order.
+    /// How many queries the row reads: `k` at stage 0, one under
+    /// `episode_query`. This is what every query channel reduces over and the
+    /// width of the mask.
+    pub fn query_count(&self) -> usize {
+        self.queries.len().checked_div(self.edim).unwrap_or(0)
+    }
+
+    /// The unregistered mask over the queries, in the same order.
     pub fn unregistered(&self) -> &'a [bool] {
         self.unregistered
     }
 
     /// `|unregistered| / k` — the candidate row's third extra column. One
-    /// when the record shows no target at all.
+    /// when the record carries no query at all.
     pub fn unregistered_share(&self) -> f32 {
-        let k = self.target_count();
+        let k = self.query_count();
         if k == 0 {
             return 1.0;
         }
@@ -156,7 +170,7 @@ impl<'a> VisibleIndex<'a> {
     /// — all of them, so no channel is ever a maximum over nothing.
     fn reduced_over(&self) -> impl Iterator<Item = usize> + '_ {
         let any = self.unregistered.iter().any(|u| *u);
-        (0..self.target_count()).filter(move |t| !any || self.unregistered[*t])
+        (0..self.query_count()).filter(move |t| !any || self.unregistered[*t])
     }
 
     /// `(min, max)` over the unregistered targets of `cosine(v, q_t)`.

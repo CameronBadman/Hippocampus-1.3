@@ -66,6 +66,13 @@ pub trait FeatureSet: Sync {
     fn k_aware(&self) -> bool {
         false
     }
+    /// Whether the set copies the raw query VECTOR into its rows (rather than
+    /// reading it only through cosines). Only `raw-v5` does; under
+    /// `QuerySource::EpisodeQuery` that vector is the question itself, and
+    /// `walk_batch` refuses the pairing.
+    fn embeds_query_vector(&self) -> bool {
+        false
+    }
     fn candidate_dim(&self, edim: usize) -> usize;
     fn context_dim(&self, edim: usize) -> usize;
     /// Width of the query token, or `None` when the set has no query token
@@ -107,6 +114,9 @@ pub struct RawV5;
 impl FeatureSet for RawV5 {
     fn name(&self) -> &'static str {
         "raw-v5"
+    }
+    fn embeds_query_vector(&self) -> bool {
+        true
     }
     fn candidate_dim(&self, edim: usize) -> usize {
         4 * edim + STRUCTURE_DIM

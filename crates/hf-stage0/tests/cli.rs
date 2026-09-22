@@ -1135,3 +1135,178 @@ fn an_ordinary_run_says_every_update_was_finite() {
     assert!(!out.join("halted").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A fixture-mode config written here, so these cases need no foundation
+/// checkout: the smoke configuration of `real_walk_v1`, with the `data` block
+/// under test.
+fn config_with_data(root: &PathBuf, data: Option<serde_json::Value>) -> PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let mut config = serde_json::json!({
+        "record_kind": "real_walk_stage0_config",
+        "note": "fixture-mode smoke configuration written by the test; never evidence",
+        "training_authorized": false,
+        "model": {
+            "hidden_dimension": 32, "self_attention_heads": 2, "feedforward_multiplier": 2,
+            "score_hidden_dimension": 16, "coverage_hidden_dimension": 8,
+            "traversal_blocks": 1, "dropout": 0.0
+        },
+        "sampler": {"subgraph_size": 64, "target_distance": 3, "removal_level": 2, "cost_epsilon": 0.5},
+        "training": {"learning_rate": 0.001, "weight_decay": 0.0, "update_count": 1, "microbatch_size": 2}
+    });
+    if let Some(block) = data {
+        config.as_object_mut().unwrap().insert("data".into(), block);
+    }
+    let path = root.join("config.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    path
+}
+
+/// `data.query_source` and its flag come as a pair, and neither is silently
+/// ignored: each alone exits 2, an unknown value exits 2, and the stage-1
+/// source is refused on the fixture world, which samples stage-0 episodes and
+/// has no questions to read.
+#[test]
+fn the_query_source_and_its_sidecar_refuse_every_half_configuration() {
+    let root = tmp("query-source");
+    let out_dir = root.join("run");
+    let queries = root.join("queries");
+    std::fs::create_dir_all(&queries).unwrap();
+    let base = |cfg: &PathBuf| -> Vec<String> {
+        vec![
+            "--config".into(),
+            cfg.to_string_lossy().into(),
+            "--output".into(),
+            out_dir.to_string_lossy().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--fixture".into(),
+            "--train-episodes".into(),
+            "4".into(),
+            "--screen-episodes".into(),
+            "2".into(),
+            "--updates".into(),
+            "1".into(),
+        ]
+    };
+    let go = |args: Vec<String>| run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+
+    // the sidecar without the config key
+    let plain = config_with_data(&root.join("plain"), None);
+    let mut args = base(&plain);
+    args.extend([
+        "--query-embeddings-dir".into(),
+        queries.to_string_lossy().into(),
+    ]);
+    let out = go(args);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("data.query_source"), "{stderr}");
+
+    // the config key without the sidecar
+    let stage1 = config_with_data(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+    );
+    let out = go(base(&stage1));
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("--query-embeddings-dir"), "{stderr}");
+
+    // both, on the fixture world, which is stage 0
+    let mut args = base(&stage1);
+    args.extend([
+        "--query-embeddings-dir".into(),
+        queries.to_string_lossy().into(),
+    ]);
+    let out = go(args);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("fixture world"), "{stderr}");
+
+    // an unknown source is a broken config, not the default
+    let odd = config_with_data(
+        &root.join("odd"),
+        Some(serde_json::json!({"query_source": "the target, obviously"})),
+    );
+    let out = go(base(&odd));
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("unknown query source"), "{stderr}");
+
+    // and the default is the stage-0 source: an absent block runs
+    let out = go(base(&plain));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let probe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir.join("probe.json")).unwrap())
+            .unwrap();
+    assert_eq!(probe["query_source"], "target_embedding");
+    assert_eq!(probe["query_embeddings"], serde_json::Value::Null);
+    assert_eq!(probe["embedding_coverage"]["share"], 1.0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--expect-embedding-coverage`: a floor the cache cannot meet exits 2 before
+/// anything is trained; one it meets is recorded in `probe.json`.
+#[test]
+fn the_embedding_coverage_floor_refuses_and_is_recorded() {
+    let root = tmp("coverage");
+    let cfg = config_with_data(&root, None);
+    let impossible = root.join("never");
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "--output",
+        impossible.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--expect-embedding-coverage",
+        "1.1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("--expect-embedding-coverage"), "{stderr}");
+    assert!(
+        !impossible.join("probe.json").exists(),
+        "nothing downstream reads a refused run as finished"
+    );
+    let met = root.join("met");
+    let out = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "--output",
+        met.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--expect-embedding-coverage",
+        "1.0",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let probe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(met.join("probe.json")).unwrap()).unwrap();
+    assert_eq!(probe["embedding_coverage"]["share"], 1.0);
+    assert_eq!(probe["embedding_coverage"]["expected"], 1.0);
+    assert!(probe["embedding_coverage"]["distinct"].as_u64().unwrap() > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}

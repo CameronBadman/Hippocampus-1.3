@@ -7,7 +7,10 @@ use std::path::Path;
 
 use hf_core::HfError;
 use hf_model::{Model, ModelScorer};
-use hf_walk::{walk_batch, EpisodeIndex, StopRule, WalkOptions, WalkResult};
+use hf_policies::WalkTrace;
+use hf_walk::{
+    walk_batch, EpisodeIndex, QuerySource, QueryVectors, StopRule, WalkOptions, WalkResult,
+};
 use serde_json::{json, Map, Value};
 
 pub const Z_ONE_SIDED_95: f64 = 1.644_853_626_951_472_2;
@@ -128,6 +131,34 @@ fn rule_row(w: &WalkResult, removed_count: u32) -> Result<RuleRow, HfError> {
     })
 }
 
+/// The row's key for greedy's overshoot, and its value.
+///
+/// At stage 0 it is the sampler's hidden `greedy_overshoot`: similarity-greedy
+/// following the TARGET's own embedding, minus the single-target oracle
+/// (`hf-episodes/src/lib.rs`). Under `episode_query` that label was measured on
+/// a query this walk never sees, so carrying it would read the stage-0 strata
+/// under another name (Track Q binding revision 1). The row carries
+/// `question_greedy_overshoot` instead — the same subtraction with the
+/// question in the target's place, from this run's own traces — and NEVER the
+/// stage-0 key.
+fn overshoot_entry(
+    query_source: QuerySource,
+    hidden: Option<i64>,
+    greedy: &WalkTrace,
+    oracle: &WalkTrace,
+) -> (&'static str, Value) {
+    match query_source {
+        QuerySource::TargetEmbedding => (
+            "greedy_overshoot",
+            hidden.map(Value::from).unwrap_or(Value::Null),
+        ),
+        QuerySource::EpisodeQuery => (
+            "question_greedy_overshoot",
+            Value::from(greedy.expansions as i64 - oracle.expansions as i64),
+        ),
+    }
+}
+
 /// Walk every episode under both stop rules and every baseline; assemble the report.
 pub fn evaluate(
     model: &Model,
@@ -135,6 +166,7 @@ pub fn evaluate(
     embeddings: &hf_embed::EmbeddingMatrix,
     dim: usize,
     record_candidates: bool,
+    queries: QueryVectors<'_>,
 ) -> Result<Evaluation, HfError> {
     let features = model.features();
     let with_prior = model.config.greedy_prior;
@@ -154,6 +186,16 @@ pub fn evaluate(
         .iter()
         .position(|n| *n == "similarity_greedy" || *n == "k_greedy")
         .expect("a similarity baseline in every list");
+    // the floor `question_greedy_overshoot` is measured against, found by name
+    let oracle_at = policy_names
+        .iter()
+        .position(|n| *n == "oracle" || *n == "k_oracle")
+        .expect("an oracle in every list");
+    if queries.source == QuerySource::EpisodeQuery && k_split {
+        return Err(HfError::BandH(
+            "query_source episode_query is k = 1 only; this split shows more".into(),
+        ));
+    }
     let mut learned_rows: Vec<RuleRow> = Vec::with_capacity(episodes.len());
     let mut exhaust_rows: Vec<RuleRow> = Vec::with_capacity(episodes.len());
     let mut baseline_rows: Vec<Vec<RuleRow>> = vec![Vec::new(); policy_names.len()];
@@ -162,7 +204,7 @@ pub fn evaluate(
     for chunk in episodes.chunks(EVAL_BATCH) {
         let indexes: Vec<EpisodeIndex> = chunk
             .iter()
-            .map(|e| EpisodeIndex::new(e, embeddings, dim))
+            .map(|e| EpisodeIndex::new_with_query(e, embeddings, dim, queries))
             .collect::<Result<_, _>>()?;
         let refs: Vec<&EpisodeIndex> = indexes.iter().collect();
         let mut scorer = ModelScorer { model };
@@ -194,10 +236,23 @@ pub fn evaluate(
             } else {
                 hf_policies::EpisodeGraph::from_episode(e)
             };
+            // under `episode_query` similarity-greedy walks on the QUESTION —
+            // the opponent a stage-1 reading is against; the index has already
+            // refused an episode the query cache does not cover
+            let query64: Option<Vec<f64>> = match queries.source {
+                QuerySource::TargetEmbedding => None,
+                QuerySource::EpisodeQuery => Some(
+                    indexes[i]
+                        .query()
+                        .iter()
+                        .map(|x| *x as f64)
+                        .collect::<Vec<f64>>(),
+                ),
+            };
             let traces = if k_split {
                 hf_policies::all_k_traces(&g, embeddings)
             } else {
-                hf_policies::all_traces(&g, embeddings)
+                hf_policies::all_traces_with_query(&g, embeddings, query64.as_deref())
             };
             let index = &indexes[i];
             let lw = &learned[i];
@@ -225,13 +280,13 @@ pub fn evaluate(
             for (name, t) in &traces {
                 row.insert((*name).to_string(), t.expansions.into());
             }
-            row.insert(
-                "greedy_overshoot".into(),
-                e.hidden
-                    .greedy_overshoot
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
+            let (overshoot_key, overshoot) = overshoot_entry(
+                queries.source,
+                e.hidden.greedy_overshoot,
+                &traces[greedy_at].1,
+                &traces[oracle_at].1,
             );
+            row.insert(overshoot_key.into(), overshoot);
             row.insert("removed_count".into(), e.hidden.removed_count.into());
             // K_TARGETS_DESIGN.md §4: recall over k at the fixed budget
             // B_fix = n / 2, read at the walk's own stop under `exhaust`, and
@@ -434,6 +489,191 @@ pub fn write_candidate_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The golden fixture episodes, rewritten as the stage-1 records a teacher
+    /// would write (no `target_node`, a `query`), with the node cache and a
+    /// question-vector sidecar keyed by episode id.
+    fn stage1_world() -> (
+        Vec<hf_io::RealEpisode>,
+        hf_embed::EmbeddingMatrix,
+        hf_embed::EmbeddingMatrix,
+    ) {
+        let goldens = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../hf-io/tests/goldens/fixture-split/screen");
+        let (_, embeddings) = hf_episodes::fixture::fixture_world(5, 400, 1600, 8);
+        let mut names: Vec<String> = embeddings.keys().cloned().collect();
+        names.sort();
+        let data: Vec<f32> = names
+            .iter()
+            .flat_map(|n| embeddings[n].iter().map(|x| *x as f32))
+            .collect();
+        let nodes = hf_embed::EmbeddingMatrix::from_rows(names, 8, data);
+        let (stage0, _) = hf_io::read_split(&goldens).expect("the golden screen split");
+        let stage0: Vec<hf_io::RealEpisode> = stage0.into_iter().take(6).collect();
+        let mut ids = Vec::new();
+        let mut rows: Vec<f32> = Vec::new();
+        let episodes: Vec<hf_io::RealEpisode> = stage0
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut e)| {
+                e.visible.stage = hf_io::STAGES[1].into();
+                e.visible.target_node = None;
+                e.visible.query = Some(Value::from("which node answers this?"));
+                // a teacher that FAILED to drop the stage-0 label: the row
+                // must still never carry it
+                e.hidden.greedy_overshoot = Some(900 + i as i64);
+                ids.push(e.episode_id.clone());
+                // a question vector that is nobody's node vector
+                rows.extend(
+                    (0..8).map(|j| (((i + 1) as f32) * 0.37 + (j as f32) * 0.11).sin() * 0.5),
+                );
+                e
+            })
+            .collect();
+        let queries = hf_embed::EmbeddingMatrix::from_rows(ids, 8, rows);
+        (episodes, nodes, queries)
+    }
+
+    fn cpu_model() -> hf_model::Model {
+        let config = hf_model::ModelConfig::from_value(
+            &json!({
+                "hidden_dimension": 16, "self_attention_heads": 2,
+                "feedforward_multiplier": 2, "score_hidden_dimension": 8,
+                "coverage_hidden_dimension": 8, "traversal_blocks": 1,
+                "dropout": 0.0, "feature_set": "relational-v6"
+            }),
+            8,
+        )
+        .expect("a model config");
+        hf_model::Model::new(config, tch::Device::Cpu).expect("a CPU model")
+    }
+
+    /// Track Q binding revision 1, on the rows themselves: under
+    /// `episode_query` every evaluation row carries `question_greedy_overshoot`
+    /// and NOT the stage-0 `greedy_overshoot`, whose value the hidden payload
+    /// still holds — so a reader cannot take the stage-0 strata for the
+    /// question strata. The value is greedy-on-the-question minus the oracle,
+    /// recomputed here from the policies.
+    #[test]
+    fn a_stage_1_row_carries_the_question_overshoot_and_never_the_stage_0_key() {
+        let (episodes, nodes, queries) = stage1_world();
+        let model = cpu_model();
+        let stage1 = evaluate(
+            &model,
+            &episodes,
+            &nodes,
+            8,
+            false,
+            QueryVectors::episode_query(&queries),
+        )
+        .expect("a stage-1 evaluation");
+        assert_eq!(stage1.rows.len(), episodes.len());
+        let mut moved = 0;
+        for (row, e) in stage1.rows.iter().zip(&episodes) {
+            let object = row.as_object().expect("a row");
+            assert!(
+                object.get("greedy_overshoot").is_none(),
+                "the stage-0 label reached a stage-1 row for {}",
+                e.episode_id
+            );
+            let g = hf_policies::EpisodeGraph::from_episode(e);
+            let q: Vec<f64> = queries
+                .get(&e.episode_id)
+                .expect("a question")
+                .iter()
+                .map(|x| *x as f64)
+                .collect();
+            let greedy = hf_policies::similarity_greedy_trace(&g, &nodes, Some(&q));
+            let oracle = hf_policies::oracle_trace(&g);
+            assert_eq!(
+                object["question_greedy_overshoot"]
+                    .as_i64()
+                    .expect("an int"),
+                greedy.expansions as i64 - oracle.expansions as i64,
+                "{}",
+                e.episode_id
+            );
+            // the baseline row is the walk on the QUESTION, not on the target
+            assert_eq!(
+                object["similarity_greedy"].as_u64().expect("expansions"),
+                greedy.expansions as u64
+            );
+            if hf_policies::similarity_greedy_trace(&g, &nodes, None).expansions
+                != greedy.expansions
+            {
+                moved += 1;
+            }
+            // the hidden payload still holds the stage-0 label; the row simply
+            // does not carry it
+            assert!(e.hidden.greedy_overshoot.is_some());
+        }
+        assert!(
+            moved > 0,
+            "the question changed no greedy walk; the check would be vacuous"
+        );
+        // and at stage 0 the same rows carry the old key and not the new one
+        let stage0: Vec<hf_io::RealEpisode> = {
+            let goldens = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../hf-io/tests/goldens/fixture-split/screen");
+            hf_io::read_split(&goldens)
+                .expect("the golden split")
+                .0
+                .into_iter()
+                .take(6)
+                .enumerate()
+                .map(|(i, mut e)| {
+                    e.hidden.greedy_overshoot = Some(7 + i as i64);
+                    e
+                })
+                .collect()
+        };
+        let plain = evaluate(
+            &model,
+            &stage0,
+            &nodes,
+            8,
+            false,
+            QueryVectors::target_embedding(),
+        )
+        .expect("a stage-0 evaluation");
+        for (row, e) in plain.rows.iter().zip(&stage0) {
+            let object = row.as_object().expect("a row");
+            assert!(object.get("question_greedy_overshoot").is_none());
+            assert_eq!(
+                object["greedy_overshoot"],
+                e.hidden
+                    .greedy_overshoot
+                    .map(Value::from)
+                    .unwrap_or(Value::Null)
+            );
+        }
+    }
+
+    /// The key alone, both ways, at the one place the row is written.
+    #[test]
+    fn the_overshoot_key_is_one_or_the_other_and_never_both() {
+        let greedy = hf_policies::WalkTrace {
+            expansions: 9,
+            ..Default::default()
+        };
+        let oracle = hf_policies::WalkTrace {
+            expansions: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            overshoot_entry(QuerySource::TargetEmbedding, Some(3), &greedy, &oracle),
+            ("greedy_overshoot", Value::from(3))
+        );
+        assert_eq!(
+            overshoot_entry(QuerySource::TargetEmbedding, None, &greedy, &oracle),
+            ("greedy_overshoot", Value::Null)
+        );
+        assert_eq!(
+            overshoot_entry(QuerySource::EpisodeQuery, Some(3), &greedy, &oracle),
+            ("question_greedy_overshoot", Value::from(5)),
+            "the hidden label is not read under episode_query"
+        );
+    }
 
     /// A dump line keeps every key the readers already consume and gains
     /// `parents` (the discovery parent of each frontier candidate, by name) and
