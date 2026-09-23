@@ -32,6 +32,11 @@ pub struct Data {
     pub queries: Option<EmbeddingMatrix>,
     /// What the run read of both caches, for the artifacts.
     pub query_embedding_manifest: Value,
+    /// Which splits the question-vector pre-check demanded a vector for, and
+    /// why — a re-evaluation that walks no training episode is checked on the
+    /// screens and the vault only, and the artifact says so rather than
+    /// leaving a narrowed check invisible.
+    pub query_precheck: Value,
     pub embedding_coverage: Value,
     pub graph_manifest: Value,
     pub embedding_manifest: Value,
@@ -197,6 +202,12 @@ pub struct Inputs<'a> {
     pub query_embeddings_dir: Option<&'a Path>,
     /// The node-coverage floor `--expect-embedding-coverage` demands.
     pub expect_embedding_coverage: Option<f64>,
+    /// Does this run walk its training pool? True for every training run and
+    /// for a `--reevaluate-checkpoint` read with `--train-sample`; false for a
+    /// re-evaluation that only reads the screens and the vault. It narrows the
+    /// question-vector pre-check to the episodes actually walked and nothing
+    /// else — no other check moves with it.
+    pub walks_training_pool: bool,
 }
 
 fn select_screen2<T>(all: Vec<T>, stage: Option<&str>, skip: usize) -> Result<Vec<T>, HfError> {
@@ -346,6 +357,7 @@ fn fixture_data(inputs: &Inputs, block: &Value) -> Result<Data, HfError> {
         query_source: QuerySource::TargetEmbedding,
         queries: None,
         query_embedding_manifest: Value::Null,
+        query_precheck: Value::Null,
         embedding_coverage,
         graph_manifest,
         embedding_manifest: json!({"model": "fixture-random", "model_digest": "fixture", "dimension": 8}),
@@ -493,13 +505,9 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
     let read: Vec<&[RealEpisode]> = vec![&train, &screen, &screen2];
     let embedding_coverage =
         check_coverage(family, &read, &embeddings, inputs.expect_embedding_coverage)?;
-    let (queries, query_embedding_manifest) = match inputs.query_embeddings_dir {
-        None => (None, Value::Null),
-        Some(dir) => {
-            let (matrix, manifest) = load_queries(dir, edir, &read)?;
-            (Some(matrix), manifest)
-        }
-    };
+    // the held-out family is loaded BEFORE the query pre-check so its episodes
+    // can be part of it (ENG-3): the vault is evaluated with this same query
+    // cache, and a missing id used to fail at index build, an hour in.
     let heldout = match inputs.heldout_splits_dir {
         None => None,
         Some(h_root) => {
@@ -545,6 +553,61 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
             })
         }
     };
+    // Which episodes must have a question vector: the ones this run WALKS.
+    // A training run walks the pool, both screens and the vault. A
+    // `--reevaluate-checkpoint` read with no `--train-sample` walks no
+    // training episode at all, so demanding a vector for the whole pool would
+    // make the per-destination `queries/` cache the teacher writes unusable
+    // for the zero-shot screen reads that need exactly it. The narrowing never
+    // relaxes a refusal for an episode that IS walked, and it is recorded.
+    let empty: &[RealEpisode] = &[];
+    let heldout_episodes: &[RealEpisode] = match &heldout {
+        Some(h) => &h.episodes,
+        None => empty,
+    };
+    // The VAULT is in the pre-check too (ENG-3). It is evaluated with this
+    // same query cache, so a vault episode the cache does not cover used to
+    // fail at INDEX BUILD inside `hf-walk`, an hour into a run; it now exits 2
+    // here, before the first update, exactly as a screen episode does.
+    let mut names: Vec<&str> = Vec::new();
+    let mut query_read: Vec<&[RealEpisode]> = Vec::new();
+    if inputs.walks_training_pool {
+        names.push("train");
+        query_read.push(&train);
+    }
+    names.push("screen");
+    query_read.push(&screen);
+    if !screen2.is_empty() {
+        names.push("screen2");
+        query_read.push(&screen2);
+    }
+    if !heldout_episodes.is_empty() {
+        names.push("heldout");
+        query_read.push(heldout_episodes);
+    }
+    // null when there is no sidecar to check against, so the artifact never
+    // describes a pre-check that did not run
+    let query_precheck = match inputs.query_embeddings_dir {
+        None => Value::Null,
+        Some(_) => json!({
+            "walks_training_pool": inputs.walks_training_pool,
+            "splits": names,
+            "episodes": query_read.iter().map(|s| s.len()).sum::<usize>(),
+            "train_episodes_excluded": if inputs.walks_training_pool { 0 } else { train.len() },
+            "why": if inputs.walks_training_pool {
+                "the run walks its training pool"
+            } else {
+                "--reevaluate-checkpoint without --train-sample walks no training episode"
+            },
+        }),
+    };
+    let (queries, query_embedding_manifest) = match inputs.query_embeddings_dir {
+        None => (None, Value::Null),
+        Some(dir) => {
+            let (matrix, manifest) = load_queries(dir, edir, &query_read)?;
+            (Some(matrix), manifest)
+        }
+    };
     Ok(Data {
         family: family.to_string(),
         dim,
@@ -555,6 +618,7 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
         query_source: inputs.query_source,
         queries,
         query_embedding_manifest,
+        query_precheck,
         embedding_coverage,
         graph_manifest,
         embedding_manifest,

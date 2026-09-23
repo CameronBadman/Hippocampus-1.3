@@ -498,13 +498,15 @@ fn run(args: Args) -> Result<(), HfError> {
                 "the fixture world samples stage-0 episodes; it has no questions to read".into(),
             ));
         }
-        if args.heldout_splits_dir.is_some() {
-            return Err(HfError::Refused(
-                "a held-out family's split is stage 0 and its episodes are in no query \
-                 sidecar; read it in its own run"
-                    .into(),
-            ));
-        }
+        // `--heldout-splits-dir` is NOT refused here. It names the held-out
+        // FAMILY -- the vault, whose questions the second source writes, read
+        // as a registration veto at stage 1 exactly as at stage 0 -- and not a
+        // holdout path. Its episodes are part of the query sidecar's
+        // pre-check exactly as the screens are (`data.rs`), so a vault id the
+        // sidecar does not cover exits 2 at load rather than walking on a
+        // silent zero vector. The string-based holdout refusal is untouched
+        // and stands on this path as on every other: `hf_io::read_split`
+        // calls `hf_core::refuse_holdout` on the directory it opens.
         if config["model"].get("feature_set").and_then(Value::as_str) == Some("raw-v5") {
             return Err(HfError::Refused(
                 "the feature set raw-v5 copies the raw query vector into every candidate row \
@@ -551,6 +553,9 @@ fn run(args: Args) -> Result<(), HfError> {
         query_source,
         query_embeddings_dir: args.query_embeddings_dir.as_deref(),
         expect_embedding_coverage: args.expect_embedding_coverage,
+        // a re-evaluation walks the screens and the vault; it touches a
+        // training episode only under `--train-sample`
+        walks_training_pool: args.reevaluate_checkpoint.is_none() || args.train_sample > 0,
     };
     let d = data::load(&inputs, &config)?;
     let model_config = ModelConfig::from_value(&config["model"], d.dim as i64)?;
@@ -867,6 +872,7 @@ fn reevaluate(
         "query_source": d.query_source.as_str(),
         "query_embeddings": args.query_embeddings_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
         "query_embedding_manifest": d.query_embedding_manifest,
+        "query_precheck": d.query_precheck,
         "embedding_coverage": d.embedding_coverage,
         "screen_episodes": d.screen.len(),
         "screen_dropped": d.screen_dropped,
@@ -1381,6 +1387,7 @@ fn train(
         "query_source": d.query_source.as_str(),
         "query_embeddings": args.query_embeddings_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
         "query_embedding_manifest": d.query_embedding_manifest,
+        "query_precheck": d.query_precheck,
         "embedding_coverage": d.embedding_coverage,
         "capacity": capacity,
         "updates": updates,

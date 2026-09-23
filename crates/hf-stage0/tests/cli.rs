@@ -1586,6 +1586,576 @@ fn a_reevaluation_reads_the_query_sidecar_and_the_coverage_floor() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// **The ALL-SEEN layout wrapper.** The teacher writes the episodes its admit
+/// gate DISCARDED as a sibling `screen/discarded` of the admitted screen, and
+/// ALL-SEEN needs rows for them, which only a re-evaluation of the arm's final
+/// checkpoint over that sibling produces. `--splits-dir <root>` loads
+/// `<root>/train` and `<root>/screen` and reads the graph manifest from
+/// `<root>/train`, so the sibling has to be presented AS a `<root>/screen`.
+///
+/// **The wrapper is two symlinks and no new engine flag** (`hf-stage0` gains
+/// nothing; § 6.5 (i) assigns the wrapper to OPS and this test to ENG):
+///
+/// ```text
+/// W=$T/allseen-wrapper                       # anywhere writable, NOT under the teacher dir
+/// mkdir -p "$W"
+/// ln -s "$(realpath private/real-walk-v1/teacher/stage1-q-r3/train)"           "$W/train"
+/// ln -s "$(realpath private/real-walk-v1/teacher/stage1-q-r3/screen/discarded)" "$W/screen"
+/// $HF_STAGE0_BIN … --splits-dir "$W" --reevaluate-checkpoint …
+/// ```
+///
+/// `W/train` is the admitted TRAIN split, unchanged: it supplies the graph
+/// manifest and the sampler agreement, and a re-evaluation walks no episode of
+/// it (see the screen-only sidecar test). This test is the "ENG confirms the
+/// exact invocation and that the wrapper changes no episode" half: the run
+/// through the wrapper reads exactly the discarded episodes, the manifest it
+/// records is the sibling's own, and the wrapper's own `visible_sha256` is the
+/// sibling's.
+#[test]
+fn the_allseen_wrapper_presents_the_discarded_sibling_as_a_screen_unchanged() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("allseen-wrapper");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    let splits = root.join("splits");
+    let ids = write_stage1_splits(&goldens, &splits);
+    let screen_ids: Vec<String> = ids[12..].to_vec();
+
+    // the teacher's discarded sibling: the LAST two screen episodes, written
+    // beside the admitted screen as `screen/discarded`
+    let discarded_ids: Vec<String> = screen_ids[screen_ids.len() - 2..].to_vec();
+    {
+        let (episodes, artifacts) = hf_io::read_split(&splits.join("screen")).unwrap();
+        let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+            .iter()
+            .filter(|e| discarded_ids.contains(&e.episode_id))
+            .map(|e| {
+                Ok(hf_io::EpisodeOut {
+                    episode_id: e.episode_id.clone(),
+                    visible: serde_json::to_value(&e.visible).unwrap(),
+                    hidden: serde_json::to_value(&e.hidden).unwrap(),
+                })
+            })
+            .collect();
+        assert_eq!(out.len(), 2);
+        hf_io::write_split(
+            "fixture",
+            hf_io::STAGES[1],
+            "screen",
+            &splits.join("screen").join("discarded"),
+            out,
+            &artifacts.graph,
+            &artifacts.public["sampler"],
+        )
+        .unwrap();
+    }
+    let sibling = splits.join("screen").join("discarded");
+    let sibling_manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(sibling.join("manifest.public.json")).unwrap(),
+    )
+    .unwrap();
+
+    // THE WRAPPER: two symlinks, nothing copied and nothing rewritten
+    let wrapper = root.join("wrapper");
+    std::fs::create_dir_all(&wrapper).unwrap();
+    std::os::unix::fs::symlink(splits.join("train"), wrapper.join("train")).unwrap();
+    std::os::unix::fs::symlink(&sibling, wrapper.join("screen")).unwrap();
+
+    let queries = root.join("queries");
+    write_query_cache(&queries, &discarded_ids);
+
+    let stage0 = relational_config(&root.join("stage0"), None);
+    let trained = root.join("trained");
+    let o = run(&[
+        "--config",
+        stage0.to_str().unwrap(),
+        "--output",
+        trained.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--save-checkpoint",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stage1 = relational_config(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+    );
+    let out = root.join("allseen");
+    let o = run_env(
+        &[
+            "--config",
+            stage1.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--model-seed",
+            "5",
+            "--family",
+            "fixture",
+            "--splits-dir",
+            wrapper.to_str().unwrap(),
+            "--embeddings-dir",
+            cache.to_str().unwrap(),
+            "--query-embeddings-dir",
+            queries.to_str().unwrap(),
+            "--expect-embedding-coverage",
+            "1.0",
+            "--screen-episodes",
+            "6",
+            "--reevaluate-checkpoint",
+            trained.join("checkpoint.json").to_str().unwrap(),
+            "--preregistration-commit",
+            &pin,
+            "--foundation-root",
+            foundation().to_str().unwrap(),
+            "--allow-stale-engine",
+        ],
+        CPU_ONLY,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(out.join("evaluation_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let read: Vec<String> = rows
+        .iter()
+        .map(|r| r["episode_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        read, discarded_ids,
+        "the wrapper reads the sibling's episodes, in its order"
+    );
+    for r in &rows {
+        assert_eq!(r["split"], "screen");
+        assert!(r["question_greedy_overshoot"].is_i64());
+    }
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("reeval.json")).unwrap()).unwrap();
+    // the wrapper changed no episode: the manifest the run recorded for its
+    // `screen` IS the sibling's own, byte for byte on the payload digests
+    assert_eq!(
+        record["split_manifests"]["screen"]["visible_sha256"],
+        sibling_manifest["visible_sha256"]
+    );
+    assert_eq!(
+        record["split_manifests"]["screen"]["episode_count"],
+        sibling_manifest["episode_count"]
+    );
+    // and it is NOT the admitted screen it sits inside
+    let admitted: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(splits.join("screen").join("manifest.public.json")).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        sibling_manifest["visible_sha256"], admitted["visible_sha256"],
+        "the fixture would not test anything if the two splits were the same"
+    );
+    assert_ne!(
+        record["split_manifests"]["screen"]["visible_sha256"],
+        admitted["visible_sha256"]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **A SCREEN-ONLY sidecar is enough for a re-evaluation, and for nothing
+/// else.** The teacher writes one `queries/` cache per destination, so the
+/// zero-shot reads of a stage-0 checkpoint on a question screen have vectors
+/// for the screen episodes and none for the training pool. A
+/// `--reevaluate-checkpoint` read with no `--train-sample` walks no training
+/// episode, so the pre-check is narrowed to the episodes it walks and records
+/// the narrowing. Every other path keeps the old demand: a training run, and a
+/// re-evaluation that samples the pool, are still refused, and a screen
+/// episode missing from the cache is still refused on every path.
+#[test]
+fn a_screen_only_query_sidecar_is_enough_to_reevaluate_and_nothing_more() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("reeval-screen-only");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    let splits = root.join("splits");
+    let ids = write_stage1_splits(&goldens, &splits);
+    assert_eq!(ids.len(), 18, "12 train + 6 screen golden episodes");
+    // `write_stage1_splits` writes train first, then screen
+    let screen_ids = &ids[12..];
+    assert_eq!(screen_ids.len(), 6);
+    let screen_only = root.join("queries-screen-only");
+    write_query_cache(&screen_only, screen_ids);
+
+    let stage0 = relational_config(&root.join("stage0"), None);
+    let trained = root.join("trained");
+    let o = run(&[
+        "--config",
+        stage0.to_str().unwrap(),
+        "--output",
+        trained.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--save-checkpoint",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let stage1 = relational_config(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+    );
+    let common = |out: &PathBuf, query_dir: &std::path::Path| -> Vec<String> {
+        vec![
+            "--config".into(),
+            stage1.to_str().unwrap().into(),
+            "--output".into(),
+            out.to_str().unwrap().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--family".into(),
+            "fixture".into(),
+            "--splits-dir".into(),
+            splits.to_str().unwrap().into(),
+            "--embeddings-dir".into(),
+            cache.to_str().unwrap().into(),
+            "--query-embeddings-dir".into(),
+            query_dir.to_str().unwrap().into(),
+            "--expect-embedding-coverage".into(),
+            "1.0".into(),
+            "--screen-episodes".into(),
+            "6".into(),
+            "--preregistration-commit".into(),
+            pin.clone(),
+            "--foundation-root".into(),
+            foundation().to_str().unwrap().into(),
+            "--allow-stale-engine".into(),
+        ]
+    };
+    let go = |argv: Vec<String>| -> std::process::Output {
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_env(&borrowed, CPU_ONLY)
+    };
+
+    // the re-evaluation walks the screen only, so the screen's own cache is enough
+    let out = root.join("reeval");
+    let mut argv = common(&out, &screen_only);
+    argv.push("--reevaluate-checkpoint".into());
+    argv.push(trained.join("checkpoint.json").to_str().unwrap().into());
+    let o = go(argv.clone());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("reeval.json")).unwrap()).unwrap();
+    let precheck = &record["query_precheck"];
+    assert_eq!(precheck["walks_training_pool"], false);
+    assert_eq!(
+        precheck["splits"],
+        serde_json::json!(["screen"]),
+        "the pool is out of the pre-check and nothing else is in it"
+    );
+    assert_eq!(precheck["episodes"], 6);
+    assert_eq!(
+        precheck["train_episodes_excluded"], 12,
+        "the narrowing is named with the count it skipped, not left invisible"
+    );
+    assert_eq!(record["query_embedding_manifest"]["count"], 6);
+    let rows = std::fs::read_to_string(out.join("evaluation_rows.jsonl")).unwrap();
+    assert_eq!(rows.lines().count(), 6);
+
+    // --train-sample walks the pool, so the same cache is refused there
+    let sampled = root.join("sampled");
+    let mut argv = common(&sampled, &screen_only);
+    argv.push("--reevaluate-checkpoint".into());
+    argv.push(trained.join("checkpoint.json").to_str().unwrap().into());
+    argv.push("--train-sample".into());
+    argv.push("2".into());
+    let o = go(argv);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("no query vector"), "{stderr}");
+    assert!(!sampled.join("reeval.json").exists());
+
+    // and a TRAINING run is refused exactly as it was before
+    let training = root.join("training");
+    let mut argv = common(&training, &screen_only);
+    argv.push("--updates".into());
+    argv.push("1".into());
+    let o = go(argv);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("no query vector"), "{stderr}");
+    assert!(!training.join("probe.json").exists());
+
+    // a SCREEN episode missing from the cache is still refused on the narrowed
+    // path: the narrowing drops the pool, never a walked episode
+    let gappy = root.join("queries-gappy");
+    write_query_cache(&gappy, &screen_ids[..screen_ids.len() - 1]);
+    let short = root.join("short");
+    let mut argv = common(&short, &gappy);
+    argv.push("--reevaluate-checkpoint".into());
+    argv.push(trained.join("checkpoint.json").to_str().unwrap().into());
+    let o = go(argv);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("no query vector"), "{stderr}");
+    assert!(!short.join("reeval.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **ENG-3: the VAULT is accepted under `episode_query`, and pre-checked.**
+/// `--heldout-splits-dir` names the held-out FAMILY -- the vault, whose
+/// questions the second source writes -- and is read as a registration veto at
+/// stage 1 exactly as at stage 0. It is not a holdout path, and the
+/// string-based holdout refusal is a separate guard that still stands.
+///
+/// The vault is evaluated with the run's OWN query cache, so a vault episode
+/// the cache does not cover used to fail at INDEX BUILD inside `hf-walk`, an
+/// hour into a run. It is now part of the loader's pre-check: covered, the run
+/// evaluates the vault and says so in `query_precheck`; uncovered, it exits 2
+/// before a row is written, with the loader's message and not the walker's.
+#[test]
+fn the_vault_is_accepted_under_episode_query_and_its_ids_are_pre_checked() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("vault-precheck");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    let splits = root.join("splits");
+    let ids = write_stage1_splits(&goldens, &splits);
+    let screen_ids: Vec<String> = ids[12..].to_vec();
+
+    // the vault: another family's screen, stage 1 (the second source wrote its
+    // questions), its episode ids its own
+    let vault = root.join("vault");
+    let mut vault_ids = Vec::new();
+    {
+        let (episodes, artifacts) = hf_io::read_split(&splits.join("screen")).unwrap();
+        let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+            .iter()
+            .map(|e| {
+                let id = format!("vault-{}", e.episode_id);
+                vault_ids.push(id.clone());
+                Ok(hf_io::EpisodeOut {
+                    episode_id: id,
+                    visible: serde_json::to_value(&e.visible).unwrap(),
+                    hidden: serde_json::to_value(&e.hidden).unwrap(),
+                })
+            })
+            .collect();
+        hf_io::write_split(
+            "vault-fixture",
+            hf_io::STAGES[1],
+            "screen",
+            &vault.join("screen"),
+            out,
+            &artifacts.graph,
+            &artifacts.public["sampler"],
+        )
+        .unwrap();
+    }
+    let vault_cache = root.join("vault-cache");
+    write_node_cache(&vault_cache);
+
+    let stage0 = relational_config(&root.join("stage0"), None);
+    let trained = root.join("trained");
+    let o = run(&[
+        "--config",
+        stage0.to_str().unwrap(),
+        "--output",
+        trained.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--save-checkpoint",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stage1 = relational_config(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+    );
+    let go = |out: &PathBuf, query_dir: &std::path::Path| -> std::process::Output {
+        run_env(
+            &[
+                "--config",
+                stage1.to_str().unwrap(),
+                "--output",
+                out.to_str().unwrap(),
+                "--model-seed",
+                "5",
+                "--family",
+                "fixture",
+                "--splits-dir",
+                splits.to_str().unwrap(),
+                "--embeddings-dir",
+                cache.to_str().unwrap(),
+                "--heldout-family",
+                "vault-fixture",
+                "--heldout-splits-dir",
+                vault.to_str().unwrap(),
+                "--heldout-embeddings-dir",
+                vault_cache.to_str().unwrap(),
+                "--query-embeddings-dir",
+                query_dir.to_str().unwrap(),
+                "--screen-episodes",
+                "6",
+                "--reevaluate-checkpoint",
+                trained.join("checkpoint.json").to_str().unwrap(),
+                "--preregistration-commit",
+                &pin,
+                "--foundation-root",
+                foundation().to_str().unwrap(),
+                "--allow-stale-engine",
+            ],
+            CPU_ONLY,
+        )
+    };
+
+    // the screens are covered and the vault is not: refused by the LOADER,
+    // which is the point -- the vault is accepted, its ids are checked
+    let screens_only = root.join("queries-screens");
+    write_query_cache(&screens_only, &screen_ids);
+    let refused = root.join("refused");
+    let o = go(&refused, &screens_only);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        stderr.contains("of the run's episodes have no query vector"),
+        "the loader's pre-check, not hf-walk's index build: {stderr}"
+    );
+    assert!(
+        !stderr.contains("the query cache holds no vector for episode"),
+        "the walker got to build an index: {stderr}"
+    );
+    assert!(
+        !stderr.contains("held-out"),
+        "the vault flag itself is accepted under episode_query: {stderr}"
+    );
+    assert!(!refused.join("evaluation_rows.jsonl").exists());
+    assert!(!refused.join("reeval.json").exists());
+
+    // with the vault covered it runs, the vault is evaluated, and the
+    // pre-check names what it covered
+    let mut all: Vec<String> = screen_ids.clone();
+    all.extend(vault_ids.iter().cloned());
+    let whole = root.join("queries-all");
+    write_query_cache(&whole, &all);
+    let out = root.join("reeval");
+    let o = go(&out, &whole);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("reeval.json")).unwrap()).unwrap();
+    assert_eq!(
+        record["query_precheck"]["splits"],
+        serde_json::json!(["screen", "heldout"])
+    );
+    assert_eq!(
+        record["query_precheck"]["episodes"],
+        (screen_ids.len() + vault_ids.len()) as u64
+    );
+    let splits_read: Vec<String> = std::fs::read_to_string(out.join("evaluation_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["split"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        splits_read.iter().filter(|s| *s == "heldout").count(),
+        vault_ids.len(),
+        "the vault was walked, which is what makes its coverage load-bearing"
+    );
+
+    // and the string-based holdout refusal is untouched on this same path
+    let named = root.join("a-heldout-vault");
+    std::fs::create_dir_all(named.join("screen")).unwrap();
+    let o = run_env(
+        &[
+            "--config",
+            stage1.to_str().unwrap(),
+            "--output",
+            root.join("never").to_str().unwrap(),
+            "--model-seed",
+            "5",
+            "--family",
+            "fixture",
+            "--splits-dir",
+            splits.to_str().unwrap(),
+            "--embeddings-dir",
+            cache.to_str().unwrap(),
+            "--heldout-family",
+            "vault-fixture",
+            "--heldout-splits-dir",
+            named.to_str().unwrap(),
+            "--heldout-embeddings-dir",
+            vault_cache.to_str().unwrap(),
+            "--query-embeddings-dir",
+            whole.to_str().unwrap(),
+            "--screen-episodes",
+            "6",
+            "--reevaluate-checkpoint",
+            trained.join("checkpoint.json").to_str().unwrap(),
+            "--preregistration-commit",
+            &pin,
+            "--foundation-root",
+            foundation().to_str().unwrap(),
+            "--allow-stale-engine",
+        ],
+        CPU_ONLY,
+    );
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        stderr.contains("holdout material is never touched"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One split directory — `train` from `source`, `screen` from the golden
 /// screen — with the sampler block the manifest will record. `rung` rewrites
 /// `subgraph_size` and `target_distance`, which is how the test makes a pool
