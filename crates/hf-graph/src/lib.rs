@@ -458,13 +458,37 @@ impl Subgraph {
         dist
     }
 
+    /// Enumerate simple paths, returning `None` as soon as more than `max_paths`
+    /// have been found. A completed result has exactly the same ordering as
+    /// [`Self::simple_paths`].
+    pub fn simple_paths_capped(
+        &self,
+        start: NodeId,
+        target: NodeId,
+        max_cost: u32,
+        max_paths: usize,
+    ) -> Option<Vec<Vec<NodeId>>> {
+        self.enumerate_simple_paths(start, target, max_cost, Some(max_paths))
+    }
+
     /// `simple_paths`: every simple path from `start` to `target` with at most
     /// `max_cost` edges, pruned by the exact distance-to-target, sorted.
     pub fn simple_paths(&self, start: NodeId, target: NodeId, max_cost: u32) -> Vec<Vec<NodeId>> {
+        self.enumerate_simple_paths(start, target, max_cost, None)
+            .expect("an uncapped enumeration cannot exceed its cap")
+    }
+
+    fn enumerate_simple_paths(
+        &self,
+        start: NodeId,
+        target: NodeId,
+        max_cost: u32,
+        max_paths: Option<usize>,
+    ) -> Option<Vec<Vec<NodeId>>> {
         let need = self.distances_to(target);
         let mut found = Vec::new();
         if !need.contains_key(&start) {
-            return found;
+            return Some(found);
         }
         let mut path = vec![start];
         let mut on_path: HashSet<NodeId> = HashSet::from([start]);
@@ -472,7 +496,7 @@ impl Subgraph {
         let mut stack: Vec<(Vec<NodeId>, usize)> = vec![(self.out_neighbours(start), 0)];
         if start == target {
             found.push(path.clone());
-            return found;
+            return (max_paths.is_none_or(|cap| found.len() <= cap)).then_some(found);
         }
         while let Some((neighbours, cursor)) = stack.last_mut() {
             if *cursor >= neighbours.len() {
@@ -495,6 +519,9 @@ impl Subgraph {
                 let mut p = path.clone();
                 p.push(tail);
                 found.push(p);
+                if max_paths.is_some_and(|cap| found.len() > cap) {
+                    return None;
+                }
                 continue;
             }
             on_path.insert(tail);
@@ -502,7 +529,7 @@ impl Subgraph {
             stack.push((self.out_neighbours(tail), 0));
         }
         found.sort_unstable();
-        found
+        Some(found)
     }
 
     /// The unpruned reference enumeration, for tests.
@@ -609,5 +636,53 @@ mod tests {
             vec!["a", "c", "z"]
         );
         assert!(g.typed());
+    }
+
+    #[test]
+    fn capped_paths_match_complete_paths_until_the_cap() {
+        let g = RealGraph::from_edges(
+            "t",
+            [
+                ("s", None, "a"),
+                ("s", None, "b"),
+                ("a", None, "t"),
+                ("b", None, "t"),
+            ],
+        );
+        let nodes: Vec<NodeId> = g.nodes().collect();
+        let sub = g.induced(&nodes);
+        let start = g.id("s").unwrap();
+        let target = g.id("t").unwrap();
+        let complete = sub.simple_paths(start, target, 2);
+        assert_eq!(sub.simple_paths_capped(start, target, 2, 2), Some(complete));
+        assert_eq!(sub.simple_paths_capped(start, target, 2, 1), None);
+    }
+
+    #[test]
+    fn capped_paths_abandon_a_combinatorial_graph() {
+        let mut triples: Vec<(String, Option<String>, String)> = Vec::new();
+        let mut previous = vec!["s".to_string()];
+        for layer in 0..24 {
+            let next = vec![format!("l{layer}a"), format!("l{layer}b")];
+            for head in &previous {
+                for tail in &next {
+                    triples.push((head.clone(), None, tail.clone()));
+                }
+            }
+            previous = next;
+        }
+        for head in &previous {
+            triples.push((head.clone(), None, "t".to_string()));
+        }
+        let refs = triples
+            .iter()
+            .map(|(h, r, t)| (h.as_str(), r.as_deref(), t.as_str()));
+        let g = RealGraph::from_edges("t", refs);
+        let nodes: Vec<NodeId> = g.nodes().collect();
+        let sub = g.induced(&nodes);
+        assert_eq!(
+            sub.simple_paths_capped(g.id("s").unwrap(), g.id("t").unwrap(), 25, 512),
+            None
+        );
     }
 }

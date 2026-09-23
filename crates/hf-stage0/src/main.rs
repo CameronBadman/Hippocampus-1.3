@@ -78,8 +78,19 @@ struct Args {
     /// covered by it — a missing episode id exits 2 whatever this says.
     #[arg(long)]
     expect_embedding_coverage: Option<f64>,
+    /// the split directory to train and screen on. Repeat it (P1) to train on
+    /// a CUMULATIVE pool: the training pool is then the concatenation of every
+    /// directory's `train` split, in the order given. The FIRST is the run's
+    /// own split — its `screen` is the evaluation set and its
+    /// `graph.manifest.json` the run's; the others contribute their `train`
+    /// and nothing else. A microbatch is one draw over the concatenation, so
+    /// each pool's share is its size, not an equal share, and `train_draws`
+    /// replays exactly as it does for one pool. With more than one, the
+    /// manifest agreement stops checking `subgraph_size` and
+    /// `target_distance` — a pool from an earlier rung has neither — and
+    /// probe.json records them per pool in `train_pools` instead.
     #[arg(long)]
-    splits_dir: Option<PathBuf>,
+    splits_dir: Vec<PathBuf>,
     #[arg(long)]
     heldout_family: Option<String>,
     #[arg(long)]
@@ -114,6 +125,8 @@ struct Args {
     reevaluate_checkpoint: Option<PathBuf>,
     #[arg(long)]
     screen2_splits_dir: Option<PathBuf>,
+    /// Skip loaded screen2 rows. This preserves the stage-0 800 -> 400 split;
+    /// filtered stage-1 splits must select source ordinals before admission.
     #[arg(long, default_value_t = 400)]
     screen2_skip: usize,
     #[arg(long)]
@@ -523,7 +536,7 @@ fn run(args: Args) -> Result<(), HfError> {
     };
     let inputs = data::Inputs {
         family: args.family.as_deref(),
-        splits_dir: args.splits_dir.as_deref(),
+        splits_dirs: &args.splits_dir,
         graph_dir: args.graph_dir.as_deref(),
         embeddings_dir: args.embeddings_dir.as_deref(),
         heldout_family: args.heldout_family.as_deref(),
@@ -1373,6 +1386,10 @@ fn train(
         "updates": updates,
         "train_episodes": d.train.len(),
         "train_episodes_cap": args.train_episodes,
+        // P1: one record per --splits-dir, in the order given, carrying the
+        // `subgraph_size` and `target_distance` a cumulative pool is no longer
+        // checked on, and the share of the pool each one realised
+        "train_pools": d.train_pools,
         "train_draws": {
             "draws": train_draws.values().sum::<u64>(),
             "distinct_seen": train_draws.len(),

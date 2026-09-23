@@ -496,6 +496,10 @@ pub struct WalkResult {
     pub registered_at: Option<usize>,
     /// Per shown target, the expansion count at which it was registered.
     pub registered_at_by_target: Vec<Option<usize>>,
+    /// Per registration target, its cosine rank at the instant it registered
+    /// (`State::cosine_rank_of`); `None` where the target never registered.
+    /// Nothing in the walk reads it — it is a diagnostic the rows carry.
+    pub cosine_rank_at_registration: Vec<Option<usize>>,
     pub stop_reason: &'static str,
     pub examined: usize,
     pub residuals: Option<Vec<Vec<f32>>>,
@@ -511,6 +515,18 @@ impl WalkResult {
 
     pub fn expansions(&self) -> usize {
         self.expanded.len()
+    }
+
+    /// ENG-9's per-episode reading: the ONE target's cosine rank at the
+    /// instant it registered. `None` when it never registered, and `None` at
+    /// k >= 2, where the rank is per target and no single number is the
+    /// episode's — the column is a k = 1 reading (and `episode_query`, the
+    /// source that makes it mean anything, is k = 1 only).
+    pub fn cosine_rank_at_registration_k1(&self) -> Option<usize> {
+        match self.cosine_rank_at_registration.as_slice() {
+            [one] => *one,
+            _ => None,
+        }
     }
 
     /// How many of the shown targets registered, at the walk's own stop.
@@ -553,6 +569,8 @@ struct State<'a> {
     registered: Vec<bool>,
     /// The expansion count at which each shown target registered.
     registered_at_by_target: Vec<Option<usize>>,
+    /// Each registration target's cosine rank at the instant it registered.
+    cosine_rank_at_registration: Vec<Option<usize>>,
     registered_at: Option<usize>,
     stop_reason: &'static str,
     examined: usize,
@@ -574,6 +592,7 @@ impl<'a> State<'a> {
             frontier: Vec::new(),
             registered: vec![false; index.registration_targets().len()],
             registered_at_by_target: vec![None; index.registration_targets().len()],
+            cosine_rank_at_registration: vec![None; index.registration_targets().len()],
             registered_at: None,
             stop_reason: "exhausted",
             examined: 0,
@@ -618,6 +637,36 @@ impl<'a> State<'a> {
         mask
     }
 
+    /// ENG-9: where the `t`-th registration target stands, by cosine to ITS
+    /// query, among the nodes the walk has seen at this instant — the start it
+    /// began from, every node it has examined as a child, and the target
+    /// itself. `1` means nothing the walk had seen scored higher than the
+    /// target, so cosine alone would have pointed straight at it.
+    ///
+    /// Ties go to the target: the count is of nodes scoring **strictly**
+    /// higher, so the rank never depends on the `edge_id` order in which the
+    /// children of one node happen to be examined.
+    ///
+    /// Under `QuerySource::TargetEmbedding` the query IS the target's own
+    /// embedding row, so its cosine is the maximum by construction and the
+    /// rank is 1 for every episode that registers. The number only means
+    /// something under `episode_query`, where the query is the question.
+    fn cosine_rank_of(&self, target: Local, t: usize) -> Option<usize> {
+        let index = self.index;
+        if t >= index.query_count() {
+            return None;
+        }
+        let q = index.query_of(t);
+        let theirs = cosine(index.emb(target), q);
+        Some(
+            1 + self
+                .seen
+                .iter()
+                .filter(|n| **n != target && cosine(index.emb(**n), q) > theirs)
+                .count(),
+        )
+    }
+
     fn push_children(&mut self, node: Local, depth: u32, path_mean: &[f32]) {
         let index = self.index;
         for &child in &index.out[node as usize] {
@@ -630,6 +679,10 @@ impl<'a> State<'a> {
                 if !self.registered[t] {
                     self.registered[t] = true;
                     self.registered_at_by_target[t] = Some(self.expanded.len());
+                    // read BEFORE `child` joins `seen`, so the comparison set
+                    // is exactly what the walk had seen when the target came
+                    // into view, the target included
+                    self.cosine_rank_at_registration[t] = self.cosine_rank_of(child, t);
                     if self.all_registered() && self.registered_at.is_none() {
                         self.registered_at = Some(self.expanded.len());
                     }
@@ -671,6 +724,7 @@ impl<'a> State<'a> {
             decisions: self.decisions,
             registered_at: self.registered_at,
             registered_at_by_target: self.registered_at_by_target,
+            cosine_rank_at_registration: self.cosine_rank_at_registration,
             stop_reason: self.stop_reason,
             examined: self.examined,
             residuals: if with_prior {

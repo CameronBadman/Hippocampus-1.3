@@ -482,3 +482,148 @@ fn stage_0_has_one_query_per_shown_target() {
     }
     assert!(seen > 0, "the goldens were empty");
 }
+
+/// The children of one node, in the `edge_id` order the walk examines them.
+fn children_of(node: &str) -> Vec<&'static str> {
+    let mut out: Vec<(u32, &'static str, &'static str)> = EDGES
+        .iter()
+        .copied()
+        .filter(|(_, source, _)| *source == node)
+        .collect();
+    out.sort_unstable();
+    out.into_iter().map(|(_, _, tail)| tail).collect()
+}
+
+/// ENG-9's rank, re-derived from `EDGES`, the caches and the expansion order
+/// the walk reports — not from the walk's own bookkeeping. The comparison set
+/// is rebuilt the way the definition states it: the start node, then every
+/// child examined in `edge_id` order until the target itself comes into view.
+fn rank_from_the_definition(expanded: &[String], target: &str, query: &[f32]) -> usize {
+    let nodes = node_cache();
+    let mut seen: Vec<&str> = vec!["s"];
+    'walk: for node in expanded {
+        for child in children_of(node) {
+            if child == target {
+                break 'walk;
+            }
+            if !seen.contains(&child) {
+                seen.push(child);
+            }
+        }
+    }
+    assert!(
+        !seen.contains(&target),
+        "the target is not in the set it is ranked against"
+    );
+    let theirs = hf_walk::cosine(nodes.get(target).expect("a vector"), query);
+    1 + seen
+        .iter()
+        .filter(|n| hf_walk::cosine(nodes.get(n).expect("a vector"), query) > theirs)
+        .count()
+}
+
+fn exhaust(index: &EpisodeIndex) -> hf_walk::WalkResult {
+    let features = RelationalV6;
+    let mut scorer = HashScorer {
+        cdim: features.candidate_dim(EDIM),
+    };
+    walk_batch(
+        &[index],
+        &features,
+        &mut scorer,
+        WalkOptions {
+            stop_rule: StopRule::Exhaust,
+            record_candidates: false,
+            keep_items: false,
+            with_prior: false,
+        },
+    )
+    .expect("the walk runs")
+    .remove(0)
+}
+
+/// A stage-1 record whose hidden target `u` sits in the subgraph but has no
+/// edge into it: the walk exhausts the frontier without ever examining it.
+fn unreachable_target_episode() -> RealEpisode {
+    let mut raw = visible(true, "t1");
+    let object = raw.as_object_mut().expect("an object");
+    object["subgraph_size"] = json!(NODES.len() + 1);
+    object["nodes"]
+        .as_array_mut()
+        .expect("nodes")
+        .push(json!({"node": "u", "text": ""}));
+    object["edges"]
+        .as_array_mut()
+        .expect("edges")
+        .push(json!({"edge_id": 9, "relation": Value::Null, "source": "u", "target": "s"}));
+    hf_io::validate_visible(&raw).expect("the payload is a valid one");
+    RealEpisode {
+        episode_id: EPISODE_ID.to_string(),
+        visible: serde_json::from_value(raw).expect("visible"),
+        hidden: serde_json::from_value(hidden("u")).expect("hidden"),
+    }
+}
+
+/// **ENG-9.** The rank the walk records is the target's place, by cosine to
+/// the QUESTION, among the nodes it had seen when the target came into view —
+/// checked against that definition re-derived from the fixture; `None` when
+/// the target never registers; and 1, vacuously, under the default query
+/// source, where the query IS the target's own embedding row.
+#[test]
+fn the_cosine_rank_at_registration_is_the_targets_place_among_what_the_walk_had_seen() {
+    let nodes = node_cache();
+    let queries = query_cache();
+    let question: Vec<f32> = queries.get(EPISODE_ID).expect("a question").to_vec();
+    let mut moved = 0;
+    for target in ["t1", "t2"] {
+        let index = stage1_index(target, &nodes, &queries);
+        let result = exhaust(&index);
+        assert!(result.registered(), "{target} registers");
+        let names: Vec<String> = result
+            .expanded
+            .iter()
+            .map(|n| index.names[*n as usize].clone())
+            .collect();
+        let want = rank_from_the_definition(&names, target, &question);
+        assert_eq!(
+            result.cosine_rank_at_registration_k1(),
+            Some(want),
+            "{target}: the recorded rank is not the one the definition gives"
+        );
+        assert_eq!(result.cosine_rank_at_registration, vec![Some(want)]);
+        if want > 1 {
+            moved += 1;
+        }
+    }
+    assert!(
+        moved > 0,
+        "neither target was out-ranked by anything the walk had seen; \
+         a rank that is always 1 makes the check vacuous"
+    );
+
+    // never registered: null, not 1
+    let index = EpisodeIndex::new_with_query(
+        &unreachable_target_episode(),
+        &nodes,
+        EDIM,
+        QueryVectors::episode_query(&queries),
+    )
+    .expect("a stage-1 record");
+    let result = exhaust(&index);
+    assert!(!result.registered(), "the hidden target is unreachable");
+    assert_eq!(result.cosine_rank_at_registration_k1(), None);
+
+    // the default source ranks the target against its OWN embedding row, so
+    // the rank is 1 and carries no information; it is recorded, not hidden
+    for target in ["t1", "t2"] {
+        let index =
+            EpisodeIndex::new(&episode(false, target), &nodes, EDIM).expect("a stage-0 record");
+        let result = exhaust(&index);
+        assert!(result.registered());
+        assert_eq!(
+            result.cosine_rank_at_registration_k1(),
+            Some(1),
+            "at stage 0 the query is the target's own row"
+        );
+    }
+}

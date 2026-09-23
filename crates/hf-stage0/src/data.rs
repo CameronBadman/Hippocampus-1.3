@@ -36,6 +36,12 @@ pub struct Data {
     pub graph_manifest: Value,
     pub embedding_manifest: Value,
     pub split_manifests: Map<String, Value>,
+    /// P1: one record per `--splits-dir`, in the order given — its path, the
+    /// episodes it drew, the `subgraph_size` and `target_distance` it was
+    /// drawn at (which a cumulative pool is no longer checked on), how many of
+    /// its episodes the cap left in the pool and the share of the pool they
+    /// are. One `--splits-dir` gives a one-element array.
+    pub train_pools: Value,
     pub train_dropped: Value,
     pub screen_dropped: Value,
     pub screen2_dropped: Value,
@@ -75,6 +81,24 @@ pub fn sampler_from_config(family: &str, block: &Value) -> Result<SamplerConfig,
     Ok(c)
 }
 
+/// The sampler keys a pool's manifest must agree with the config on.
+pub const SAMPLER_AGREEMENT: [&str; 4] = [
+    "subgraph_size",
+    "target_distance",
+    "removal_level",
+    "cost_epsilon",
+];
+
+/// The two of them a CUMULATIVE training pool is exempted from: a pool drawn
+/// at an earlier rung is a smaller ball at a shorter distance by definition,
+/// which is the whole point of stacking it under a later rung's config. They
+/// are then recorded per pool in `probe.json` (`train_pools`) instead of
+/// checked, so nothing is lost — the numbers move from a refusal to the
+/// artifact. `removal_level` and `cost_epsilon` are NOT exempt: those describe
+/// how hard each episode is cut, and a pool cut by another rule is not the
+/// same experiment.
+pub const CUMULATIVE_EXEMPT: [&str; 2] = ["subgraph_size", "target_distance"];
+
 /// `load_split_from_disk`: the manifest's sampler must agree with the config
 /// on size, distance, level and epsilon (band H otherwise); drops come from
 /// `sampling.json` when present, else the manifest.
@@ -83,16 +107,26 @@ pub fn load_split_from_disk(
     split: &str,
     block: &Value,
 ) -> Result<(Vec<RealEpisode>, Value, Value), HfError> {
+    load_split_from_disk_exempting(root, split, block, &[])
+}
+
+/// The same read with `exempt` sampler keys left unchecked — the cumulative
+/// pool's relaxation, spelled at the call site so a single `--splits-dir`
+/// passes `&[]` and is checked exactly as it always was.
+pub fn load_split_from_disk_exempting(
+    root: &Path,
+    split: &str,
+    block: &Value,
+    exempt: &[&str],
+) -> Result<(Vec<RealEpisode>, Value, Value), HfError> {
     let dir = root.join(split);
     let (episodes, artifacts) = hf_io::read_split(&dir)?;
     let manifest = artifacts.public;
     let recorded = &manifest["sampler"];
-    for key in [
-        "subgraph_size",
-        "target_distance",
-        "removal_level",
-        "cost_epsilon",
-    ] {
+    for key in SAMPLER_AGREEMENT {
+        if exempt.contains(&key) {
+            continue;
+        }
         let want = block.get(key).cloned().unwrap_or(if key == "cost_epsilon" {
             json!(0.5)
         } else {
@@ -140,7 +174,12 @@ fn drops_value(drops: &BTreeMap<&'static str, u64>) -> Value {
 
 pub struct Inputs<'a> {
     pub family: Option<&'a str>,
-    pub splits_dir: Option<&'a Path>,
+    /// Every `--splits-dir`, in the order the command line gave them. The
+    /// FIRST is the run's own split: its `screen` is the evaluation set, its
+    /// `graph.manifest.json` the run's graph manifest and its `train` the head
+    /// of the training pool. Each further one contributes its `train` split to
+    /// the pool, appended in order and nothing else.
+    pub splits_dirs: &'a [PathBuf],
     pub graph_dir: Option<&'a Path>,
     pub embeddings_dir: Option<&'a Path>,
     pub heldout_family: Option<&'a str>,
@@ -158,6 +197,24 @@ pub struct Inputs<'a> {
     pub query_embeddings_dir: Option<&'a Path>,
     /// The node-coverage floor `--expect-embedding-coverage` demands.
     pub expect_embedding_coverage: Option<f64>,
+}
+
+fn select_screen2<T>(all: Vec<T>, stage: Option<&str>, skip: usize) -> Result<Vec<T>, HfError> {
+    if stage == Some("stage1_described_target") && skip != 0 {
+        return Err(HfError::BandH(
+            "--screen2-skip counts rows after question admission and cannot select source \
+             ordinals from a filtered stage-1 split; select the source slice before running the \
+             teacher and pass --screen2-skip 0"
+                .into(),
+        ));
+    }
+    let selected: Vec<T> = all.into_iter().skip(skip).collect();
+    if selected.is_empty() {
+        return Err(HfError::BandH(
+            "screen2 has no episodes beyond --screen2-skip".into(),
+        ));
+    }
+    Ok(selected)
 }
 
 impl Data {
@@ -293,6 +350,9 @@ fn fixture_data(inputs: &Inputs, block: &Value) -> Result<Data, HfError> {
         graph_manifest,
         embedding_manifest: json!({"model": "fixture-random", "model_digest": "fixture", "dimension": 8}),
         split_manifests: Map::new(),
+        // the fixture world samples its pool in process: one pool, no split
+        // directory, and nothing for a reader to attribute a share to
+        train_pools: Value::Array(Vec::new()),
         train_dropped: drops_value(&sampled_train.drops),
         screen_dropped: drops_value(&sampled_screen.drops),
         screen2_dropped: json!({}),
@@ -316,7 +376,7 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
             "a real run needs --family, --embeddings-dir and --splits-dir".into(),
         ));
     };
-    let Some(splits_dir) = inputs.splits_dir else {
+    let Some(splits_dir) = inputs.splits_dirs.first() else {
         return Err(HfError::Invalid(
             "a real run needs --splits-dir (sampling from --graph-dir in-process is not offered by this engine; write the splits with hf-splits)".into(),
         ));
@@ -331,8 +391,61 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
     let graph_manifest = read_json(&splits_dir.join("train").join("graph.manifest.json"))?;
     let sampler = sampler_from_config(family, block)?;
     let mut split_manifests = Map::new();
-    let (mut train, train_dropped, m) = load_split_from_disk(splits_dir, "train", block)?;
-    split_manifests.insert("train".into(), m);
+    // P1: the training pool is the concatenation of every --splits-dir's
+    // `train`, in the order given. One pool is the old read exactly — the same
+    // strict sampler agreement, the same `train` manifest, the same drops.
+    let cumulative = inputs.splits_dirs.len() > 1;
+    let exempt: &[&str] = if cumulative { &CUMULATIVE_EXEMPT } else { &[] };
+    let mut train: Vec<RealEpisode> = Vec::new();
+    let mut train_dropped = json!({});
+    let mut pools: Vec<Value> = Vec::new();
+    for (i, dir) in inputs.splits_dirs.iter().enumerate() {
+        let (mut pool, dropped, m) = load_split_from_disk_exempting(dir, "train", block, exempt)?;
+        let recorded = m.get("sampler").cloned().unwrap_or(Value::Null);
+        pools.push(json!({
+            "index": i,
+            "splits_dir": dir.to_string_lossy(),
+            "episodes": pool.len(),
+            "subgraph_size": recorded.get("subgraph_size"),
+            "target_distance": recorded.get("target_distance"),
+            "sampler": recorded,
+            "visible_sha256": m.get("visible_sha256"),
+            "dropped": dropped.clone(),
+        }));
+        if i == 0 {
+            train_dropped = dropped;
+            split_manifests.insert("train".into(), m);
+        } else {
+            split_manifests.insert(format!("train{}", i + 1), m);
+        }
+        train.append(&mut pool);
+    }
+    if cumulative {
+        // an episode drawn into two pools would be one row of the pool drawn
+        // twice, and `train_draws` — keyed by episode id — would fold the two
+        // counts into one: the replay the readers check against would then
+        // disagree with the run. Refused rather than silently deduplicated.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if let Some(e) = train.iter().find(|e| !seen.insert(e.episode_id.as_str())) {
+            return Err(HfError::BandH(format!(
+                "the cumulative training pool holds {} twice; the pools overlap",
+                e.episode_id
+            )));
+        }
+        println!(
+            "[{family}] cumulative training pool: {} episodes over {} splits ({})",
+            train.len(),
+            inputs.splits_dirs.len(),
+            pools
+                .iter()
+                .map(|p| format!(
+                    "n={} d={} x{}",
+                    p["subgraph_size"], p["target_distance"], p["episodes"]
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let (mut screen, screen_dropped, m) = load_split_from_disk(splits_dir, "screen", block)?;
     split_manifests.insert("screen".into(), m);
     if let Some(cap) = inputs.train_episodes {
@@ -344,6 +457,22 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
             train.truncate(cap);
         }
     }
+    // the realised share of the pool each split contributed, AFTER the cap —
+    // the cap cuts the concatenation's tail, so a cap below the first pool's
+    // size leaves the later ones at zero, and the artifact says so
+    let mut left = train.len();
+    for p in pools.iter_mut() {
+        let drawn = p["episodes"].as_u64().unwrap_or(0) as usize;
+        let used = drawn.min(left);
+        left -= used;
+        p["episodes_used"] = Value::from(used);
+        p["share"] = if train.is_empty() {
+            Value::Null
+        } else {
+            Value::from(used as f64 / train.len() as f64)
+        };
+    }
+    let train_pools = Value::Array(pools);
     if inputs.screen_episodes < screen.len() {
         screen.truncate(inputs.screen_episodes);
     }
@@ -351,14 +480,10 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
     let mut screen2_dropped = json!({});
     if let Some(dir) = inputs.screen2_splits_dir {
         let (all, dropped, m) = load_split_from_disk(dir, "screen", block)?;
+        let stage = m.get("stage").and_then(Value::as_str).map(str::to_string);
         split_manifests.insert("screen2".into(), m);
         screen2_dropped = dropped;
-        screen2 = all.into_iter().skip(inputs.screen2_skip).collect();
-        if screen2.is_empty() {
-            return Err(HfError::BandH(
-                "screen2 has no episodes beyond --screen2-skip".into(),
-            ));
-        }
+        screen2 = select_screen2(all, stage.as_deref(), inputs.screen2_skip)?;
     }
     if train.is_empty() || screen.is_empty() {
         return Err(HfError::Invalid(format!(
@@ -434,6 +559,7 @@ pub fn load(inputs: &Inputs, config: &Value) -> Result<Data, HfError> {
         graph_manifest,
         embedding_manifest,
         split_manifests,
+        train_pools,
         train_dropped,
         screen_dropped,
         screen2_dropped,
@@ -504,4 +630,37 @@ pub fn engine_binary_sha256() -> &'static str {
             .map(|(_, digest)| digest)
             .unwrap_or_else(|| "unknown".into())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_screen2;
+
+    #[test]
+    fn stage0_screen2_keeps_the_existing_row_skip() {
+        assert_eq!(
+            select_screen2(vec![0, 1, 2, 3], Some("stage0_known_target"), 2).unwrap(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn filtered_stage1_screen2_must_be_sliced_before_admission() {
+        let error = select_screen2(
+            vec!["admitted-source-401"],
+            Some("stage1_described_target"),
+            400,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("after question admission"));
+        assert_eq!(
+            select_screen2(
+                vec!["admitted-source-401"],
+                Some("stage1_described_target"),
+                0,
+            )
+            .unwrap(),
+            vec!["admitted-source-401"]
+        );
+    }
 }

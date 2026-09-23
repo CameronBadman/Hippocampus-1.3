@@ -28,6 +28,9 @@ hf-core.workspace = true
 
 [dev-dependencies]
 hf-core.workspace = true
+hf-io.workspace = true
+hf-embed.workspace = true
+hf-episodes.workspace = true
 serde_json.workspace = true
 flate2.workspace = true
 

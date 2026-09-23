@@ -33,6 +33,11 @@ fn run(args: &[&str]) -> std::process::Output {
     run_env(args, &[])
 }
 
+/// A real run picks CUDA when it is there; a CLI test must not take the GPU
+/// from whatever is training on it, so every non-fixture run here is pinned to
+/// the CPU (`tch::Cuda::is_available()` is then false).
+const CPU_ONLY: &[(&str, &str)] = &[("CUDA_VISIBLE_DEVICES", "")];
+
 fn run_env(args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hf-stage0"));
     command.args(args);
@@ -1308,5 +1313,478 @@ fn the_embedding_coverage_floor_refuses_and_is_recorded() {
     assert_eq!(probe["embedding_coverage"]["share"], 1.0);
     assert_eq!(probe["embedding_coverage"]["expected"], 1.0);
     assert!(probe["embedding_coverage"]["distinct"].as_u64().unwrap() > 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The fixture world's node vectors as a v5 cache on disk.
+fn write_node_cache(dir: &std::path::Path) {
+    let (_, embeddings) = hf_episodes::fixture::fixture_world(5, 400, 1600, 8);
+    std::fs::create_dir_all(dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("vectors.jsonl")).unwrap();
+    let mut names: Vec<&String> = embeddings.keys().collect();
+    names.sort();
+    for n in &names {
+        hf_embed::append_vector(&mut f, n, &embeddings[*n]).unwrap();
+    }
+    hf_embed::write_manifest(dir, &fixture_manifest(names.len() as u64, 8)).unwrap();
+}
+
+fn fixture_manifest(count: u64, dimension: u32) -> hf_embed::Manifest {
+    hf_embed::Manifest {
+        record_kind: hf_embed::MANIFEST_KIND.into(),
+        model: "fixture".into(),
+        model_digest: "fixture".into(),
+        base_url: "none".into(),
+        dimension,
+        count,
+        text_char_limit: 6000,
+        text_sha256: None,
+        truncated: Default::default(),
+        training_authorized: false,
+        extra: Default::default(),
+    }
+}
+
+/// A question-vector sidecar: an ordinary v5 cache whose ids are EPISODE ids.
+fn write_query_cache(dir: &std::path::Path, ids: &[String]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("vectors.jsonl")).unwrap();
+    for (i, id) in ids.iter().enumerate() {
+        let v: Vec<f64> = (0..8)
+            .map(|j| ((i as f64 + 1.0) * 0.37 + j as f64 * 0.11).sin())
+            .collect();
+        hf_embed::append_vector(&mut f, id, &v).unwrap();
+    }
+    hf_embed::write_manifest(dir, &fixture_manifest(ids.len() as u64, 8)).unwrap();
+}
+
+/// The golden fixture split rewritten as the stage-1 one a teacher would
+/// write: no `target_node`, a `query`, the hidden payload carried across.
+/// Returns every episode id the run will read, in file order.
+fn write_stage1_splits(source: &std::path::Path, destination: &std::path::Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for split in ["train", "screen"] {
+        let (episodes, artifacts) = hf_io::read_split(&source.join(split)).unwrap();
+        let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+            .iter()
+            .map(|e| {
+                ids.push(e.episode_id.clone());
+                let mut visible = serde_json::to_value(&e.visible).unwrap();
+                let object = visible.as_object_mut().unwrap();
+                object.remove("target_node");
+                object.insert("stage".into(), hf_io::STAGES[1].into());
+                object.insert(
+                    "query".into(),
+                    serde_json::json!(format!("what does {} lead to?", e.visible.start_node)),
+                );
+                Ok(hf_io::EpisodeOut {
+                    episode_id: e.episode_id.clone(),
+                    visible,
+                    hidden: serde_json::to_value(&e.hidden).unwrap(),
+                })
+            })
+            .collect();
+        hf_io::write_split(
+            "fixture",
+            hf_io::STAGES[1],
+            split,
+            &destination.join(split),
+            out,
+            &artifacts.graph,
+            &artifacts.public["sampler"],
+        )
+        .unwrap();
+    }
+    ids
+}
+
+/// A config whose model is `relational-v6` at the fixture world's sizes —
+/// `raw-v5`, the default, is refused under `episode_query`.
+fn relational_config(root: &PathBuf, data: Option<serde_json::Value>) -> PathBuf {
+    std::fs::create_dir_all(root).unwrap();
+    let mut config = serde_json::json!({
+        "record_kind": "real_walk_stage0_config",
+        "note": "fixture-mode smoke configuration written by the test; never evidence",
+        "training_authorized": false,
+        "model": {
+            "hidden_dimension": 32, "self_attention_heads": 2, "feedforward_multiplier": 2,
+            "score_hidden_dimension": 16, "coverage_hidden_dimension": 8,
+            "traversal_blocks": 1, "dropout": 0.0, "feature_set": "relational-v6"
+        },
+        "sampler": {"subgraph_size": 64, "target_distance": 3, "removal_level": 2, "cost_epsilon": 0.5},
+        "training": {"learning_rate": 0.001, "weight_decay": 0.0, "update_count": 1, "microbatch_size": 2}
+    });
+    if let Some(block) = data {
+        config.as_object_mut().unwrap().insert("data".into(), block);
+    }
+    let path = root.join("config.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    path
+}
+
+/// The foundation's own HEAD, which is an ancestor of itself and so a pin a
+/// real run accepts.
+fn foundation_head() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(foundation())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// **The zero-shot read.** `--query-embeddings-dir` and
+/// `--expect-embedding-coverage` are honoured on `--reevaluate-checkpoint`,
+/// not only on a training run: the sidecar drives the walk (the rows carry
+/// `question_greedy_overshoot` and never the stage-0 key), both are recorded
+/// in `reeval.json`, an unreachable coverage floor exits 2 before a row is
+/// written, and an episode the sidecar does not cover exits 2 rather than
+/// walking on a silent zero vector.
+#[test]
+fn a_reevaluation_reads_the_query_sidecar_and_the_coverage_floor() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("reeval-stage1");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    let splits = root.join("splits");
+    let ids = write_stage1_splits(&goldens, &splits);
+    assert_eq!(ids.len(), 18, "12 train + 6 screen golden episodes");
+    let queries = root.join("queries");
+    write_query_cache(&queries, &ids);
+
+    // a checkpoint to re-evaluate, trained on the fixture world at the SAME
+    // model configuration (the fixture world is 8-dimensional, as this cache is)
+    let stage0 = relational_config(&root.join("stage0"), None);
+    let trained = root.join("trained");
+    let o = run(&[
+        "--config",
+        stage0.to_str().unwrap(),
+        "--output",
+        trained.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "4",
+        "--screen-episodes",
+        "2",
+        "--updates",
+        "1",
+        "--save-checkpoint",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let stage1 = relational_config(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+    );
+    // a real run takes the GPU when one is present; this is a CLI check, not a
+    // training job, so it is pinned to the CPU
+    let reeval =
+        |out: &PathBuf, query_dir: &std::path::Path, floor: &str| -> std::process::Output {
+            run_env(
+                &[
+                    "--config",
+                    stage1.to_str().unwrap(),
+                    "--output",
+                    out.to_str().unwrap(),
+                    "--model-seed",
+                    "5",
+                    "--family",
+                    "fixture",
+                    "--splits-dir",
+                    splits.to_str().unwrap(),
+                    "--embeddings-dir",
+                    cache.to_str().unwrap(),
+                    "--query-embeddings-dir",
+                    query_dir.to_str().unwrap(),
+                    "--expect-embedding-coverage",
+                    floor,
+                    "--screen-episodes",
+                    "6",
+                    "--reevaluate-checkpoint",
+                    trained.join("checkpoint.json").to_str().unwrap(),
+                    "--preregistration-commit",
+                    &pin,
+                    "--foundation-root",
+                    foundation().to_str().unwrap(),
+                    "--allow-stale-engine",
+                ],
+                CPU_ONLY,
+            )
+        };
+
+    let out = root.join("reeval");
+    let o = reeval(&out, &queries, "1.0");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("reeval.json")).unwrap()).unwrap();
+    assert_eq!(record["query_source"], "episode_query");
+    assert_eq!(
+        record["query_embeddings"],
+        serde_json::Value::from(queries.to_string_lossy().to_string()),
+        "the sidecar the run read is named in the artifact"
+    );
+    assert_eq!(record["query_embedding_manifest"]["dimension"], 8);
+    assert_eq!(record["query_embedding_manifest"]["count"], ids.len());
+    assert_eq!(record["embedding_coverage"]["expected"], 1.0);
+    assert_eq!(record["embedding_coverage"]["share"], 1.0);
+    assert!(record["embedding_coverage"]["distinct"].as_u64().unwrap() > 0);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(out.join("evaluation_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 6, "the screen split was re-evaluated");
+    for r in &rows {
+        assert_eq!(r["update"], "reeval");
+        // the sidecar really drove the walk: the stage-1 key, never the stage-0 one
+        assert!(r.get("greedy_overshoot").is_none());
+        assert!(r["question_greedy_overshoot"].is_i64());
+        // and ENG-9's column is on the re-evaluation's rows too
+        let rank = &r["cosine_rank_at_registration"];
+        assert!(
+            rank.is_null() || rank.as_u64().is_some_and(|k| k >= 1),
+            "{rank}"
+        );
+    }
+
+    // the floor is a gate on this path, not decoration
+    let refused = root.join("refused");
+    let o = reeval(&refused, &queries, "1.1");
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("--expect-embedding-coverage"), "{stderr}");
+    assert!(
+        !refused.join("reeval.json").exists() && !refused.join("evaluation_rows.jsonl").exists(),
+        "a refused re-evaluation writes nothing a reader would take as finished"
+    );
+
+    // an episode the sidecar does not cover exits 2 rather than walking on a
+    // silent zero vector
+    let partial = root.join("partial-queries");
+    write_query_cache(&partial, &ids[..ids.len() - 1]);
+    let short = root.join("short");
+    let o = reeval(&short, &partial, "1.0");
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("no query vector"), "{stderr}");
+    assert!(!short.join("reeval.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One split directory — `train` from `source`, `screen` from the golden
+/// screen — with the sampler block the manifest will record. `rung` rewrites
+/// `subgraph_size` and `target_distance`, which is how the test makes a pool
+/// that a later rung's config disagrees with.
+fn write_pool(
+    goldens: &std::path::Path,
+    destination: &std::path::Path,
+    source: &str,
+    rung: Option<(u64, u64)>,
+) {
+    for (split, from) in [("train", source), ("screen", "screen")] {
+        let (episodes, artifacts) = hf_io::read_split(&goldens.join(from)).unwrap();
+        let mut sampler = artifacts.public["sampler"].clone();
+        if let Some((size, distance)) = rung {
+            let object = sampler.as_object_mut().unwrap();
+            object.insert("subgraph_size".into(), size.into());
+            object.insert("target_distance".into(), distance.into());
+        }
+        let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+            .iter()
+            .map(|e| {
+                Ok(hf_io::EpisodeOut {
+                    episode_id: e.episode_id.clone(),
+                    visible: serde_json::to_value(&e.visible).unwrap(),
+                    hidden: serde_json::to_value(&e.hidden).unwrap(),
+                })
+            })
+            .collect();
+        hf_io::write_split(
+            "fixture",
+            hf_io::STAGES[0],
+            split,
+            &destination.join(split),
+            out,
+            &artifacts.graph,
+            &sampler,
+        )
+        .unwrap();
+    }
+}
+
+/// **P1, the cumulative pool.** `--splits-dir` repeated concatenates the
+/// pools in the order given; the draw stays ONE draw over the concatenation,
+/// so each pool's share is its size and `train_draws` replays exactly as it
+/// does for one pool — checked here through the engine's own replay gate,
+/// which goes band H when the replayed draws do not reproduce the probe's
+/// histogram. A single `--splits-dir` is unchanged, sampler agreement and
+/// all; only a cumulative pool stops being checked on `subgraph_size` and
+/// `target_distance`, which `probe.json` then records per pool.
+#[test]
+fn a_cumulative_pool_concatenates_the_splits_dirs_and_keeps_the_draws_replayable() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("cumulative");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    // the run's own rung, agreeing with the config, and an earlier one that
+    // does not: a smaller ball at a shorter distance
+    let rung3 = root.join("rung3");
+    write_pool(&goldens, &rung3, "train", None);
+    let rung2 = root.join("rung2");
+    write_pool(&goldens, &rung2, "train-greedy", Some((20, 2)));
+    let cfg = relational_config(&root.join("config"), None);
+
+    let train = |out: &PathBuf, pools: &[&PathBuf], extra: &[&str]| -> std::process::Output {
+        let mut args: Vec<String> = vec![
+            "--config".into(),
+            cfg.to_string_lossy().into(),
+            "--output".into(),
+            out.to_string_lossy().into(),
+            "--model-seed".into(),
+            "5".into(),
+            "--family".into(),
+            "fixture".into(),
+            "--embeddings-dir".into(),
+            cache.to_string_lossy().into(),
+            "--screen-episodes".into(),
+            "6".into(),
+            "--updates".into(),
+            "3".into(),
+            "--eval-every".into(),
+            "3".into(),
+            "--preregistration-commit".into(),
+            pin.clone(),
+            "--foundation-root".into(),
+            foundation().to_string_lossy().into(),
+            "--allow-stale-engine".into(),
+        ];
+        for p in pools {
+            args.push("--splits-dir".into());
+            args.push(p.to_string_lossy().into());
+        }
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        run_env(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            CPU_ONLY,
+        )
+    };
+    let probe_of = |out: &PathBuf| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(out.join("probe.json")).unwrap()).unwrap()
+    };
+
+    // one pool: the old read, and a one-element `train_pools`
+    let single = root.join("single");
+    let o = train(&single, &[&rung3], &[]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe = probe_of(&single);
+    assert_eq!(probe["train_episodes"], 12);
+    let pools = probe["train_pools"].as_array().unwrap();
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0]["episodes"], 12);
+    assert_eq!(pools[0]["episodes_used"], 12);
+    assert_eq!(pools[0]["share"], 1.0);
+    assert_eq!(pools[0]["subgraph_size"], 64);
+    assert!(probe["split_manifests"].get("train2").is_none());
+
+    // two pools: the concatenation, in the order given
+    let both = root.join("both");
+    let o = train(&both, &[&rung3, &rung2], &["--save-checkpoint"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe = probe_of(&both);
+    assert_eq!(probe["train_episodes"], 24, "12 + 12, concatenated");
+    let pools = probe["train_pools"].as_array().unwrap();
+    assert_eq!(pools.len(), 2);
+    assert_eq!(pools[0]["splits_dir"], rung3.to_string_lossy().to_string());
+    assert_eq!(pools[1]["splits_dir"], rung2.to_string_lossy().to_string());
+    // the two keys the cumulative pool is no longer checked on are recorded
+    assert_eq!(pools[0]["subgraph_size"], 64);
+    assert_eq!(pools[0]["target_distance"], 3);
+    assert_eq!(pools[1]["subgraph_size"], 20);
+    assert_eq!(pools[1]["target_distance"], 2);
+    assert_eq!(pools[0]["share"], 0.5);
+    assert_eq!(pools[1]["share"], 0.5);
+    assert!(probe["split_manifests"]["train2"]["sampler"]["subgraph_size"] == 20);
+    // the screen is the FIRST pool's, and only the first pool's
+    assert_eq!(probe["screen_episodes"], 6);
+    assert_eq!(probe["train_draws"]["draws"], 6, "3 updates x microbatch 2");
+
+    // the draw is one draw over the concatenation, so the engine's own replay
+    // reproduces it: blank the checkpoint's recorded draws (as
+    // `tools/export_checkpoint.py` leaves a Python checkpoint) and make the
+    // re-evaluation replay them against this probe. A two-level draw could not
+    // pass this gate.
+    let meta = both.join("checkpoint.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+    assert!(
+        !saved["train_draws"].as_object().unwrap().is_empty(),
+        "the checkpoint recorded the draws before the test blanked them"
+    );
+    saved["train_draws"] = serde_json::json!({});
+    std::fs::write(&meta, serde_json::to_string_pretty(&saved).unwrap()).unwrap();
+    let replayed = root.join("replayed");
+    let o = train(
+        &replayed,
+        &[&rung3, &rung2],
+        &[
+            "--reevaluate-checkpoint",
+            meta.to_str().unwrap(),
+            "--train-sample",
+            "8",
+            "--train-draws-probe",
+            both.join("probe.json").to_str().unwrap(),
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(replayed.join("reeval.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["train_sample"]["draw_counts_source"], "replay");
+    assert_eq!(
+        record["train_sample"]["draw_counts_replay"]["histogram_matches_probe"],
+        true
+    );
+    assert_eq!(record["train_sample"]["pool_size"], 24);
+
+    // ONE --splits-dir is checked exactly as it always was
+    let refused = root.join("refused");
+    let o = train(&refused, &[&rung2], &[]);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("band H"), "{stderr}");
+    assert!(stderr.contains("subgraph_size"), "{stderr}");
+
+    // and overlapping pools are refused rather than folded together: an
+    // episode drawn twice would be one `train_draws` key with both counts
+    let twice = root.join("twice");
+    let o = train(&twice, &[&rung3, &rung3], &[]);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(stderr.contains("the pools overlap"), "{stderr}");
     let _ = std::fs::remove_dir_all(&root);
 }

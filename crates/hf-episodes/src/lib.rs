@@ -711,12 +711,12 @@ impl<'g> Sampler<'g> {
         }
         let target = candidates[rng.randrange(candidates.len() as u64) as usize];
         let bound = config.cost_bound();
-        let paths = sub.simple_paths(start, target, bound);
+        let Some(paths) = sub.simple_paths_capped(start, target, bound, config.max_paths as usize)
+        else {
+            return Ok(Err(Dropped::PathSetOverCap));
+        };
         if paths.is_empty() {
             return Ok(Err(Dropped::NoPathWithinBound));
-        }
-        if paths.len() > config.max_paths as usize {
-            return Ok(Err(Dropped::PathSetOverCap));
         }
         let names = |p: &Vec<NodeId>| -> Vec<String> {
             p.iter().map(|n| self.graph.name(*n).to_string()).collect()
@@ -751,12 +751,13 @@ impl<'g> Sampler<'g> {
                     return Ok(Err(Dropped::TargetsInterdependent));
                 }
                 let next = filtered[rng.randrange(filtered.len() as u64) as usize];
-                let next_paths = sub.simple_paths(start, next, bound);
+                let Some(next_paths) =
+                    sub.simple_paths_capped(start, next, bound, config.max_paths as usize)
+                else {
+                    return Ok(Err(Dropped::PathSetOverCap));
+                };
                 if next_paths.is_empty() {
                     return Ok(Err(Dropped::NoPathWithinBound));
-                }
-                if next_paths.len() > config.max_paths as usize {
-                    return Ok(Err(Dropped::PathSetOverCap));
                 }
                 targets.push(next);
                 raw_paths.push(next_paths);
@@ -976,16 +977,24 @@ impl<'g> Sampler<'g> {
                 self.graph.name(t).to_string(),
             ))
         });
-        let recomputed: Vec<Vec<Vec<String>>> = targets
-            .iter()
-            .map(|t| {
-                pruned
-                    .simple_paths(start, *t, bound)
+        let mut recomputed: Vec<Vec<Vec<String>>> = Vec::with_capacity(targets.len());
+        for target in targets {
+            // Removing edges cannot add paths, so a target whose original set
+            // was within the cap should stay within it. Keep the cap here too:
+            // the invariant fails closed instead of reopening an unbounded
+            // enumeration if this code changes later.
+            let Some(found) =
+                pruned.simple_paths_capped(start, *target, bound, config.max_paths as usize)
+            else {
+                return Ok(Err(Dropped::PathSetOverCap));
+            };
+            recomputed.push(
+                found
                     .iter()
                     .map(|p| p.iter().map(|n| self.graph.name(*n).to_string()).collect())
-                    .collect()
-            })
-            .collect();
+                    .collect(),
+            );
+        }
         let survivors: Vec<Vec<String>> = if k == 1 {
             // v1's test: the recomputed set must EQUAL the designated survivors
             if recomputed[0].is_empty() || recomputed[0] != designated[0] {

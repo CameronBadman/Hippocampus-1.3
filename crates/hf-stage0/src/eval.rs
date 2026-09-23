@@ -377,6 +377,21 @@ pub fn evaluate(
                         .into(),
                 );
             }
+            // ENG-9, and the LAST key the row gains: where the target stood by
+            // cosine-to-query among the nodes the walk had examined at the
+            // moment it registered (1 = nothing it had seen scored higher),
+            // null when it never registered. `registered_at[0]` — and, under
+            // `exhaust`, `walk_exhaust` itself — already carry the expansions
+            // at that moment, so the row states no third copy of them.
+            // Under the default `target_embedding` the query IS the target's
+            // own row, so the rank is 1 for every registered episode and says
+            // nothing; it means something under `episode_query`.
+            row.insert(
+                "cosine_rank_at_registration".into(),
+                xw.cosine_rank_at_registration_k1()
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
             rows.push(Value::Object(row));
             if let Some(c) = &xw.candidates {
                 candidates.push((e.episode_id.clone(), c.clone()));
@@ -645,6 +660,135 @@ mod tests {
                     .greedy_overshoot
                     .map(Value::from)
                     .unwrap_or(Value::Null)
+            );
+        }
+    }
+
+    /// ENG-9's rank from its DEFINITION, re-derived from one episode: the walk
+    /// sees the start node, then the children of each expanded node in
+    /// `edge_id` order, and the rank is taken the instant the target is first
+    /// examined — one plus the number of nodes seen so far whose cosine to the
+    /// query is strictly higher. A node the cache does not hold is the zero
+    /// vector, whose cosine is 0, exactly as the index treats it.
+    fn rank_from_the_definition(
+        e: &hf_io::RealEpisode,
+        expanded: &[&str],
+        nodes: &hf_embed::EmbeddingMatrix,
+        query: &[f32],
+    ) -> usize {
+        let target = e.hidden.target_set.first().expect("one hidden target");
+        let mut edges: Vec<(u32, &str, &str)> = e
+            .visible
+            .edges
+            .iter()
+            .map(|x| (x.edge_id, x.source.as_str(), x.target.as_str()))
+            .collect();
+        edges.sort_unstable();
+        let ids: std::collections::HashSet<u32> = edges.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(
+            ids.len(),
+            edges.len(),
+            "the edge ids are unique, so `edge_id` alone fixes the order"
+        );
+        let mut seen: Vec<&str> = vec![e.visible.start_node.as_str()];
+        'walk: for node in expanded {
+            for (_, source, tail) in &edges {
+                if source != node {
+                    continue;
+                }
+                if tail == target {
+                    break 'walk;
+                }
+                if !seen.contains(tail) {
+                    seen.push(tail);
+                }
+            }
+        }
+        assert!(!seen.contains(&target.as_str()));
+        let cos = |n: &str| {
+            nodes
+                .get(n)
+                .map(|v| hf_walk::cosine(v, query))
+                .unwrap_or(0.0)
+        };
+        let theirs = cos(target);
+        1 + seen.iter().filter(|n| cos(n) > theirs).count()
+    }
+
+    /// **ENG-9 on the row.** `cosine_rank_at_registration` is the LAST key
+    /// every evaluation row carries: an integer where the exhaust walk
+    /// registered, null where it did not, and 1 under the default query
+    /// source, where the query is the target's own embedding row and the
+    /// number says nothing. The stage-1 value is checked against the walk's
+    /// own reading for the same episode, which
+    /// `crates/hf-walk/tests/stage1.rs` checks against the definition.
+    #[test]
+    fn the_last_key_of_every_row_is_the_cosine_rank_at_registration() {
+        let (episodes, nodes, queries) = stage1_world();
+        let model = cpu_model();
+        let stage1 = evaluate(
+            &model,
+            &episodes,
+            &nodes,
+            8,
+            false,
+            QueryVectors::episode_query(&queries),
+        )
+        .expect("a stage-1 evaluation");
+        let mut ranked = 0;
+        for (row, e) in stage1.rows.iter().zip(&episodes) {
+            let object = row.as_object().expect("a row");
+            assert_eq!(
+                object.keys().next_back().map(String::as_str),
+                Some("cosine_rank_at_registration"),
+                "the new key is not the row's last"
+            );
+            // re-derived from the EPISODE — its own edge list in `edge_id`
+            // order, the expansion order the row reports and the two caches —
+            // not read back out of the walk that wrote the row
+            let expanded: Vec<&str> = object["walk_expanded"]
+                .as_array()
+                .expect("the expansion order")
+                .iter()
+                .map(|n| n.as_str().expect("a name"))
+                .collect();
+            let question = queries.get(&e.episode_id).expect("a question");
+            let want = match object["walk_registered"].as_bool() {
+                Some(true) => Value::from(rank_from_the_definition(e, &expanded, &nodes, question)),
+                _ => Value::Null,
+            };
+            assert_eq!(
+                object["cosine_rank_at_registration"], want,
+                "{}",
+                e.episode_id
+            );
+            if want.as_u64().is_some_and(|r| r > 1) {
+                ranked += 1;
+            }
+        }
+        assert!(
+            ranked > 0,
+            "no target was out-ranked by anything the walk had seen; the check would be vacuous"
+        );
+        // at stage 0 the query is the target's own row: the rank is 1, always
+        let goldens = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../hf-io/tests/goldens/fixture-split/screen");
+        let stage0 = hf_io::read_split(&goldens).expect("the golden split").0;
+        let plain = evaluate(
+            &model,
+            &stage0,
+            &nodes,
+            8,
+            false,
+            QueryVectors::target_embedding(),
+        )
+        .expect("a stage-0 evaluation");
+        assert!(!plain.rows.is_empty());
+        for row in &plain.rows {
+            assert_eq!(
+                row["cosine_rank_at_registration"],
+                Value::from(1),
+                "at stage 0 nothing can out-score the target's own embedding"
             );
         }
     }
