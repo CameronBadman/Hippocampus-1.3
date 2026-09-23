@@ -1055,3 +1055,303 @@ fn the_question_sidecar_refuses_another_encoder_a_missing_episode_and_thin_cover
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// `hf-splits subset` (ENG-6): a membership, not a prefix
+
+/// A gzip stream's JSON lines, read through the engine's own reader.
+fn gz_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    String::from_utf8(hf_io::read_maybe_gz(path).unwrap())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn ids_of(path: &std::path::Path) -> Vec<String> {
+    gz_records(path)
+        .iter()
+        .map(|r| r["episode_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// The id SET is the file's and the ORDER is the source's; every record reads
+/// back equal to the source's, the sampler block and stage are carried, the
+/// manifests' digests are recomputed (the reader validates them), the id
+/// file's sha256 is recorded, and the modes are 0644 / 0600. The whole id list
+/// reproduces the source's containers byte for byte.
+#[test]
+fn subset_keeps_exactly_the_listed_ids_in_the_sources_order() {
+    let root = tmp("subset");
+    let (gdir, _cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 10);
+    let src = dest.join("screen");
+    let all = ids_of(&src.join("visible.jsonl.gz"));
+    assert_eq!(all.len(), 10);
+    // listed out of order: 7, 2, 5
+    let listed = [all[7].clone(), all[2].clone(), all[5].clone()];
+    let ids_file = root.join("ids.txt");
+    let ids_text = format!("{}\n\n{}\n{}\n", listed[0], listed[1], listed[2]);
+    std::fs::write(&ids_file, &ids_text).unwrap();
+    let out_dir = root.join("sub");
+    let out = run(&[
+        "subset",
+        "--split-dir",
+        src.to_str().unwrap(),
+        "--ids",
+        ids_file.to_str().unwrap(),
+        "--destination",
+        out_dir.to_str().unwrap(),
+        "--role-note",
+        "test subset",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let want = vec![all[2].clone(), all[5].clone(), all[7].clone()];
+    assert_eq!(ids_of(&out_dir.join("visible.jsonl.gz")), want);
+    assert_eq!(ids_of(&out_dir.join("hidden.jsonl.gz")), want);
+    // record for record equal to the source's
+    let (ours, art) = hf_io::read_split(&out_dir).unwrap();
+    let (theirs, src_art) = hf_io::read_split(&src).unwrap();
+    for e in &ours {
+        let s = theirs
+            .iter()
+            .find(|t| t.episode_id == e.episode_id)
+            .unwrap();
+        assert_eq!(e.visible, s.visible);
+        assert_eq!(e.hidden, s.hidden);
+    }
+    for key in [
+        "sampler",
+        "stage",
+        "schema_version",
+        "family",
+        "split",
+        "graph_manifest_sha256",
+    ] {
+        assert_eq!(art.public[key], src_art.public[key], "{key}");
+        assert_eq!(art.private[key], src_art.private[key], "{key}");
+    }
+    assert_eq!(art.public["episode_count"], 3);
+    assert_eq!(art.public["training_authorized"], false);
+    let removal: u64 = art.public["removal_levels"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(removal, 3);
+    assert_eq!(
+        art.public["subset"]["ids_sha256"],
+        hf_core::sha256_bytes(ids_text.as_bytes())
+    );
+    assert_eq!(art.public["subset"]["role_note"], "test subset");
+    assert_eq!(
+        art.public["subset"]["source_visible_sha256"],
+        src_art.public["visible_sha256"]
+    );
+    assert!(art.public["subset"].get("source_hidden_sha256").is_none());
+    assert_eq!(
+        art.private["subset"]["source_hidden_sha256"],
+        src_art.private["hidden_sha256"]
+    );
+    assert_eq!(mode_of(&out_dir.join("visible.jsonl.gz")), 0o644);
+    assert_eq!(mode_of(&out_dir.join("hidden.jsonl.gz")), 0o600);
+    assert_eq!(mode_of(&out_dir.join("manifest.public.json")), 0o644);
+    assert_eq!(mode_of(&out_dir.join("manifest.private.json")), 0o600);
+    // the sidecars are cut to the subset's nodes
+    let texts = hf_io::read_texts(&out_dir).unwrap();
+    let mut nodes: std::collections::BTreeSet<String> = Default::default();
+    for e in &ours {
+        nodes.extend(e.visible.nodes.iter().map(|n| n.node.clone()));
+    }
+    assert_eq!(
+        texts
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        nodes
+    );
+    let listed_nodes = std::fs::read_to_string(out_dir.join("nodes.txt")).unwrap();
+    assert_eq!(
+        listed_nodes.lines().map(str::to_string).collect::<Vec<_>>(),
+        nodes.iter().cloned().collect::<Vec<_>>()
+    );
+    assert!(!out_dir.join("sampling.json").exists());
+    // every id: the containers are the source's, byte for byte
+    let every = root.join("ids-all.txt");
+    let mut shuffled = all.clone();
+    shuffled.reverse();
+    std::fs::write(&every, shuffled.join("\n")).unwrap();
+    let whole = root.join("whole");
+    let out = run(&[
+        "subset",
+        "--split-dir",
+        src.to_str().unwrap(),
+        "--ids",
+        every.to_str().unwrap(),
+        "--destination",
+        whole.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for f in ["visible.jsonl.gz", "hidden.jsonl.gz"] {
+        assert_eq!(
+            std::fs::read(whole.join(f)).unwrap(),
+            std::fs::read(src.join(f)).unwrap(),
+            "{f}"
+        );
+    }
+}
+
+/// Refused: an id the source lacks, a duplicate id, an empty list, an existing
+/// destination and a holdout path — and nothing is left behind.
+#[test]
+fn subset_refuses_unknown_duplicate_and_empty_ids_an_existing_destination_and_holdout() {
+    let root = tmp("subset-refusals");
+    let (gdir, _cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 4);
+    let src = dest.join("screen");
+    let all = ids_of(&src.join("visible.jsonl.gz"));
+    let case = |name: &str, ids: &str, destination: &std::path::Path| {
+        let file = root.join(format!("{name}.txt"));
+        std::fs::write(&file, ids).unwrap();
+        run(&[
+            "subset",
+            "--split-dir",
+            src.to_str().unwrap(),
+            "--ids",
+            file.to_str().unwrap(),
+            "--destination",
+            destination.to_str().unwrap(),
+        ])
+    };
+    let unknown = case(
+        "unknown",
+        &format!("{}\nnot-an-episode\n", all[0]),
+        &root.join("u"),
+    );
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("not-an-episode"));
+    assert!(!root.join("u").exists());
+    let twice = case(
+        "twice",
+        &format!("{}\n{}\n", all[1], all[1]),
+        &root.join("t"),
+    );
+    assert!(!twice.status.success());
+    assert!(String::from_utf8_lossy(&twice.stderr).contains("twice"));
+    let empty = case("empty", "\n\n", &root.join("e"));
+    assert!(!empty.status.success());
+    std::fs::create_dir_all(root.join("exists")).unwrap();
+    let exists = case("exists", &all[0], &root.join("exists"));
+    assert!(!exists.status.success());
+    assert!(String::from_utf8_lossy(&exists.stderr).contains("already exists"));
+    let holdout = case("holdout", &all[0], &root.join("heldout-copy"));
+    assert!(!holdout.status.success());
+    assert!(!root.join("heldout-copy").exists());
+    // no temporary directory is left beside the destinations
+    assert!(std::fs::read_dir(&root).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".tmp-")));
+}
+
+/// A stage-1 (teacher-written) source: the hidden records keep keys no typed
+/// reader models (the `teacher` block) byte for byte, `stage` stays
+/// `stage1_described_target`, and the sampler's `role` travels. A 6.0.0 source
+/// keeps its version.
+#[test]
+fn subset_of_a_stage1_split_keeps_untyped_hidden_keys_and_a_v6_split_keeps_its_version() {
+    let root = tmp("subset-stage1");
+    let (gdir, _cache) = fixture_dirs(&root);
+    let dest = root.join("pool");
+    write_fixture_split(&root, &gdir, &dest, "1", 5);
+    let (episodes, artifacts) = hf_io::read_split(&dest.join("screen")).unwrap();
+    let mut sampler = artifacts.public["sampler"].clone();
+    sampler["role"] = "teacher".into();
+    let out: Vec<Result<hf_io::EpisodeOut, hf_core::HfError>> = episodes
+        .iter()
+        .map(|e| {
+            let mut visible = serde_json::to_value(&e.visible).unwrap();
+            let o = visible.as_object_mut().unwrap();
+            o.remove("target_node");
+            o.insert("stage".into(), hf_io::STAGES[1].into());
+            o.insert("query".into(), serde_json::json!("which note is it?"));
+            let mut hidden = serde_json::to_value(&e.hidden).unwrap();
+            hidden["teacher"] = serde_json::json!({"role": "teacher", "source_ordinal": 3});
+            Ok(hf_io::EpisodeOut {
+                episode_id: e.episode_id.clone(),
+                visible,
+                hidden,
+            })
+        })
+        .collect();
+    let stage1 = root.join("stage1");
+    hf_io::write_split(
+        "fixture",
+        hf_io::STAGES[1],
+        "screen",
+        &stage1,
+        out,
+        &artifacts.graph,
+        &sampler,
+    )
+    .unwrap();
+    let ids: Vec<String> = episodes.iter().map(|e| e.episode_id.clone()).collect();
+    std::fs::write(root.join("ids.txt"), format!("{}\n{}\n", ids[3], ids[1])).unwrap();
+    let sub = root.join("stage1-sub");
+    let o = run(&[
+        "subset",
+        "--split-dir",
+        stage1.to_str().unwrap(),
+        "--ids",
+        root.join("ids.txt").to_str().unwrap(),
+        "--destination",
+        sub.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let hidden = gz_records(&sub.join("hidden.jsonl.gz"));
+    assert_eq!(hidden.len(), 2);
+    assert_eq!(hidden[0]["episode_id"], ids[1].as_str());
+    assert_eq!(hidden[0]["hidden"]["teacher"]["source_ordinal"], 3);
+    let art = hf_io::validate_split_artifacts(&sub).unwrap();
+    assert_eq!(art.public["stage"], hf_io::STAGES[1]);
+    assert_eq!(art.public["sampler"]["role"], "teacher");
+    assert_eq!(art.public["sampler"], sampler);
+    // a k = 2 source is 6.0.0 and stays so
+    let k2 = root.join("pool-k2");
+    write_fixture_split(&root, &gdir, &k2, "2", 4);
+    let k2_ids = ids_of(&k2.join("screen").join("visible.jsonl.gz"));
+    std::fs::write(root.join("k2.txt"), &k2_ids[2]).unwrap();
+    let k2_sub = root.join("k2-sub");
+    let o = run(&[
+        "subset",
+        "--split-dir",
+        k2.join("screen").to_str().unwrap(),
+        "--ids",
+        root.join("k2.txt").to_str().unwrap(),
+        "--destination",
+        k2_sub.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = hf_io::validate_split_artifacts(&k2_sub).unwrap();
+    assert_eq!(art.public["schema_version"], hf_io::SCHEMA_VERSION_V6);
+    assert_eq!(
+        ids_of(&k2_sub.join("visible.jsonl.gz")),
+        vec![k2_ids[2].clone()]
+    );
+}

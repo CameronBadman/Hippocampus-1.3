@@ -3,6 +3,9 @@
 //! the server. The manifest is written before the first vector, so a
 //! half-run never lacks provenance; an existing cache is resumed only when its
 //! served digest and character limit match.
+//!
+//! `hf-embed merge --into <dst> <src>...`: several caches (the teacher's
+//! per-destination `queries/`) merged into one — see `hf_embed::merge_caches`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -229,7 +232,43 @@ fn pending_len(texts: &[String], _node: &str) -> usize {
     texts.iter().map(|t| t.chars().count()).max().unwrap_or(0)
 }
 
+/// `hf-embed merge`: one cache from several (ENG-2).
+#[derive(Parser, Debug)]
+#[command(
+    name = "hf-embed merge",
+    about = "merge v5 caches (e.g. the teacher's queries/ caches) into one; refuses \
+             another encoder, another text_char_limit or keyed_by, a count that \
+             disagrees with its manifest, and one id with two different vectors"
+)]
+struct MergeArgs {
+    /// the merged cache directory; refused when it exists
+    #[arg(long)]
+    into: PathBuf,
+    /// the source cache directories (manifest.json + vectors.jsonl), in order
+    #[arg(required = true)]
+    sources: Vec<PathBuf>,
+}
+
 fn main() {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if argv.get(1).map(|a| a == "merge").unwrap_or(false) {
+        let mut rest = vec![argv[0].clone()];
+        rest.extend(argv[2..].iter().cloned());
+        let args = MergeArgs::parse_from(rest);
+        match hf_embed::merge_caches(&args.sources, &args.into) {
+            Ok(report) => {
+                println!(
+                    "hf-embed merge: {} vectors from {} caches ({} identical duplicates dropped) -> {}",
+                    report.written,
+                    args.sources.len(),
+                    report.duplicates_identical,
+                    args.into.display()
+                );
+                return;
+            }
+            Err(e) => hf_core::exit_with("hf-embed merge", &e),
+        }
+    }
     let args = Args::parse();
     if let Err(e) = run(args) {
         hf_core::exit_with("hf-embed", &e);

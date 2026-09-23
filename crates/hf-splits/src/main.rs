@@ -14,6 +14,13 @@
 //! `evaluate` baseline half without the learned walk, which is the only part
 //! that needs a checkpoint.
 //!
+//! `hf-splits subset`: a derived split holding exactly the episodes an id
+//! file names (ENG-6 of `STAGE1_Q_DESIGN.md`): both streams copied record for
+//! record in the SOURCE's order, the source's manifests carried with the
+//! sampler block and `stage` unchanged, the counts and digests recomputed, and
+//! a `subset` block recording the id file's sha256. A Q0 / Q0-rand pool is a
+//! membership, which `--train-episodes` (a prefix) cannot select.
+//!
 //! `hf-splits prefix-check OLD NEW`: `real_walk_split_prefix_check.py` — the
 //! first `episode_count(OLD)` records of both streams of NEW equal OLD's,
 //! record for record (digests differ by construction and are not the check);
@@ -44,6 +51,8 @@ enum Command {
     Write(WriteArgs),
     /// read the k baselines off one split directory, one JSON line per episode
     Baselines(BaselinesArgs),
+    /// write a split holding exactly the listed episode ids, in the source's order
+    Subset(SubsetArgs),
     /// check that NEW's first records reproduce OLD's, stream by stream
     PrefixCheck {
         old: PathBuf,
@@ -132,6 +141,24 @@ struct BaselinesArgs {
     /// read only the first N episodes (0 = every one)
     #[arg(long, default_value_t = 0)]
     limit: usize,
+}
+
+#[derive(Parser, Debug)]
+struct SubsetArgs {
+    /// ONE source split directory (visible/hidden streams and manifests)
+    #[arg(long)]
+    split_dir: PathBuf,
+    /// the episode ids to keep, one per line (blank lines ignored); every id
+    /// must be in the source, none twice. The output keeps the SOURCE's order
+    #[arg(long)]
+    ids: PathBuf,
+    /// the new split directory; refused when it exists
+    #[arg(long)]
+    destination: PathBuf,
+    /// free text recorded in the manifests' `subset.role_note` (e.g. "Q0: the
+    /// admitted ids of stage1-q-r3")
+    #[arg(long)]
+    role_note: Option<String>,
 }
 
 fn read_json(path: &Path) -> Result<Value, HfError> {
@@ -618,6 +645,66 @@ fn baselines(args: BaselinesArgs) -> Result<(), HfError> {
     Ok(())
 }
 
+/// ENG-6: the subset writer. The id file's bytes are hashed as given, so the
+/// sha256 a launcher records for its id list is the one the manifest carries.
+fn subset(args: SubsetArgs) -> Result<(), HfError> {
+    for path in [&args.split_dir, &args.ids, &args.destination] {
+        refuse_holdout(path)?;
+    }
+    let text = std::fs::read_to_string(&args.ids)
+        .map_err(|e| HfError::Invalid(format!("{}: {e}", args.ids.display())))?;
+    let ids: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let ids_sha256 = hf_core::sha256_bytes(text.as_bytes());
+    let source = hf_io::validate_split_artifacts(&args.split_dir)?;
+    let block = json!({
+        "record_kind": "hippo13_split_subset_v1",
+        "engine": "hippo-13 hf-splits subset",
+        "source_split_dir": args.split_dir.to_string_lossy(),
+        "source_episode_count": source.public.get("episode_count").cloned().unwrap_or(Value::Null),
+        "source_visible_sha256": source.public.get("visible_sha256").cloned().unwrap_or(Value::Null),
+        "ids_file": args.ids.to_string_lossy(),
+        "ids_sha256": ids_sha256,
+        "ids_count": ids.len(),
+        "order": "the source's stream order, not the id file's",
+        "role_note": args.role_note,
+        "carried_unchanged": [
+            "family", "graph_manifest_sha256", "sampler", "schema_version", "split", "stage"
+        ],
+        "recomputed": [
+            "episode_count", "removal_levels", "visible_bytes", "visible_sha256",
+            "hidden_bytes", "hidden_sha256", "training_authorized"
+        ],
+        "not_copied": "sampling.json, queries/, discarded/ and any other sidecar: the \
+            sampler block (its drops, seen, admitted and discards included) describes \
+            the SOURCE's draw, not this subset",
+        "training_authorized": false,
+    });
+    let private_extra = json!({
+        "source_hidden_sha256": source.private.get("hidden_sha256").cloned().unwrap_or(Value::Null),
+    });
+    let written = hf_io::write_subset_split(
+        &args.split_dir,
+        &ids,
+        &args.destination,
+        &block,
+        &private_extra,
+    )?;
+    println!(
+        "subset: {} of {} episodes ({} distinct nodes), ids {} -> {}",
+        written.episode_count,
+        block["source_episode_count"],
+        written.nodes.len(),
+        block["ids_sha256"].as_str().unwrap_or(""),
+        args.destination.display()
+    );
+    Ok(())
+}
+
 fn prefix_check(old: &Path, new: &Path, embeddings: Option<&Path>) -> Result<bool, HfError> {
     let mut notes = Vec::new();
     let old_art = hf_io::validate_split_artifacts(old)?;
@@ -685,6 +772,7 @@ fn main() {
     let result = match cli.command {
         Command::Write(args) => write(args),
         Command::Baselines(args) => baselines(args),
+        Command::Subset(args) => subset(args),
         Command::PrefixCheck {
             old,
             new,

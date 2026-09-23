@@ -757,3 +757,309 @@ pub fn read_maybe_gz(path: &Path) -> Result<Vec<u8>, HfError> {
     .map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?;
     Ok(out)
 }
+
+#[derive(Deserialize)]
+struct IdOnly {
+    episode_id: String,
+}
+
+/// What `write_subset_split` wrote: both manifests, the episode count and the
+/// distinct visible node names of the subset.
+#[derive(Clone, Debug)]
+pub struct SubsetWritten {
+    pub public: Value,
+    pub private: Value,
+    pub episode_count: u64,
+    pub nodes: std::collections::BTreeSet<String>,
+}
+
+/// A derived split holding EXACTLY the episodes named by `ids`, copied from
+/// `source` record for record.
+///
+/// Both streams keep the source's line bytes (the canonical bytes the source
+/// digests were taken over) and the source's order — never the id list's — so
+/// a record reads back identical to the source's, including hidden keys no
+/// typed reader models (a stage-1 `teacher` block). The manifests are the
+/// source's, byte for byte in every key except the ones a subset changes:
+/// `episode_count`, `removal_levels`, the stream sizes and digests and
+/// `training_authorized` (always false); `sampler`, `stage`, `schema_version`,
+/// `family`, `split` and the graph digest are carried unchanged. `subset` —
+/// the caller's provenance block — is added to both; `subset_private` is
+/// merged into the PRIVATE manifest's copy only (the source's hidden digest
+/// belongs beside the hidden stream). `texts.jsonl` is filtered to the
+/// subset's nodes in the source's order and `nodes.txt` recomputed when the
+/// source carries them; nothing else beside the streams is copied.
+///
+/// Refused: a holdout path on either side, an existing destination, an empty
+/// or duplicated id list, an id absent from either source stream, a source
+/// stream carrying an id twice, and a selected record whose stage or schema
+/// version differs from the source manifest's.
+pub fn write_subset_split(
+    source: &Path,
+    ids: &[String],
+    destination: &Path,
+    subset: &Value,
+    subset_private: &Value,
+) -> Result<SubsetWritten, HfError> {
+    refuse_holdout(source)?;
+    refuse_holdout(destination)?;
+    if destination.exists() || destination.symlink_metadata().is_ok() {
+        return Err(HfError::Refused(format!(
+            "{} already exists",
+            destination.display()
+        )));
+    }
+    if ids.is_empty() {
+        return Err(HfError::Refused("the id list is empty".into()));
+    }
+    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in ids {
+        if !wanted.insert(id.as_str()) {
+            return Err(HfError::Refused(format!("episode id {id} is listed twice")));
+        }
+    }
+    let artifacts = validate_split_artifacts(source)?;
+    let stage = artifacts
+        .public
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let version = artifacts
+        .public
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // the visible stream: validated per selected record, levels and nodes counted
+    let mut visible: Vec<Vec<u8>> = Vec::new();
+    let mut seen_visible: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut removal_levels: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in gz_lines(&source.join("visible.jsonl.gz"))? {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let head: IdOnly = serde_json::from_slice(&line)
+            .map_err(|e| HfError::BandH(format!("visible record: {e}")))?;
+        if !seen_visible.insert(head.episode_id.clone()) {
+            return Err(HfError::BandH(format!(
+                "the source visible stream carries {} twice",
+                head.episode_id
+            )));
+        }
+        if !wanted.contains(head.episode_id.as_str()) {
+            continue;
+        }
+        let record: VisibleLine = serde_json::from_slice(&line)
+            .map_err(|e| HfError::BandH(format!("visible record: {e}")))?;
+        validate_visible(&record.visible)?;
+        let got_stage = record.visible.get("stage").and_then(Value::as_str);
+        if got_stage != Some(stage.as_str()) {
+            return Err(HfError::BandH(format!(
+                "{}: stage {got_stage:?} differs from the source manifest's {stage:?}",
+                record.episode_id
+            )));
+        }
+        let got_version = record.visible.get("schema_version").and_then(Value::as_str);
+        if let Some(v) = &version {
+            if got_version != Some(v.as_str()) {
+                return Err(HfError::BandH(format!(
+                    "{}: schema version {got_version:?} differs from the source manifest's {v:?}",
+                    record.episode_id
+                )));
+            }
+        }
+        let level = record
+            .visible
+            .get("removal_level")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        *removal_levels.entry(level).or_default() += 1;
+        for node in record
+            .visible
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = node.get("node").and_then(Value::as_str) {
+                nodes.insert(name.to_string());
+            }
+        }
+        visible.push(line);
+    }
+    let mut hidden: Vec<Vec<u8>> = Vec::new();
+    let mut seen_hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in gz_lines(&source.join("hidden.jsonl.gz"))? {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let head: IdOnly = serde_json::from_slice(&line)
+            .map_err(|e| HfError::BandH(format!("hidden record: {e}")))?;
+        if !seen_hidden.insert(head.episode_id.clone()) {
+            return Err(HfError::BandH(format!(
+                "the source hidden stream carries {} twice",
+                head.episode_id
+            )));
+        }
+        if wanted.contains(head.episode_id.as_str()) {
+            hidden.push(line);
+        }
+    }
+    for (stream, seen) in [("visible", &seen_visible), ("hidden", &seen_hidden)] {
+        let missing: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !seen.contains(*id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(HfError::Refused(format!(
+                "{} listed id(s) are not in the source {stream} stream, e.g. {:?}",
+                missing.len(),
+                &missing[..missing.len().min(3)]
+            )));
+        }
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| HfError::Invalid("destination has no parent".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| HfError::Invalid(format!("{}: {e}", parent.display())))?;
+    let temporary: PathBuf = parent.join(format!(
+        ".tmp-{}-{}",
+        destination
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(MODE_SPLIT_DIR)
+            .create(&temporary)
+            .map_err(|e| HfError::Invalid(format!("{}: {e}", temporary.display())))?;
+    }
+    let result = (|| -> Result<(Value, Value), HfError> {
+        let visible_path = temporary.join("visible.jsonl.gz");
+        let hidden_path = temporary.join("hidden.jsonl.gz");
+        let mut v = GzStream::create(&visible_path, MODE_VISIBLE)?;
+        for line in &visible {
+            v.write_record(line)?;
+        }
+        v.finish()?;
+        let mut h = GzStream::create(&hidden_path, MODE_HIDDEN)?;
+        for line in &hidden {
+            h.write_record(line)?;
+        }
+        h.finish()?;
+        let (visible_bytes, visible_sha256) =
+            sha256_file(&visible_path).map_err(|e| HfError::Invalid(e.to_string()))?;
+        let (hidden_bytes, hidden_sha256) =
+            sha256_file(&hidden_path).map_err(|e| HfError::Invalid(e.to_string()))?;
+        let levels: Map<String, Value> = removal_levels
+            .iter()
+            .map(|(k, v)| (k.to_string(), Value::from(*v)))
+            .collect();
+        let count = visible.len() as u64;
+        let mut public = artifacts.public.clone();
+        let mut private = artifacts.private.clone();
+        for manifest in [&mut public, &mut private] {
+            let obj = manifest
+                .as_object_mut()
+                .ok_or_else(|| HfError::BandH("a source manifest is not an object".into()))?;
+            obj.insert("episode_count".into(), count.into());
+            obj.insert("removal_levels".into(), Value::Object(levels.clone()));
+            obj.insert("visible_bytes".into(), visible_bytes.into());
+            obj.insert("visible_sha256".into(), visible_sha256.clone().into());
+            obj.insert("training_authorized".into(), Value::Bool(false));
+            obj.insert("subset".into(), subset.clone());
+        }
+        {
+            let obj = private.as_object_mut().expect("checked above");
+            obj.insert("hidden_bytes".into(), hidden_bytes.into());
+            obj.insert("hidden_sha256".into(), hidden_sha256.into());
+            if let (Some(block), Some(extra)) = (
+                obj.get_mut("subset").and_then(Value::as_object_mut),
+                subset_private.as_object(),
+            ) {
+                for (k, v) in extra {
+                    block.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        write_json_exclusive(
+            &temporary.join("manifest.public.json"),
+            MODE_VISIBLE,
+            &public,
+        )?;
+        write_json_exclusive(
+            &temporary.join("manifest.private.json"),
+            MODE_HIDDEN,
+            &private,
+        )?;
+        write_json_exclusive(
+            &temporary.join("graph.manifest.json"),
+            MODE_VISIBLE,
+            &artifacts.graph,
+        )?;
+        // the sidecars a split writer leaves beside the streams, cut to the subset
+        let texts = source.join("texts.jsonl");
+        if texts.exists() {
+            let file = std::fs::File::open(&texts)
+                .map_err(|e| HfError::Invalid(format!("{}: {e}", texts.display())))?;
+            let mut out = create_exclusive(&temporary.join("texts.jsonl"), MODE_VISIBLE)
+                .map_err(|e| HfError::Invalid(e.to_string()))?;
+            for line in BufReader::new(file).split(b'\n') {
+                let line = line.map_err(|e| HfError::Invalid(e.to_string()))?;
+                if line.is_empty() {
+                    continue;
+                }
+                let v: Value = serde_json::from_slice(&line)
+                    .map_err(|e| HfError::Invalid(format!("texts.jsonl: {e}")))?;
+                if v.get("node")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| nodes.contains(n))
+                {
+                    out.write_all(&line)
+                        .and_then(|_| out.write_all(b"\n"))
+                        .map_err(|e| HfError::Invalid(e.to_string()))?;
+                }
+            }
+            out.sync_all()
+                .map_err(|e| HfError::Invalid(e.to_string()))?;
+        }
+        if source.join("nodes.txt").exists() {
+            let mut text = nodes.iter().cloned().collect::<Vec<_>>().join("\n");
+            text.push('\n');
+            hf_core::files::write_exclusive(
+                &temporary.join("nodes.txt"),
+                MODE_VISIBLE,
+                text.as_bytes(),
+            )
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+        }
+        Ok((public, private))
+    })();
+    match result {
+        Ok((public, private)) => {
+            fsync_dir(&temporary)?;
+            std::fs::rename(&temporary, destination).map_err(|e| {
+                HfError::Invalid(format!("rename to {}: {e}", destination.display()))
+            })?;
+            fsync_dir(parent)?;
+            Ok(SubsetWritten {
+                public,
+                private,
+                episode_count: visible.len() as u64,
+                nodes,
+            })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temporary);
+            Err(e)
+        }
+    }
+}

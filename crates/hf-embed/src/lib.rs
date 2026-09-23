@@ -428,6 +428,257 @@ fn parse_vectors(path: &Path, dimension: usize) -> Result<(Vec<String>, Vec<f32>
     Ok((nodes, data))
 }
 
+/// What `merge_caches` wrote.
+#[derive(Clone, Debug)]
+pub struct MergeReport {
+    pub manifest: Manifest,
+    pub written: u64,
+    pub duplicates_identical: u64,
+}
+
+#[derive(Deserialize)]
+struct VectorLine64 {
+    node: String,
+    vector: Vec<f64>,
+}
+
+fn vector_fingerprint(vector: &[f64]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for x in vector {
+        h.update(x.to_bits().to_le_bytes());
+    }
+    h.finalize().into()
+}
+
+/// ENG-2: several v5 caches — in practice the teacher's per-destination
+/// `queries/` caches, whose ids are EPISODE ids — merged into ONE cache under
+/// `into` with one manifest, so a single `--query-embeddings-dir` covers
+/// train, screen, screen2 and the vault. (A destination's `discarded/`
+/// sibling has no cache of its own: its vectors are in the destination's
+/// `queries/`, so naming that cache covers the discards.)
+///
+/// Every source must agree with the first on the encoder
+/// (`same_encoder`: `dimension` and `model_digest`), on `text_char_limit` and
+/// on `keyed_by` (so a node cache cannot be folded into a query cache), and
+/// must hold exactly its manifest's `count` of lines, each `dimension` wide.
+/// An id in two sources is kept once when the two vectors are bit-identical as
+/// f64 and REFUSED otherwise (the test-writer's and the teacher's copies of
+/// one episode are different questions). Lines are copied as the sources wrote
+/// them, sources in the order given, file order within each. The manifest
+/// records each source's path, count, manifest (whole, and its canonical
+/// sha256) and `vectors.jsonl` size and sha256. Written under a temporary
+/// name and renamed; an existing `into` is refused; no sidecar is copied.
+pub fn merge_caches(sources: &[PathBuf], into: &Path) -> Result<MergeReport, HfError> {
+    hf_core::refuse_holdout(into)?;
+    if sources.is_empty() {
+        return Err(HfError::Invalid(
+            "merge needs at least one source cache".into(),
+        ));
+    }
+    if into.exists() || into.symlink_metadata().is_ok() {
+        return Err(HfError::Refused(format!(
+            "{} already exists",
+            into.display()
+        )));
+    }
+    let mut named = std::collections::HashSet::new();
+    let mut manifests = Vec::with_capacity(sources.len());
+    for source in sources {
+        hf_core::refuse_holdout(source)?;
+        let canonical = std::fs::canonicalize(source)
+            .map_err(|e| HfError::Invalid(format!("{}: {e}", source.display())))?;
+        if !named.insert(canonical) {
+            return Err(HfError::Refused(format!(
+                "{} is named twice",
+                source.display()
+            )));
+        }
+        manifests.push(read_manifest(source)?);
+    }
+    let first = manifests[0].clone();
+    for (source, m) in sources.iter().zip(&manifests).skip(1) {
+        same_encoder(&first, m)
+            .map_err(|e| HfError::BandH(format!("{}: {e}", source.display())))?;
+        if m.text_char_limit != first.text_char_limit {
+            return Err(HfError::BandH(format!(
+                "{}: text_char_limit {} differs from the first source's {}",
+                source.display(),
+                m.text_char_limit,
+                first.text_char_limit
+            )));
+        }
+        if m.extra.get("keyed_by") != first.extra.get("keyed_by") {
+            return Err(HfError::BandH(format!(
+                "{}: keyed_by {:?} differs from the first source's {:?}",
+                source.display(),
+                m.extra.get("keyed_by"),
+                first.extra.get("keyed_by")
+            )));
+        }
+    }
+    let parent = into
+        .parent()
+        .ok_or_else(|| HfError::Invalid("--into has no parent".into()))?;
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| HfError::Invalid(format!("{}: {e}", parent.display())))?;
+    }
+    let temporary = parent.join(format!(
+        ".tmp-{}-{}",
+        into.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    std::fs::create_dir(&temporary)
+        .map_err(|e| HfError::Invalid(format!("{}: {e}", temporary.display())))?;
+    let result = (|| -> Result<MergeReport, HfError> {
+        let out_path = temporary.join("vectors.jsonl");
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(&out_path)
+                .map_err(|e| HfError::Invalid(format!("{}: {e}", out_path.display())))?,
+        );
+        let mut seen: HashMap<String, ([u8; 32], usize)> = HashMap::new();
+        let mut truncated: HashMap<String, u64> = HashMap::new();
+        let mut records = Vec::with_capacity(sources.len());
+        let mut written = 0u64;
+        let mut duplicates = 0u64;
+        for (i, (source, m)) in sources.iter().zip(&manifests).enumerate() {
+            let path = source.join("vectors.jsonl");
+            let (bytes, sha) = sha256_file(&path)
+                .map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?;
+            let file = std::fs::File::open(&path)
+                .map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?;
+            let mut lines = 0u64;
+            let mut kept = 0u64;
+            let mut dup_here = 0u64;
+            for (n, line) in BufReader::with_capacity(1 << 20, file).lines().enumerate() {
+                let line = line.map_err(|e| HfError::Invalid(e.to_string()))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                lines += 1;
+                let record: VectorLine64 = serde_json::from_str(&line).map_err(|e| {
+                    HfError::Invalid(format!("{} line {}: {e}", path.display(), n + 1))
+                })?;
+                if record.vector.len() != first.dimension as usize {
+                    return Err(HfError::BandH(format!(
+                        "{}: the vector for {} has {} values, the dimension is {}",
+                        path.display(),
+                        record.node,
+                        record.vector.len(),
+                        first.dimension
+                    )));
+                }
+                let print = vector_fingerprint(&record.vector);
+                match seen.get(&record.node) {
+                    Some((earlier, _)) if *earlier == print => {
+                        dup_here += 1;
+                        continue;
+                    }
+                    Some((_, from)) => {
+                        return Err(HfError::BandH(format!(
+                            "{} is in {} and in {} with DIFFERENT vectors; refusing to pick one",
+                            record.node,
+                            sources[*from].display(),
+                            source.display()
+                        )));
+                    }
+                    None => {}
+                }
+                seen.insert(record.node.clone(), (print, i));
+                out.write_all(line.as_bytes())
+                    .and_then(|_| out.write_all(b"\n"))
+                    .map_err(|e| HfError::Invalid(e.to_string()))?;
+                kept += 1;
+            }
+            if lines != m.count {
+                return Err(HfError::BandH(format!(
+                    "{}: vectors.jsonl carries {lines} vectors but the manifest says {}",
+                    source.display(),
+                    m.count
+                )));
+            }
+            for (node, n) in &m.truncated {
+                if let Some(prev) = truncated.insert(node.clone(), *n) {
+                    if prev != *n {
+                        return Err(HfError::BandH(format!(
+                            "{node} is truncated at {prev} and at {n} characters in two sources"
+                        )));
+                    }
+                }
+            }
+            let manifest_value =
+                serde_json::to_value(m).map_err(|e| HfError::Invalid(e.to_string()))?;
+            records.push(serde_json::json!({
+                "path": source.to_string_lossy(),
+                "count": m.count,
+                "written": kept,
+                "duplicates_identical": dup_here,
+                "vectors_bytes": bytes,
+                "vectors_sha256": sha,
+                "manifest_sha256": hf_core::canonical_sha256(&manifest_value)?,
+                "manifest": manifest_value,
+            }));
+            written += kept;
+            duplicates += dup_here;
+        }
+        out.flush().map_err(|e| HfError::Invalid(e.to_string()))?;
+        out.get_ref()
+            .sync_all()
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+        let mut extra = serde_json::Map::new();
+        if let Some(k) = first.extra.get("keyed_by") {
+            extra.insert("keyed_by".into(), k.clone());
+        }
+        extra.insert("merged_from".into(), Value::Array(records));
+        extra.insert("duplicates_identical".into(), duplicates.into());
+        extra.insert(
+            "merge_note".into(),
+            Value::from(
+                "hf-embed merge: the sources' lines copied in the order given; an id in \
+                 two sources is kept once when its vectors are bit-identical and refused \
+                 otherwise; model and base_url are the first source's, every source's \
+                 own manifest is under merged_from",
+            ),
+        );
+        let manifest = Manifest {
+            record_kind: MANIFEST_KIND.into(),
+            model: first.model.clone(),
+            model_digest: first.model_digest.clone(),
+            base_url: first.base_url.clone(),
+            dimension: first.dimension,
+            count: written,
+            text_char_limit: first.text_char_limit,
+            text_sha256: None,
+            truncated,
+            training_authorized: false,
+            extra,
+        };
+        write_manifest(&temporary, &manifest)?;
+        Ok(MergeReport {
+            manifest,
+            written,
+            duplicates_identical: duplicates,
+        })
+    })();
+    match result {
+        Ok(report) => {
+            std::fs::rename(&temporary, into)
+                .map_err(|e| HfError::Invalid(format!("rename to {}: {e}", into.display())))?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temporary);
+            Err(e)
+        }
+    }
+}
+
 /// Raised when the server refuses an input for its context length.
 #[derive(Debug)]
 pub struct ContextOverflow;
