@@ -1401,6 +1401,15 @@ fn write_stage1_splits(source: &std::path::Path, destination: &std::path::Path) 
 /// A config whose model is `relational-v6` at the fixture world's sizes —
 /// `raw-v5`, the default, is refused under `episode_query`.
 fn relational_config(root: &PathBuf, data: Option<serde_json::Value>) -> PathBuf {
+    relational_config_with(root, data, "relational-v6")
+}
+
+/// `relational_config` with another relational feature set.
+fn relational_config_with(
+    root: &PathBuf,
+    data: Option<serde_json::Value>,
+    feature_set: &str,
+) -> PathBuf {
     std::fs::create_dir_all(root).unwrap();
     let mut config = serde_json::json!({
         "record_kind": "real_walk_stage0_config",
@@ -1409,7 +1418,7 @@ fn relational_config(root: &PathBuf, data: Option<serde_json::Value>) -> PathBuf
         "model": {
             "hidden_dimension": 32, "self_attention_heads": 2, "feedforward_multiplier": 2,
             "score_hidden_dimension": 16, "coverage_hidden_dimension": 8,
-            "traversal_blocks": 1, "dropout": 0.0, "feature_set": "relational-v6"
+            "traversal_blocks": 1, "dropout": 0.0, "feature_set": feature_set
         },
         "sampler": {"subgraph_size": 64, "target_distance": 3, "removal_level": 2, "cost_epsilon": 0.5},
         "training": {"learning_rate": 0.001, "weight_decay": 0.0, "update_count": 1, "microbatch_size": 2}
@@ -1583,6 +1592,97 @@ fn a_reevaluation_reads_the_query_sidecar_and_the_coverage_floor() {
     let stderr = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(stderr.contains("no query vector"), "{stderr}");
     assert!(!short.join("reeval.json").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **Smoke: `relational-v6-prev` end to end at stage 1.** A training run on
+/// the golden fixture split rewritten as stage 1 (no `target_node`, a
+/// question), with `data.query_source = episode_query` and a query sidecar
+/// covering every episode, trains, evaluates and writes its artifacts under the
+/// previous-node feature set: exit 0, `probe.json` naming the source, the
+/// sidecar and the feature set, and screen rows that carry the stage-1 key.
+/// The leak test in `hf-walk/tests/stage1.rs` is what says the set's rows do
+/// not see the target; this says the set runs where that test says it may.
+#[test]
+fn relational_v6_prev_trains_end_to_end_on_the_stage1_fixture_under_episode_query() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let Some(pin) = foundation_head() else {
+        eprintln!("skipped: the foundation checkout has no git head");
+        return;
+    };
+    let goldens =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../hf-io/tests/goldens/fixture-split");
+    let root = tmp("stage1-prev-smoke");
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.join("cache");
+    write_node_cache(&cache);
+    let splits = root.join("splits");
+    let ids = write_stage1_splits(&goldens, &splits);
+    assert_eq!(ids.len(), 18, "12 train + 6 screen golden episodes");
+    let queries = root.join("queries");
+    write_query_cache(&queries, &ids);
+    let stage1 = relational_config_with(
+        &root.join("stage1"),
+        Some(serde_json::json!({"query_source": "episode_query"})),
+        "relational-v6-prev",
+    );
+    let out = root.join("run");
+    let o = run_env(
+        &[
+            "--config",
+            stage1.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--model-seed",
+            "5",
+            "--family",
+            "fixture",
+            "--splits-dir",
+            splits.to_str().unwrap(),
+            "--embeddings-dir",
+            cache.to_str().unwrap(),
+            "--query-embeddings-dir",
+            queries.to_str().unwrap(),
+            "--expect-embedding-coverage",
+            "1.0",
+            "--screen-episodes",
+            "6",
+            "--updates",
+            "1",
+            "--preregistration-commit",
+            &pin,
+            "--foundation-root",
+            foundation().to_str().unwrap(),
+            "--allow-stale-engine",
+        ],
+        CPU_ONLY,
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let probe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("probe.json")).unwrap()).unwrap();
+    assert_eq!(probe["query_source"], "episode_query");
+    assert_eq!(
+        probe["query_embeddings"],
+        serde_json::Value::from(queries.to_string_lossy().to_string())
+    );
+    assert_eq!(probe["embedding_coverage"]["share"], 1.0);
+    assert_eq!(
+        probe["config"]["model"]["feature_set"], "relational-v6-prev",
+        "the run trained the previous-node set"
+    );
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(out.join("evaluation_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(!rows.is_empty(), "the screen was evaluated");
+    for r in &rows {
+        assert!(r.get("greedy_overshoot").is_none());
+        assert!(r["question_greedy_overshoot"].is_i64(), "{r}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

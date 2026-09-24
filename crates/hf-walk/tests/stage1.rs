@@ -22,7 +22,8 @@ use hf_embed::EmbeddingMatrix;
 use hf_io::RealEpisode;
 use hf_walk::{
     walk_batch, DecisionBatch, EpisodeIndex, FeatureSet, QuerySource, QueryVectors, RawV5,
-    RelationalV6, Scored, Scorer, StopRule, VisibleIndex, WalkOptions, STOP_DIM,
+    RelationalV6, RelationalV6K, RelationalV6Prev, Scored, Scorer, StopRule, VisibleIndex,
+    WalkOptions, STOP_DIM,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -96,7 +97,18 @@ fn visible(stage1: bool, target: &str) -> Value {
     payload
 }
 
-fn hidden(target: &str) -> Value {
+/// The hidden payload of an episode whose one target is the last node of
+/// `path`, a surviving path from the start: distances and path sets agree
+/// with it, so a swap to a target elsewhere in the fixture is a consistent
+/// record and not a relabelled one.
+fn hidden_on(path: &[&str]) -> Value {
+    let target = *path.last().expect("a path to the target");
+    let d = path.len() - 1;
+    let distance: serde_json::Map<String, Value> = path
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ((*n).to_string(), json!(d - i)))
+        .collect();
     json!({
         "schema_version": hf_io::SCHEMA_VERSION_V5,
         "record_kind": hf_io::HIDDEN_KIND,
@@ -106,17 +118,32 @@ fn hidden(target: &str) -> Value {
         "index": 0,
         "start_node": "s",
         "target_set": [target],
-        "target_distance": 3,
-        "cost_bound": 3,
-        "path_set": [["s", "a", "b", target]],
-        "surviving_paths": [["s", "a", "b", target]],
+        "target_distance": d,
+        "cost_bound": d,
+        "path_set": [path],
+        "surviving_paths": [path],
         "removal_set": [],
         "removed_count": 0,
         "unremovable_count": 0,
-        "nodes_on_surviving_path": ["s", "a", "b", target],
-        "distance_to_target": {"s": 3, "a": 2, "b": 1, target: 0},
+        "nodes_on_surviving_path": path,
+        "distance_to_target": distance,
         "sampler": {"subgraph_size": 8},
     })
+}
+
+/// The path to each node the fixture's episodes name as the hidden target
+/// (`u`, the unreachable target, keeps the payload it has always had: no
+/// path in the graph reaches it).
+fn path_to(target: &str) -> Vec<&str> {
+    match target {
+        "t1" | "t2" | "u" => vec!["s", "a", "b", target],
+        "b" => vec!["s", "a", "b"],
+        other => panic!("no fixture path to {other}"),
+    }
+}
+
+fn hidden(target: &str) -> Value {
+    hidden_on(&path_to(target))
 }
 
 /// One episode of the fixture. `stage1` writes the stage-1 payload (a question,
@@ -167,20 +194,51 @@ impl Scorer for HashScorer {
     }
 }
 
-/// Everything one walk would hand a model or write to `candidate_dump.jsonl.gz`,
-/// as one string: per decision the candidate rows, the context tokens, the pair
-/// channel, the query token, the cosine column, the stop row, and the dumped
-/// record (names, scores, cosines, chosen, parents, depths). Nothing here is
-/// hidden data — which is the point: swapping the hidden target may not move a
-/// byte of it.
-fn walk_fingerprint(index: &EpisodeIndex) -> (usize, bool, String) {
-    let features = RelationalV6;
+/// Every feature set a record under `episode_query` may meet: all but
+/// `raw-v5`, which `raw_v5_is_refused_under_episode_query` pins as refused.
+const EPISODE_QUERY_SETS: [&dyn FeatureSet; 3] = [&RelationalV6, &RelationalV6K, &RelationalV6Prev];
+
+/// One decision of one walk: everything the walk would hand a model or write
+/// to `candidate_dump.jsonl.gz`, channel by channel — the candidate rows, the
+/// context tokens, the pair channel, the query token, the cosine column, the
+/// stop row, and the dumped record (names, scores, cosines, chosen, parents,
+/// depths). Nothing here is hidden data — which is the point: swapping the
+/// hidden target may not move a byte of it.
+type Row = Vec<(&'static str, String)>;
+
+struct Walked {
+    rows: Vec<Row>,
+    items: Vec<hf_walk::DecisionItem>,
+    registered_at: Option<usize>,
+    expanded: Vec<String>,
+}
+
+impl Walked {
+    fn fingerprint(&self) -> String {
+        serde_json::to_string(&self.rows).expect("a fingerprint")
+    }
+}
+
+/// Every float a decision carries is finite: serde writes a NaN as `null`, so
+/// two NaNs would otherwise compare equal and hide a broken channel.
+fn assert_finite(what: &str, k: usize, values: &[f32]) {
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "decision {k}: a non-finite value in {what}: {values:?}"
+    );
+}
+
+fn channel(v: impl serde::Serialize) -> String {
+    serde_json::to_string(&v).expect("a channel")
+}
+
+fn walk(index: &EpisodeIndex, features: &dyn FeatureSet) -> Walked {
     let mut scorer = HashScorer {
         cdim: features.candidate_dim(EDIM),
     };
     let result = walk_batch(
         &[index],
-        &features,
+        features,
         &mut scorer,
         WalkOptions {
             stop_rule: StopRule::Exhaust,
@@ -192,28 +250,60 @@ fn walk_fingerprint(index: &EpisodeIndex) -> (usize, bool, String) {
     .expect("the walk runs")
     .remove(0);
     let records = result.candidates.as_ref().expect("records were asked for");
-    let mut lines: Vec<Value> = Vec::new();
+    let mut rows = Vec::new();
+    let mut items = Vec::new();
     for (k, d) in result.decisions.iter().enumerate() {
         let item = d.item.as_ref().expect("the item was kept");
-        lines.push(json!({
-            "decision": k,
-            "cand": item.cand,
-            "ctx": item.ctx,
-            "pair": item.pair,
-            "query": item.query,
-            "frontier_len": item.frontier_len,
-            "context_len": item.context_len,
-            "cosines": d.cosines,
-            "stop_features": d.stop_features,
-            "chosen": d.chosen,
-            "dump": serde_json::to_value(&records[k]).expect("a record"),
-        }));
+        for (what, values) in [
+            ("cand", &item.cand[..]),
+            ("ctx", &item.ctx[..]),
+            ("pair", &item.pair[..]),
+            ("query", &item.query[..]),
+            ("cosines", &d.cosines[..]),
+            ("stop_features", &d.stop_features[..]),
+            ("scores", &records[k].scores[..]),
+        ] {
+            assert_finite(what, k, values);
+        }
+        rows.push(vec![
+            ("cand", channel(&item.cand)),
+            ("ctx", channel(&item.ctx)),
+            ("pair", channel(&item.pair)),
+            ("query", channel(&item.query)),
+            ("frontier_len", channel(item.frontier_len)),
+            ("context_len", channel(item.context_len)),
+            ("cosines", channel(&d.cosines)),
+            ("stop_features", channel(d.stop_features)),
+            ("chosen", channel(d.chosen)),
+            ("dump", channel(&records[k])),
+        ]);
+        items.push(item.clone());
     }
-    (
-        result.decisions.len(),
-        result.registered(),
-        serde_json::to_string(&lines).expect("a fingerprint"),
-    )
+    Walked {
+        rows,
+        items,
+        registered_at: result.registered_at,
+        expanded: result
+            .expanded
+            .iter()
+            .map(|n| index.names[*n as usize].clone())
+            .collect(),
+    }
+}
+
+/// The first (decision, channel) at which two walks differ over their common
+/// decision prefix, or `None` when every row of that prefix is byte-identical.
+fn first_difference(a: &Walked, b: &Walked) -> Option<(usize, &'static str)> {
+    a.rows
+        .iter()
+        .zip(&b.rows)
+        .enumerate()
+        .find_map(|(k, (x, y))| {
+            x.iter()
+                .zip(y)
+                .find(|((_, u), (_, v))| u != v)
+                .map(|((name, _), _)| (k, *name))
+        })
 }
 
 fn stage1_index(target: &str, nodes: &EmbeddingMatrix, queries: &EmbeddingMatrix) -> EpisodeIndex {
@@ -226,9 +316,35 @@ fn stage1_index(target: &str, nodes: &EmbeddingMatrix, queries: &EmbeddingMatrix
     .expect("a stage-1 record builds under episode_query")
 }
 
-/// **The leak test.** Two episodes that differ only in the hidden target, with
-/// the question held fixed: every feature row, every score, the cosine column,
-/// every stop row and every dumped candidate record are byte-identical.
+/// The two previous-node columns of `relational-v6-prev` — `was_abandoned`
+/// and `recency` — as they appear in the context tokens and the pair channel
+/// of every decision: `(ctx abandoned, ctx recency, pair abandoned, pair recency)`.
+fn previous_node_columns(items: &[hf_walk::DecisionItem]) -> [Vec<f32>; 4] {
+    let (c, p) = (
+        RelationalV6Prev.context_dim(EDIM),
+        RelationalV6Prev.pair_dim(),
+    );
+    let mut out: [Vec<f32>; 4] = Default::default();
+    for item in items {
+        for token in item.ctx.chunks(c) {
+            out[0].push(token[c - 2]);
+            out[1].push(token[c - 1]);
+        }
+        for entry in item.pair.chunks(p) {
+            out[2].push(entry[p - 2]);
+            out[3].push(entry[p - 1]);
+        }
+    }
+    out
+}
+
+/// **The leak test**, for every feature set `episode_query` admits. Two
+/// episodes that differ only in the hidden target, with the question held
+/// fixed: every feature row (candidate, context, pair — `relational-v6-prev`'s
+/// `was_abandoned` and `recency` columns included), every score, the cosine
+/// column, every stop row and every dumped candidate record are byte-identical.
+/// The two targets share a parent, so they are first enumerated at the same
+/// expansion and the whole walk is the common prefix.
 #[test]
 fn the_hidden_target_moves_no_feature_no_score_and_no_dump_row() {
     let nodes = node_cache();
@@ -242,29 +358,135 @@ fn the_hidden_target_moves_no_feature_no_score_and_no_dump_row() {
     );
     assert_eq!(one.registration_targets(), one.hidden_targets);
     assert!(one.targets_shown.is_empty() && other.targets_shown.is_empty());
-    let (decisions, registered, a) = walk_fingerprint(&one);
-    let (other_decisions, other_registered, b) = walk_fingerprint(&other);
-    // not vacuous: both walks ran, both completed, and there was something to
-    // compare at every decision
-    assert!(
-        decisions >= 2,
-        "only {decisions} decisions were compared — the fixture stops too early"
-    );
-    assert!(registered && other_registered, "both walks register");
-    assert_eq!(
-        decisions, other_decisions,
-        "the walk itself diverged when the hidden target was swapped"
-    );
-    assert_eq!(
-        a, b,
-        "a feature, a score or a dumped row moved when the hidden target was swapped"
-    );
+    for features in EPISODE_QUERY_SETS {
+        let name = features.name();
+        let a = walk(&one, features);
+        let b = walk(&other, features);
+        // not vacuous: both walks ran, both completed, and there was something
+        // to compare at every decision
+        assert!(
+            a.rows.len() >= 2,
+            "{name}: only {} decisions were compared — the fixture stops too early",
+            a.rows.len()
+        );
+        assert!(
+            a.registered_at.is_some() && b.registered_at.is_some(),
+            "{name}: both walks register"
+        );
+        assert_eq!(
+            a.rows.len(),
+            b.rows.len(),
+            "{name}: the walk itself diverged when the hidden target was swapped"
+        );
+        assert_eq!(
+            first_difference(&a, &b),
+            None,
+            "{name}: (decision, channel) moved when the hidden target was swapped"
+        );
+        assert_eq!(a.fingerprint(), b.fingerprint(), "{name}");
+    }
+}
+
+/// The comparison above covers `relational-v6-prev`'s own channels only if
+/// they carry something: over the compared walk, some expanded node was
+/// abandoned (in the context token AND in the pair channel), and recency takes
+/// more than one value. A walk that went straight down to the target would
+/// leave `was_abandoned` zero everywhere and the leak test silent about it.
+#[test]
+fn the_previous_node_channels_the_leak_test_compares_are_not_constant() {
+    let nodes = node_cache();
+    let queries = query_cache();
+    let walked = walk(&stage1_index("t1", &nodes, &queries), &RelationalV6Prev);
+    let [ctx_abandoned, ctx_recency, pair_abandoned, pair_recency] =
+        previous_node_columns(&walked.items);
+    let distinct = |v: &[f32]| {
+        let mut bits: Vec<u32> = v.iter().map(|x| x.to_bits()).collect();
+        bits.sort_unstable();
+        bits.dedup();
+        bits.len()
+    };
+    for (what, column) in [
+        ("context was_abandoned", &ctx_abandoned),
+        ("pair was_abandoned", &pair_abandoned),
+    ] {
+        assert!(
+            column.contains(&1.0) && column.contains(&0.0),
+            "{what} is constant over the walk {:?}: {column:?}",
+            walked.expanded
+        );
+    }
+    for (what, column) in [
+        ("context recency", &ctx_recency),
+        ("pair recency", &pair_recency),
+    ] {
+        assert!(
+            distinct(column) >= 2,
+            "{what} is constant over the walk {:?}",
+            walked.expanded
+        );
+    }
+}
+
+/// Q2's statement in full: with the question fixed and the hidden target moved
+/// to a node first enumerated at a DIFFERENT expansion, the two walks are
+/// byte-identical over their common decision prefix, and the first decision at
+/// which they differ is the one the shorter walk never makes — its target was
+/// enumerated by the expansion before it, and the walk stopped there.
+#[test]
+fn a_target_moved_elsewhere_changes_nothing_before_it_is_first_enumerated() {
+    let nodes = node_cache();
+    let queries = query_cache();
+    let near = stage1_index("b", &nodes, &queries);
+    let far = stage1_index("t1", &nodes, &queries);
+    for features in EPISODE_QUERY_SETS {
+        let name = features.name();
+        let a = walk(&near, features);
+        let b = walk(&far, features);
+        let (short, long) = if a.rows.len() <= b.rows.len() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        // not vacuous: the targets come into view at different expansions,
+        // and the prefix they share is more than the first decision
+        assert_ne!(
+            a.rows.len(),
+            b.rows.len(),
+            "{name}: both targets were enumerated at the same expansion ({:?} / {:?})",
+            a.expanded,
+            b.expanded
+        );
+        assert!(
+            short.rows.len() >= 2,
+            "{name}: a common prefix of {} decisions",
+            short.rows.len()
+        );
+        assert_eq!(
+            first_difference(short, long),
+            None,
+            "{name}: (decision, channel) moved before either target was enumerated"
+        );
+        // the divergence is exactly where the shorter walk's target came into
+        // view: its last expansion enumerated it, and it made no decision after
+        let registered_at = short.registered_at.expect("the shorter walk registered");
+        assert_eq!(short.expanded.len(), registered_at, "{name}");
+        assert_eq!(
+            short.rows.len() + 1,
+            registered_at,
+            "{name}: the walk's decisions are its expansions after the start"
+        );
+        assert!(
+            long.registered_at.expect("the longer walk registered") > registered_at,
+            "{name}"
+        );
+    }
 }
 
 /// The same comparison, on an index whose query was taken from the HIDDEN
 /// target's own embedding — the stage-0 query kept although the sidecar was
 /// read. Nothing in the engine builds an index this way; it is built here by
-/// hand so that the comparison above is known to be able to fail.
+/// hand so that the comparison above is known to be able to fail, for every
+/// set it is run over.
 #[test]
 fn a_query_taken_from_the_hidden_target_fails_the_same_comparison() {
     let nodes = node_cache();
@@ -277,12 +499,16 @@ fn a_query_taken_from_the_hidden_target_fails_the_same_comparison() {
         index.queries = q;
         index
     };
-    let (_, _, a) = walk_fingerprint(&leak("t1"));
-    let (_, _, b) = walk_fingerprint(&leak("t2"));
-    assert_ne!(
-        a, b,
-        "the comparison cannot fail: a query read off the hidden target left every row alike"
-    );
+    let (one, other) = (leak("t1"), leak("t2"));
+    for features in EPISODE_QUERY_SETS {
+        let a = walk(&one, features);
+        let b = walk(&other, features);
+        assert!(
+            first_difference(&a, &b).is_some() || a.rows.len() != b.rows.len(),
+            "{}: the comparison cannot fail: a query read off the hidden target left every row alike",
+            features.name()
+        );
+    }
 }
 
 /// And under the default query source, where the record SHOWS the target, the
@@ -297,8 +523,8 @@ fn the_same_swap_at_stage_0_moves_the_features() {
     let one = index("t1");
     assert_eq!(one.query_source, QuerySource::TargetEmbedding);
     assert_eq!(one.registration_targets(), one.targets_shown);
-    let (_, _, a) = walk_fingerprint(&one);
-    let (_, _, b) = walk_fingerprint(&index("t2"));
+    let a = walk(&one, &RelationalV6).fingerprint();
+    let b = walk(&index("t2"), &RelationalV6).fingerprint();
     assert_ne!(a, b, "at stage 0 the target IS the query");
 }
 
