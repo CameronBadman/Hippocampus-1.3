@@ -7,8 +7,13 @@
 //!
 //! A binary sidecar (`vectors.f32`, row-major float32, plus
 //! `vectors.index.json`) is built on first use and memory-mapped afterwards;
-//! it is bound to the size and SHA-256 of the `vectors.jsonl` it came from and
-//! refused when that file has moved. It is regenerable and never evidence.
+//! it is bound to the size and SHA-256 of the `vectors.jsonl` it came from.
+//! It is regenerable and never evidence: a sidecar that no longer matches is
+//! rebuilt from `vectors.jsonl` — but only when that file itself validates
+//! against the manifest; otherwise the load is refused and the stale sidecar
+//! left as it is. Every write goes through temporary files, fsync and rename,
+//! the index last, so an index is never visible beside data it does not
+//! describe.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -156,30 +161,105 @@ impl Data {
     }
 }
 
+/// What `from_sidecar` found.
+enum Sidecar {
+    Hit(Box<EmbeddingMatrix>),
+    Absent,
+    /// present but not a description of this `vectors.jsonl`
+    Stale,
+}
+
+/// Write `bytes` to a temporary file beside `path` (named for this process and
+/// instant), fsync it and rename it over `path`; the temporary is removed on
+/// any failure.
+fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), HfError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{nanos}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    result.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        HfError::Invalid(format!("{}: {e}", path.display()))
+    })
+}
+
+fn sync_directory(directory: &Path) -> Result<(), HfError> {
+    std::fs::File::open(directory)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| HfError::Invalid(format!("{}: {e}", directory.display())))
+}
+
+/// Parse `vectors.jsonl` in one pass that also hashes the bytes it parses (so
+/// the sidecar is bound to exactly what was read) and check its count against
+/// the manifest; the errors are those of a load with no sidecar.
+fn parse_validated(
+    directory: &Path,
+    manifest: &Manifest,
+) -> Result<(Vec<String>, Vec<f32>, u64, String), HfError> {
+    let source = directory.join("vectors.jsonl");
+    let (nodes, data, bytes, sha256) = parse_vectors(&source, manifest.dimension as usize)?;
+    if nodes.len() as u64 != manifest.count {
+        return Err(HfError::BandH(format!(
+            "vectors.jsonl carries {} vectors but the manifest says {}",
+            nodes.len(),
+            manifest.count
+        )));
+    }
+    Ok((nodes, data, bytes, sha256))
+}
+
+/// A reader that hashes and counts every byte it hands on.
+struct HashingReader<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+    bytes: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
 impl EmbeddingMatrix {
     /// `load_embedding_matrix`: from the sidecar when it matches `vectors.jsonl`,
     /// else by parsing `vectors.jsonl` (and writing the sidecar when the
-    /// directory is writable). Row order is file order; dimension and count
-    /// are checked against the manifest as Python checks them.
+    /// directory is writable). A stale sidecar is rebuilt, atomically, once
+    /// `vectors.jsonl` has parsed and matched the manifest; when it does not,
+    /// the load fails exactly as it would with no sidecar, which is left
+    /// untouched. Row order is file order; dimension and count are checked
+    /// against the manifest as Python checks them.
     pub fn load(directory: &Path) -> Result<Self, HfError> {
         let manifest = read_manifest(directory)?;
         let source = directory.join("vectors.jsonl");
         let (source_bytes, source_sha256) = sha256_file(&source)
             .map_err(|e| HfError::Invalid(format!("{}: {e}", source.display())))?;
-        if let Some(loaded) =
-            Self::from_sidecar(directory, &manifest, source_bytes, &source_sha256)?
-        {
-            return Ok(loaded);
-        }
-        let (nodes, data) = parse_vectors(&source, manifest.dimension as usize)?;
-        if nodes.len() as u64 != manifest.count {
-            return Err(HfError::BandH(format!(
-                "vectors.jsonl carries {} vectors but the manifest says {}",
-                nodes.len(),
-                manifest.count
-            )));
-        }
-        let _ = Self::write_sidecar(
+        let stale = match Self::from_sidecar(directory, &manifest, source_bytes, &source_sha256)? {
+            Sidecar::Hit(loaded) => return Ok(*loaded),
+            Sidecar::Absent => false,
+            Sidecar::Stale => true,
+        };
+        let (nodes, data, source_bytes, source_sha256) = parse_validated(directory, &manifest)?;
+        let written = Self::write_sidecar(
             directory,
             &manifest,
             &nodes,
@@ -187,11 +267,59 @@ impl EmbeddingMatrix {
             source_bytes,
             &source_sha256,
         );
+        if stale {
+            match &written {
+                Ok(()) => eprintln!(
+                    "hf-embed: rebuilt the stale sidecar in {}",
+                    directory.display()
+                ),
+                Err(e) => eprintln!(
+                    "hf-embed: the stale sidecar in {} could not be rebuilt ({e}); vectors.jsonl was read instead",
+                    directory.display()
+                ),
+            }
+        }
         Ok(Self::build(
             nodes,
             manifest.dimension as usize,
             Data::Owned(data),
         ))
+    }
+
+    /// Bring the sidecar in line with `vectors.jsonl` without building the
+    /// matrix: nothing is written when it already matches; otherwise
+    /// `vectors.jsonl` is parsed, validated against the manifest and the
+    /// sidecar written atomically. `hf-embed` calls this after an append run.
+    /// Returns whether the sidecar was (re)written.
+    pub fn refresh_sidecar(directory: &Path) -> Result<bool, HfError> {
+        let manifest = read_manifest(directory)?;
+        let source = directory.join("vectors.jsonl");
+        let (source_bytes, source_sha256) = sha256_file(&source)
+            .map_err(|e| HfError::Invalid(format!("{}: {e}", source.display())))?;
+        if Self::matching_index(directory, &manifest, source_bytes, &source_sha256)?.is_some() {
+            return Ok(false);
+        }
+        let (nodes, data, source_bytes, source_sha256) = parse_validated(directory, &manifest)?;
+        Self::write_sidecar(
+            directory,
+            &manifest,
+            &nodes,
+            &data,
+            source_bytes,
+            &source_sha256,
+        )?;
+        Ok(true)
+    }
+
+    /// Withdraw the sidecar's index (the data file is inert without it), so
+    /// nothing reads the sidecar while `vectors.jsonl` is being appended to.
+    pub fn invalidate_sidecar(directory: &Path) -> Result<(), HfError> {
+        let (_, index_path) = Self::sidecar_paths(directory);
+        match std::fs::remove_file(&index_path) {
+            Ok(()) => sync_directory(directory),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(HfError::Invalid(format!("{}: {e}", index_path.display()))),
+        }
     }
 
     /// A matrix from rows already in memory (the fixture world's embeddings).
@@ -234,47 +362,70 @@ impl EmbeddingMatrix {
         )
     }
 
-    fn from_sidecar(
+    /// The sidecar's index when it describes this `vectors.jsonl` and
+    /// manifest and its data file has the size the index implies; `None` when
+    /// it is absent or stale (unreadable, torn, another source, another shape).
+    fn matching_index(
         directory: &Path,
         manifest: &Manifest,
         source_bytes: u64,
         source_sha256: &str,
-    ) -> Result<Option<Self>, HfError> {
+    ) -> Result<Option<SidecarIndex>, HfError> {
         let (data_path, index_path) = Self::sidecar_paths(directory);
-        if !data_path.exists() || !index_path.exists() {
+        let Ok(text) = std::fs::read_to_string(&index_path) else {
             return Ok(None);
-        }
-        let index: SidecarIndex = serde_json::from_str(
-            &std::fs::read_to_string(&index_path).map_err(|e| HfError::Invalid(e.to_string()))?,
-        )
-        .map_err(|e| HfError::Invalid(format!("{}: {e}", index_path.display())))?;
+        };
+        let Ok(index) = serde_json::from_str::<SidecarIndex>(&text) else {
+            return Ok(None);
+        };
         if index.record_kind != SIDECAR_KIND
             || index.source_bytes != source_bytes
             || index.source_sha256 != source_sha256
             || index.dimension != manifest.dimension
             || index.count != manifest.count
+            || index.nodes.len() as u64 != index.count
         {
-            return Err(HfError::Refused(format!(
-                "{} does not match vectors.jsonl (rebuild it by deleting the sidecar)",
-                index_path.display()
-            )));
+            return Ok(None);
         }
+        match std::fs::metadata(&data_path) {
+            Ok(m) if m.len() == index.count * index.dimension as u64 * 4 => Ok(Some(index)),
+            _ => Ok(None),
+        }
+    }
+
+    fn from_sidecar(
+        directory: &Path,
+        manifest: &Manifest,
+        source_bytes: u64,
+        source_sha256: &str,
+    ) -> Result<Sidecar, HfError> {
+        let (data_path, index_path) = Self::sidecar_paths(directory);
+        if !data_path.exists() && !index_path.exists() {
+            return Ok(Sidecar::Absent);
+        }
+        let Some(index) = Self::matching_index(directory, manifest, source_bytes, source_sha256)?
+        else {
+            return Ok(Sidecar::Stale);
+        };
         let file = std::fs::File::open(&data_path).map_err(|e| HfError::Invalid(e.to_string()))?;
         let map =
             unsafe { memmap2::Mmap::map(&file) }.map_err(|e| HfError::Invalid(e.to_string()))?;
         if map.len() != index.count as usize * index.dimension as usize * 4 {
-            return Err(HfError::Refused(format!(
-                "{} has the wrong size",
-                data_path.display()
-            )));
+            // replaced between the check and the open; the jsonl decides
+            return Ok(Sidecar::Stale);
         }
-        Ok(Some(Self::build(
+        Ok(Sidecar::Hit(Box::new(Self::build(
             index.nodes,
             index.dimension as usize,
             Data::Mapped(map),
-        )))
+        ))))
     }
 
+    /// Write the sidecar atomically: the old index is withdrawn first, then the
+    /// data and the new index each go through a uniquely named temporary file,
+    /// fsync and rename, the index last, and the directory is synced. At no
+    /// instant is an index visible beside data it does not describe, and
+    /// concurrent rebuilders never share a temporary file.
     fn write_sidecar(
         directory: &Path,
         manifest: &Manifest,
@@ -284,17 +435,6 @@ impl EmbeddingMatrix {
         source_sha256: &str,
     ) -> Result<(), HfError> {
         let (data_path, index_path) = Self::sidecar_paths(directory);
-        let tmp = data_path.with_extension("f32.tmp");
-        {
-            let mut file =
-                std::fs::File::create(&tmp).map_err(|e| HfError::Invalid(e.to_string()))?;
-            let bytes =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-            file.write_all(bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|e| HfError::Invalid(e.to_string()))?;
-        }
-        std::fs::rename(&tmp, &data_path).map_err(|e| HfError::Invalid(e.to_string()))?;
         let index = SidecarIndex {
             record_kind: SIDECAR_KIND.into(),
             dimension: manifest.dimension,
@@ -304,11 +444,14 @@ impl EmbeddingMatrix {
             nodes: nodes.to_vec(),
             training_authorized: false,
         };
-        std::fs::write(
-            &index_path,
-            serde_json::to_string(&index).map_err(|e| HfError::Invalid(e.to_string()))?,
-        )
-        .map_err(|e| HfError::Invalid(e.to_string()))
+        let index_text =
+            serde_json::to_string(&index).map_err(|e| HfError::Invalid(e.to_string()))?;
+        Self::invalidate_sidecar(directory)?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        replace_atomically(&data_path, bytes)?;
+        replace_atomically(&index_path, index_text.as_bytes())?;
+        sync_directory(directory)
     }
 
     pub fn len(&self) -> usize {
@@ -403,12 +546,24 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
-fn parse_vectors(path: &Path, dimension: usize) -> Result<(Vec<String>, Vec<f32>), HfError> {
+fn parse_vectors(
+    path: &Path,
+    dimension: usize,
+) -> Result<(Vec<String>, Vec<f32>, u64, String), HfError> {
+    use sha2::Digest;
     let file = std::fs::File::open(path)
         .map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?;
+    let mut reader = BufReader::with_capacity(
+        1 << 20,
+        HashingReader {
+            inner: file,
+            hasher: sha2::Sha256::new(),
+            bytes: 0,
+        },
+    );
     let mut nodes = Vec::new();
     let mut data = Vec::new();
-    for (i, line) in BufReader::with_capacity(1 << 20, file).lines().enumerate() {
+    for (i, line) in (&mut reader).lines().enumerate() {
         let line = line.map_err(|e| HfError::Invalid(e.to_string()))?;
         if line.trim().is_empty() {
             continue;
@@ -425,7 +580,9 @@ fn parse_vectors(path: &Path, dimension: usize) -> Result<(Vec<String>, Vec<f32>
         nodes.push(record.node);
         data.extend_from_slice(&record.vector);
     }
-    Ok((nodes, data))
+    let hashing = reader.into_inner();
+    let sha256 = format!("sha256:{}", hex::encode(hashing.hasher.finalize()));
+    Ok((nodes, data, hashing.bytes, sha256))
 }
 
 /// What `merge_caches` wrote.

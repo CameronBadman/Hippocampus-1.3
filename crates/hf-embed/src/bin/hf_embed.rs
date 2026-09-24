@@ -2,7 +2,8 @@
 //! the v5 cache, with `real_walk_embed.py`'s flags and guards. It never starts
 //! the server. The manifest is written before the first vector, so a
 //! half-run never lacks provenance; an existing cache is resumed only when its
-//! served digest and character limit match.
+//! served digest and character limit match. The binary sidecar is withdrawn
+//! before the first append and rebuilt, atomically, once the manifest is final.
 //!
 //! `hf-embed merge --into <dst> <src>...`: several caches (the teacher's
 //! per-destination `queries/`) merged into one — see `hf_embed::merge_caches`.
@@ -14,8 +15,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use hf_core::{refuse_holdout, HfError};
 use hf_embed::{
-    append_vector, nodes_present, read_manifest, truncate_chars, write_manifest, Manifest,
-    OllamaEmbedClient,
+    append_vector, nodes_present, read_manifest, truncate_chars, write_manifest, EmbeddingMatrix,
+    Manifest, OllamaEmbedClient,
 };
 
 #[derive(Parser, Debug)]
@@ -120,6 +121,8 @@ fn run(args: Args) -> Result<(), HfError> {
     };
     let text_file = std::fs::File::open(&args.text)
         .map_err(|e| HfError::Invalid(format!("{}: {e}", args.text.display())))?;
+    // the binary sidecar describes the jsonl as it was; withdraw it before appending
+    EmbeddingMatrix::invalidate_sidecar(&args.destination)?;
     let mut out = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -221,6 +224,10 @@ fn run(args: Args) -> Result<(), HfError> {
     manifest.count = done.len() as u64;
     manifest.truncated = truncated;
     write_manifest(&args.destination, &manifest)?;
+    // and rebuild it (atomically) now that the jsonl and the manifest agree again
+    out.sync_all()
+        .map_err(|e| HfError::Invalid(format!("{}: {e}", vectors_path.display())))?;
+    EmbeddingMatrix::refresh_sidecar(&args.destination)?;
     println!(
         "hf-embed: wrote {written} vectors; cache holds {} (dimension {dimension})",
         manifest.count

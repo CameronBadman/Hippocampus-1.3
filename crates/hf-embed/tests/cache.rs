@@ -1,6 +1,6 @@
 //! The cache reader against a Python-shaped `vectors.jsonl` + manifest: the
-//! sidecar is built on first load, memory-mapped on the second, refused when
-//! the jsonl moves; and the ollama client against a stub server speaking the
+//! sidecar is built on first load, memory-mapped on the second, rebuilt when
+//! the jsonl moves and still validates, left alone when it does not; and the ollama client against a stub server speaking the
 //! `/api/tags` and `/api/embed` shapes, including the context-length overflow.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -42,7 +42,7 @@ fn write_cache(dir: &std::path::Path, rows: &[(&str, &[f64])]) {
 }
 
 #[test]
-fn cache_loads_builds_the_sidecar_and_refuses_a_moved_source() {
+fn cache_loads_builds_the_sidecar_refuses_an_invalid_source_and_rebuilds_a_stale_sidecar() {
     let dir = tmp("cache");
     write_cache(
         &dir,
@@ -74,7 +74,10 @@ fn cache_loads_builds_the_sidecar_and_refuses_a_moved_source() {
     let m2 = EmbeddingMatrix::load(&dir).unwrap();
     assert_eq!(m2.get("Q2"), m.get("Q2"));
     assert_eq!(m2.nodes, m.nodes);
-    // a moved jsonl is refused until the sidecar is rebuilt
+    // a jsonl that moved without its manifest fails validation: refused, and
+    // the stale sidecar is left exactly as it was
+    let index_before = std::fs::read(dir.join("vectors.index.json")).unwrap();
+    let data_before = std::fs::read(dir.join("vectors.f32")).unwrap();
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(dir.join("vectors.jsonl"))
@@ -82,12 +85,115 @@ fn cache_loads_builds_the_sidecar_and_refuses_a_moved_source() {
     hf_embed::append_vector(&mut f, "Q4", &[1.0, 1.0, 1.0]).unwrap();
     drop(f);
     let err = match EmbeddingMatrix::load(&dir) {
-        Ok(_) => panic!("a moved vectors.jsonl must be refused"),
+        Ok(_) => panic!("a jsonl that disagrees with its manifest must be refused"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("does not match vectors.jsonl"), "{err}");
+    assert!(
+        err.contains("carries 4 vectors but the manifest says 3"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("vectors.index.json")).unwrap(),
+        index_before
+    );
+    assert_eq!(std::fs::read(dir.join("vectors.f32")).unwrap(), data_before);
     let manifest = read_manifest(&dir).unwrap();
     assert_eq!(manifest.count, 3);
+    // once the manifest agrees, the stale sidecar is rebuilt on load, no deletion needed
+    set_count(&dir, 4);
+    let m = EmbeddingMatrix::load(&dir).unwrap();
+    assert_eq!(m.nodes, vec!["Q1", "Q2", "Q3", "Q4"]);
+    assert_eq!(m.get("Q4").unwrap(), &[1.0, 1.0, 1.0]);
+    assert_ne!(
+        std::fs::read(dir.join("vectors.index.json")).unwrap(),
+        index_before
+    );
+    assert_sidecar_equals_a_fresh_build(&dir);
+    // and the rebuilt sidecar is the one mapped next time
+    let m2 = EmbeddingMatrix::load(&dir).unwrap();
+    assert_eq!(m2.nodes, m.nodes);
+    assert_eq!(m2.get("Q4"), m.get("Q4"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn set_count(dir: &std::path::Path, count: u64) {
+    let mut manifest = read_manifest(dir).unwrap();
+    manifest.count = count;
+    hf_embed::write_manifest(dir, &manifest).unwrap();
+}
+
+/// The sidecar in `dir` is byte-identical to one built from scratch out of a
+/// copy of its manifest and `vectors.jsonl`, and no temporary file is left.
+fn assert_sidecar_equals_a_fresh_build(dir: &std::path::Path) {
+    let fresh = dir.with_file_name(format!(
+        "{}-fresh",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh).unwrap();
+    for name in ["manifest.json", "vectors.jsonl"] {
+        std::fs::copy(dir.join(name), fresh.join(name)).unwrap();
+    }
+    EmbeddingMatrix::load(&fresh).unwrap();
+    for name in ["vectors.f32", "vectors.index.json"] {
+        assert_eq!(
+            std::fs::read(dir.join(name)).unwrap(),
+            std::fs::read(fresh.join(name)).unwrap(),
+            "{name} differs from a fresh build"
+        );
+    }
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".tmp"), "left a temporary file {name}");
+    }
+    let _ = std::fs::remove_dir_all(&fresh);
+}
+
+#[test]
+fn a_torn_or_foreign_sidecar_is_rebuilt_when_the_jsonl_validates() {
+    let dir = tmp("torn");
+    write_cache(&dir, &[("Q1", &[1.0, 2.0]), ("Q2", &[3.0, 4.0])]);
+    EmbeddingMatrix::load(&dir).unwrap();
+    // a half-written index (the old in-place write could leave one)
+    std::fs::write(dir.join("vectors.index.json"), "{\"record_kind\": ").unwrap();
+    let m = EmbeddingMatrix::load(&dir).unwrap();
+    assert_eq!(m.get("Q2").unwrap(), &[3.0, 4.0]);
+    assert_sidecar_equals_a_fresh_build(&dir);
+    // a data file of the wrong size under a matching index
+    std::fs::write(dir.join("vectors.f32"), [0u8; 4]).unwrap();
+    let m = EmbeddingMatrix::load(&dir).unwrap();
+    assert_eq!(m.get("Q1").unwrap(), &[1.0, 2.0]);
+    assert_sidecar_equals_a_fresh_build(&dir);
+    // an index left without its data
+    std::fs::remove_file(dir.join("vectors.f32")).unwrap();
+    EmbeddingMatrix::load(&dir).unwrap();
+    assert_sidecar_equals_a_fresh_build(&dir);
+    // refresh is a no-op on a matching sidecar, a rebuild on a stale one
+    assert!(!EmbeddingMatrix::refresh_sidecar(&dir).unwrap());
+    std::fs::write(dir.join("vectors.index.json"), "not json").unwrap();
+    assert!(EmbeddingMatrix::refresh_sidecar(&dir).unwrap());
+    assert_sidecar_equals_a_fresh_build(&dir);
+    // a jsonl that fails to parse is refused however stale the sidecar is
+    std::fs::write(dir.join("vectors.index.json"), "not json").unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("vectors.jsonl"))
+        .unwrap();
+    f.write_all(b"{\"node\": \"Q3\", \"vector\": [1.0]}\n")
+        .unwrap();
+    drop(f);
+    set_count(&dir, 3);
+    let err = match EmbeddingMatrix::load(&dir) {
+        Ok(_) => panic!("a jsonl with a short vector must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("has 1 values, manifest dimension 2"), "{err}");
+    assert!(EmbeddingMatrix::refresh_sidecar(&dir).is_err());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("vectors.index.json")).unwrap(),
+        "not json",
+        "a refused load leaves the stale sidecar alone"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -264,6 +370,12 @@ fn the_cli_writes_a_python_shaped_cache_and_resumes_only_a_matching_one() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(read_manifest(&dest).unwrap().count, 4);
+    // the append run itself rebuilt the sidecar (the 3-row one from the load
+    // above is gone before anything loads again): byte-identical to a fresh
+    // build, and it loads with no manual deletion
+    assert_sidecar_equals_a_fresh_build(&dest);
+    let m = EmbeddingMatrix::load(&dest).unwrap();
+    assert_eq!(m.nodes, vec!["Q1", "Q2", "Q3", "Q4"]);
     // a different character limit refuses to mix
     let out = std::process::Command::new(bin)
         .args([
