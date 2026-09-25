@@ -152,7 +152,7 @@ fn overshoot_entry(
             "greedy_overshoot",
             hidden.map(Value::from).unwrap_or(Value::Null),
         ),
-        QuerySource::EpisodeQuery => (
+        QuerySource::EpisodeQuery | QuerySource::DeletedPayload => (
             "question_greedy_overshoot",
             Value::from(greedy.expansions as i64 - oracle.expansions as i64),
         ),
@@ -168,6 +168,11 @@ pub fn evaluate(
     record_candidates: bool,
     queries: QueryVectors<'_>,
 ) -> Result<Evaluation, HfError> {
+    if queries.source == QuerySource::DeletedPayload {
+        return Err(HfError::Refused(
+            "a deleted_payload split is walked by --deletion-probe, never evaluated".into(),
+        ));
+    }
     let features = model.features();
     let with_prior = model.config.greedy_prior;
     // a split is drawn at one k; the baselines are v1's at k = 1 and
@@ -241,7 +246,7 @@ pub fn evaluate(
             // refused an episode the query cache does not cover
             let query64: Option<Vec<f64>> = match queries.source {
                 QuerySource::TargetEmbedding => None,
-                QuerySource::EpisodeQuery => Some(
+                QuerySource::EpisodeQuery | QuerySource::DeletedPayload => Some(
                     indexes[i]
                         .query()
                         .iter()

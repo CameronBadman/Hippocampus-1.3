@@ -28,6 +28,7 @@
 
 mod data;
 mod eval;
+mod probe;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -153,6 +154,24 @@ struct Args {
     /// its trainable parameter count and exit; no data is read
     #[arg(long, value_name = "DIM")]
     print_capacity: Option<i64>,
+    /// R1 premise (`R1_PREMISE_PLAN.md` E2): walk the deletion split written
+    /// by `hf-splits deletions` in DIR with the `--reevaluate-checkpoint`
+    /// checkpoint, on X's own row, with no target, on the CPU; writes
+    /// `probe_rows.jsonl` and `probe.manifest.json` under `--output`. Never
+    /// opens the split's labels. A real probe needs `--preregistration-commit`
+    /// as a run does; `--fixture` waives it and marks the output `evidence: false`.
+    #[arg(long, value_name = "DIR")]
+    deletion_probe: Option<PathBuf>,
+    /// which visible stream the probe walks: `visible.jsonl.gz` (the start s)
+    /// or `visible_h.jsonl.gz` (the start at the dense top-1 h)
+    #[arg(long, default_value = "visible.jsonl.gz")]
+    probe_stream: String,
+    /// the probe's expansion cap, the start counted (the plan's B_max)
+    #[arg(long, default_value_t = 80)]
+    max_expansions: usize,
+    /// walk only the first N records (0 = all): the plan's 50-episode timing run
+    #[arg(long, default_value_t = 0)]
+    probe_limit: usize,
 }
 
 fn foundation_root(args: &Args) -> PathBuf {
@@ -450,9 +469,62 @@ fn main() {
         }
         return;
     }
+    if args.deletion_probe.is_some() {
+        if let Err(e) = run_probe(&args) {
+            hf_core::exit_with("hf-stage0", &e);
+        }
+        return;
+    }
     if let Err(e) = run(args) {
         hf_core::exit_with("hf-stage0", &e);
     }
+}
+
+/// `--deletion-probe`: the governance of a run (the stale-binary gate and the
+/// preregistration pin, both waived by `--fixture` alone), then `probe::run`.
+fn run_probe(args: &Args) -> Result<(), HfError> {
+    let split_dir = args.deletion_probe.clone().expect("checked by the caller");
+    let named = args
+        .reevaluate_checkpoint
+        .clone()
+        .ok_or_else(|| HfError::Invalid("--deletion-probe needs --reevaluate-checkpoint".into()))?;
+    hf_core::refuse_holdout(&named)?;
+    // the weights of the checkpoint named by its .json, directory or .safetensors
+    let (checkpoint, _, _) = locate_checkpoint(&named)?.paths();
+    let embeddings_dir = args
+        .embeddings_dir
+        .clone()
+        .ok_or_else(|| HfError::Invalid("--deletion-probe needs --embeddings-dir".into()))?;
+    let output = args.output.clone().expect("required");
+    let config_path = args.config.clone().expect("required");
+    let lower = output.to_string_lossy().to_lowercase();
+    if lower.contains("holdout") || lower.contains("heldout") {
+        return Err(HfError::Refused("refusing a holdout path".into()));
+    }
+    let foundation = foundation_root(args);
+    let engine_head = data::engine_head();
+    preflight(args, &foundation, &engine_head)?;
+    probe::run(probe::ProbeArgs {
+        split_dir: &split_dir,
+        stream: &args.probe_stream,
+        config_path: &config_path,
+        checkpoint: &checkpoint,
+        embeddings_dir: &embeddings_dir,
+        output: &output,
+        max_expansions: args.max_expansions,
+        limit: args.probe_limit,
+        model_seed: args.model_seed.expect("required"),
+        provenance: json!({
+            "git_head": data::git_head(&foundation),
+            "engine_head": engine_head,
+            "engine_build_head": data::ENGINE_BUILD_HEAD,
+            "engine_build_dirty": data::engine_build_dirty(),
+            "engine_binary_sha256": data::engine_binary_sha256(),
+            "engine_stale_allowed": args.allow_stale_engine,
+            "preregistration_commit": args.preregistration_commit,
+        }),
+        evidence: !args.fixture,
+    })
 }
 
 fn run(args: Args) -> Result<(), HfError> {

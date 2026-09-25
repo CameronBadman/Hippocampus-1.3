@@ -22,6 +22,7 @@
 //! field enters neither the draw key, the sampler block, nor the episode id,
 //! and every k = 1 payload is the byte the Python sampler wrote.
 
+pub mod deletion;
 pub mod fixture;
 
 use std::collections::{BTreeMap, HashSet};
@@ -634,7 +635,9 @@ impl<'g> Sampler<'g> {
         })
     }
 
-    fn member(&self, split: &str, node: NodeId) -> bool {
+    /// Whether a node lies in `split`'s region (the screen region, or the
+    /// `split_of` bucket without one). `deletion` rebuilds balls through it.
+    pub fn member(&self, split: &str, node: NodeId) -> bool {
         let name = self.graph.name(node);
         if self.config.screen_region > 0.0 {
             let inside = in_screen_region(name, &self.config.seed_label, self.config.screen_region);

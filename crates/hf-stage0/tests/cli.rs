@@ -2458,3 +2458,190 @@ fn a_cumulative_pool_concatenates_the_splits_dirs_and_keeps_the_draws_replayable
     assert!(stderr.contains("the pools overlap"), "{stderr}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// --------------------------------------------------------------------------
+// `--deletion-probe`: the R1 premise's walk probe (R1_PREMISE_PLAN.md E2)
+
+/// A two-record deletion split over fixture-world nodes, written by hand in
+/// the layout `hf-splits deletions` writes, WITHOUT `labels.jsonl.gz`: the
+/// probe cannot depend on a file that is not there. The deleted node of each
+/// record (`n7`, `n9`) is absent from its ball; its row is the query.
+fn write_deletion_split(dir: &std::path::Path) -> PathBuf {
+    use std::io::Write;
+    let (graph, embeddings) = hf_episodes::fixture::fixture_world(5, 400, 1600, 8);
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let mut f = std::fs::File::create(cache.join("vectors.jsonl")).unwrap();
+    let mut names: Vec<&String> = embeddings.keys().collect();
+    names.sort();
+    for n in &names {
+        hf_embed::append_vector(&mut f, n, &embeddings[*n]).unwrap();
+    }
+    let manifest = |count: u64| hf_embed::Manifest {
+        record_kind: hf_embed::MANIFEST_KIND.into(),
+        model: "fixture".into(),
+        model_digest: "fixture".into(),
+        base_url: "none".into(),
+        dimension: 8,
+        count,
+        text_char_limit: 6000,
+        text_sha256: None,
+        truncated: Default::default(),
+        training_authorized: false,
+        extra: Default::default(),
+    };
+    hf_embed::write_manifest(&cache, &manifest(names.len() as u64)).unwrap();
+    let split = dir.join("del");
+    std::fs::create_dir_all(split.join("queries")).unwrap();
+    let file = std::fs::File::create(split.join("visible.jsonl.gz")).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut q = std::fs::File::create(split.join("queries/vectors.jsonl")).unwrap();
+    for (k, (start, deleted)) in [("n1", "n7"), ("n2", "n9")].iter().enumerate() {
+        let s = graph.id(start).unwrap();
+        let x = graph.id(deleted).unwrap();
+        let ball: Vec<u32> = graph
+            .ball_traced(s, 20, None, 3, None, Some(x))
+            .unwrap()
+            .order;
+        let sub = graph.induced(&ball);
+        let mut edges = Vec::new();
+        for &h in &ball {
+            for e in sub.out(h) {
+                edges.push(serde_json::json!({"edge_id": edges.len(), "source": graph.name(h), "target": graph.name(e.tail), "relation": null}));
+            }
+        }
+        let id = format!("fixture-screen-00000{k}-00000000-del-U");
+        let record = serde_json::json!({"episode_id": id, "visible": {
+            "record_kind": "r1_deletion_visible_v1",
+            "family": "fixture",
+            "start_node": start,
+            "nodes": ball.iter().map(|n| graph.name(*n)).collect::<Vec<_>>(),
+            "edges": edges,
+        }});
+        gz.write_all(serde_json::to_string(&record).unwrap().as_bytes())
+            .unwrap();
+        gz.write_all(b"\n").unwrap();
+        hf_embed::append_vector(&mut q, &id, &embeddings[*deleted]).unwrap();
+    }
+    gz.finish().unwrap();
+    hf_embed::write_manifest(&split.join("queries"), &manifest(2)).unwrap();
+    std::fs::write(
+        split.join("deletions.manifest.json"),
+        serde_json::json!({"record_kind": "r1_deletion_split_manifest_v1", "records_written": 2, "training_authorized": false}).to_string(),
+    )
+    .unwrap();
+    assert!(!split.join("labels.jsonl.gz").exists());
+    cache
+}
+
+/// The probe walks every record on the CPU with no target: nothing
+/// registers, every walk starts at its start, the cap binds, the labels are
+/// never opened (they do not exist here), and the refusals exit 2.
+#[test]
+fn the_deletion_probe_walks_without_a_target_and_honours_the_cap() {
+    if !config().exists() {
+        eprintln!("skipped: the foundation checkout is not beside this one");
+        return;
+    }
+    let cfg = config();
+    let root = tmp("deletion-probe");
+    let train = root.join("train");
+    let o = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "--output",
+        train.to_str().unwrap(),
+        "--model-seed",
+        "5",
+        "--fixture",
+        "--train-episodes",
+        "8",
+        "--screen-episodes",
+        "4",
+        "--updates",
+        "2",
+        "--eval-every",
+        "2",
+        "--save-checkpoint",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let cache = write_deletion_split(&root);
+    let split = root.join("del");
+    let probe = |out: &PathBuf, extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "--config",
+            cfg.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--model-seed",
+            "5",
+            "--fixture",
+            "--deletion-probe",
+            split.to_str().unwrap(),
+            "--reevaluate-checkpoint",
+            train.join("checkpoint.json").to_str().unwrap(),
+            "--embeddings-dir",
+            cache.to_str().unwrap(),
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        run_env(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            CPU_ONLY,
+        )
+    };
+    let full = root.join("probe-full");
+    let o = probe(&full, &[]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(full.join("probe_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        let expanded = r["walk_expanded"].as_array().unwrap();
+        assert_eq!(expanded[0], r["start_node"]);
+        assert!(expanded.len() <= 80);
+        assert!(
+            !expanded.iter().any(|n| n == "n7" || n == "n9"),
+            "the deleted node was walked"
+        );
+        assert_ne!(r["stop_reason"], "target_registered");
+    }
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(full.join("probe.manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(m["labels_opened"], false);
+    assert_eq!(m["evidence"], false);
+    assert_eq!(m["device"], "cpu");
+    assert_eq!(m["query_source"], "deleted_payload");
+    // the cap binds, and a capped walk is the prefix of the full one
+    let capped = root.join("probe-capped");
+    let o = probe(&capped, &["--max-expansions", "2"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let short: Vec<serde_json::Value> = std::fs::read_to_string(capped.join("probe_rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (s, f) in short.iter().zip(&rows) {
+        let se = s["walk_expanded"].as_array().unwrap();
+        let fe = f["walk_expanded"].as_array().unwrap();
+        assert!(se.len() <= 2);
+        assert_eq!(&fe[..se.len()], &se[..]);
+    }
+    // refusals: an unknown stream, rows already written, a holdout output
+    assert_eq!(
+        probe(&root.join("p3"), &["--probe-stream", "labels.jsonl.gz"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(probe(&full, &[]).status.code(), Some(2));
+    assert_eq!(
+        probe(&root.join("holdout-probe"), &[]).status.code(),
+        Some(2)
+    );
+}

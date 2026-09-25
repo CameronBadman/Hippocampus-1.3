@@ -32,6 +32,14 @@ pub struct OutEdge {
     pub tail: NodeId,
 }
 
+/// A ball's breadth-first order and the discovery parent of every node but
+/// the start (the node whose capped tail list first reached it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BallTrace {
+    pub order: Vec<NodeId>,
+    pub parent: HashMap<NodeId, NodeId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RealGraph {
     pub family: String,
@@ -289,10 +297,40 @@ impl RealGraph {
         hub_fanout: usize,
         allow: Option<&dyn Fn(NodeId) -> bool>,
     ) -> Result<Vec<NodeId>, HfError> {
-        if !self.has_out(start) {
+        self.ball_traced(start, size, hub_cap, hub_fanout, allow, None)
+            .map(|t| t.order)
+    }
+
+    /// `ball` with the BFS discovery parent of every node beside the order,
+    /// on the graph with `exclude` **deleted**: the excluded node is removed
+    /// from every out-list BEFORE the hub cap is checked and before a hub's
+    /// fan-out is ranked, so a hub whose only surplus tail was the excluded
+    /// node is no longer capped and a hub that had hashed it among its
+    /// `hub_fanout` picks takes its next-ranked tail instead. This is the ball
+    /// of `G ∖ {exclude}`, which filtering the node out through `allow` is
+    /// not: `allow` runs after the cap and after the ranking. With
+    /// `exclude = None` it is `ball` exactly. The start is never excluded.
+    pub fn ball_traced(
+        &self,
+        start: NodeId,
+        size: usize,
+        hub_cap: Option<u32>,
+        hub_fanout: usize,
+        allow: Option<&dyn Fn(NodeId) -> bool>,
+        exclude: Option<NodeId>,
+    ) -> Result<BallTrace, HfError> {
+        if exclude == Some(start) {
+            return Err(HfError::Invalid(
+                "the ball centre cannot be excluded".into(),
+            ));
+        }
+        let mut start_tails = self.out_neighbours(start);
+        start_tails.retain(|t| Some(*t) != exclude);
+        if start_tails.is_empty() {
             return Err(HfError::Invalid("ball centre has no out-edges".into()));
         }
         let mut order = vec![start];
+        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
         let mut seen: HashSet<NodeId> = HashSet::from([start]);
         let mut queue = VecDeque::from([start]);
         'outer: while let Some(node) = queue.pop_front() {
@@ -300,6 +338,7 @@ impl RealGraph {
                 break;
             }
             let mut tails = self.out_neighbours(node);
+            tails.retain(|t| Some(*t) != exclude);
             if let Some(cap) = hub_cap {
                 if node != start && tails.len() as u32 > cap {
                     let start_name = self.name(start);
@@ -331,13 +370,14 @@ impl RealGraph {
                 }
                 seen.insert(tail);
                 order.push(tail);
+                parent.insert(tail, node);
                 queue.push_back(tail);
                 if order.len() >= size {
                     break 'outer;
                 }
             }
         }
-        Ok(order)
+        Ok(BallTrace { order, parent })
     }
 
     /// `induced`: the subgraph on a node set, edges with both ends inside.
@@ -636,6 +676,134 @@ mod tests {
             vec!["a", "c", "z"]
         );
         assert!(g.typed());
+    }
+
+    fn graph_of(triples: &[(String, String)]) -> RealGraph {
+        RealGraph::from_edges(
+            "t",
+            triples.iter().map(|(h, t)| (h.as_str(), None, t.as_str())),
+        )
+    }
+
+    fn names(g: &RealGraph, ids: &[NodeId]) -> Vec<String> {
+        ids.iter().map(|n| g.name(*n).to_string()).collect()
+    }
+
+    /// `ball_traced` with nothing excluded is `ball`, order for order.
+    #[test]
+    fn traced_ball_without_exclusion_is_the_ball() {
+        let mut triples = Vec::new();
+        for i in 0..30u32 {
+            for j in [1u32, 7, 11] {
+                triples.push((format!("n{i}"), format!("n{}", (i * j + 3) % 30)));
+            }
+        }
+        let g = graph_of(&triples);
+        let s = g.id("n0").unwrap();
+        for cap in [None, Some(2)] {
+            let plain = g.ball(s, 12, cap, 3, None).unwrap();
+            let traced = g.ball_traced(s, 12, cap, 3, None, None).unwrap();
+            assert_eq!(plain, traced.order);
+            for n in &traced.order[1..] {
+                let p = traced.parent[n];
+                assert!(g.out_neighbours(p).contains(n));
+            }
+        }
+    }
+
+    /// A node reachable only through the excluded node leaves the ball; the
+    /// excluded node itself never enters it.
+    #[test]
+    fn excluding_a_node_drops_what_only_it_reached() {
+        let pairs = [("s", "a"), ("s", "x"), ("x", "y"), ("a", "b")];
+        let triples: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(h, t)| (h.to_string(), t.to_string()))
+            .collect();
+        let g = graph_of(&triples);
+        let s = g.id("s").unwrap();
+        let x = g.id("x").unwrap();
+        let with = names(&g, &g.ball(s, 10, None, 3, None).unwrap());
+        assert!(with.contains(&"y".to_string()));
+        let without = g.ball_traced(s, 10, None, 3, None, Some(x)).unwrap();
+        let without = names(&g, &without.order);
+        assert_eq!(without, vec!["s", "a", "b"]);
+        assert!(g.ball_traced(s, 10, None, 3, None, Some(s)).is_err());
+    }
+
+    /// The ball of G minus x, for a hub test: the same triples with every edge
+    /// touching x deleted, BFS'd on its own graph.
+    fn ball_of_deleted(triples: &[(String, String)], x: &str, cap: u32) -> Vec<String> {
+        let kept: Vec<(String, String)> = triples
+            .iter()
+            .filter(|(h, t)| h != x && t != x)
+            .cloned()
+            .collect();
+        let g = graph_of(&kept);
+        names(
+            &g,
+            &g.ball(g.id("s").unwrap(), 50, Some(cap), 3, None).unwrap(),
+        )
+    }
+
+    /// Plan test (h): x is one of a capped hub's three hashed tails. Deleting
+    /// it must hand the hub's slot to its NEXT-ranked tail, as the ball of the
+    /// graph with x physically deleted does; filtering x through `allow` (which
+    /// runs after the ranking) must be shown to differ.
+    #[test]
+    fn excluding_a_hashed_hub_tail_takes_the_next_ranked_tail() {
+        let cap = 3u32;
+        let mut found = false;
+        for candidate in 0..200 {
+            let x = format!("x{candidate:03}");
+            let mut triples: Vec<(String, String)> = vec![("s".into(), "h".into())];
+            for t in ["t0", "t1", "t2", "t3", "t4", "t5"] {
+                triples.push(("h".into(), t.into()));
+            }
+            triples.push(("h".into(), x.clone()));
+            let g = graph_of(&triples);
+            let s = g.id("s").unwrap();
+            let xid = g.id(&x).unwrap();
+            let full = names(&g, &g.ball(s, 50, Some(cap), 3, None).unwrap());
+            if !full.contains(&x) {
+                continue; // x is not among the hub's hashed picks; try another name
+            }
+            found = true;
+            let traced = g.ball_traced(s, 50, Some(cap), 3, None, Some(xid)).unwrap();
+            let traced = names(&g, &traced.order);
+            let deleted = ball_of_deleted(&triples, &x, cap);
+            assert_eq!(traced, deleted, "exclusion must equal physical deletion");
+            assert_eq!(traced.len(), full.len(), "the hub keeps three picks");
+            let not_x = |n: NodeId| n != xid;
+            let allow_only = names(&g, &g.ball(s, 50, Some(cap), 3, Some(&not_x)).unwrap());
+            assert_ne!(allow_only, traced, "allow-only filtering is not deletion");
+            assert_eq!(allow_only.len() + 1, traced.len());
+            break;
+        }
+        assert!(found, "no candidate name was hashed among the hub's picks");
+    }
+
+    /// Plan test (k): a hub at exactly cap + 1 tails, x among them, is capped
+    /// in G and UNCAPPED in G minus x, so every one of its remaining tails
+    /// enters the ball.
+    #[test]
+    fn a_hub_at_cap_plus_one_is_uncapped_once_x_is_gone() {
+        let cap = 3u32;
+        let mut triples: Vec<(String, String)> = vec![("s".into(), "h".into())];
+        for t in ["a", "b", "c", "x"] {
+            triples.push(("h".into(), t.into()));
+        }
+        let g = graph_of(&triples);
+        let s = g.id("s").unwrap();
+        let x = g.id("x").unwrap();
+        let full = g.ball(s, 50, Some(cap), 3, None).unwrap();
+        assert_eq!(full.len(), 2 + 3, "capped in G: fan-out 3 of 4");
+        let traced = g.ball_traced(s, 50, Some(cap), 3, None, Some(x)).unwrap();
+        let got = names(&g, &traced.order);
+        for t in ["a", "b", "c"] {
+            assert!(got.contains(&t.to_string()), "{t} missing from {got:?}");
+        }
+        assert_eq!(got, ball_of_deleted(&triples, "x", cap));
     }
 
     #[test]

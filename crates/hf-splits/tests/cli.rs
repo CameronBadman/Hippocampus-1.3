@@ -1355,3 +1355,236 @@ fn subset_of_a_stage1_split_keeps_untyped_hidden_keys_and_a_v6_split_keeps_its_v
         vec![k2_ids[2].clone()]
     );
 }
+
+// --------------------------------------------------------------------------
+// `hf-splits deletions`: the R1 premise's delete-a-node split (R1_PREMISE_PLAN.md E1)
+
+fn deletions_run(
+    split: &std::path::Path,
+    gdir: &std::path::Path,
+    cache: &std::path::Path,
+    dest: &std::path::Path,
+    threads: &str,
+) -> std::process::Output {
+    run(&[
+        "deletions",
+        "--split-dir",
+        split.to_str().unwrap(),
+        "--graph-dir",
+        gdir.to_str().unwrap(),
+        "--embeddings",
+        cache.to_str().unwrap(),
+        "--destination",
+        dest.to_str().unwrap(),
+        "--threads",
+        threads,
+    ])
+}
+
+/// Rewrite a split's visible stream through `edit` and restamp the public
+/// manifest's digest, so a doctored source passes the digest check and
+/// reaches the check under test.
+fn doctor_visible(split: &std::path::Path, edit: impl Fn(&mut serde_json::Value)) {
+    use std::io::Write;
+    let mut records = gz_records(&split.join("visible.jsonl.gz"));
+    for r in records.iter_mut() {
+        edit(r);
+    }
+    let path = split.join("visible.jsonl.gz");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    for r in &records {
+        gz.write_all(&hf_core::canonical_bytes(r).unwrap()).unwrap();
+        gz.write_all(b"\n").unwrap();
+    }
+    gz.finish().unwrap();
+    let (bytes, sha) = hf_core::sha256_file(&path).unwrap();
+    let mpath = split.join("manifest.public.json");
+    let mut m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    m["visible_bytes"] = bytes.into();
+    m["visible_sha256"] = sha.into();
+    std::fs::write(&mpath, hf_core::dump_pretty(&m)).unwrap();
+}
+
+/// Plan tests (c), (g) and (i): a sampler-written split is accepted (its balls
+/// rebuild exactly), the deleted node never reaches either visible stream or
+/// an episode id, every label has a non-empty T drawn from the rebuilt ball,
+/// the start-at-h stream starts at the recorded h, and every sidecar row is
+/// X's own node-cache row, bit for bit. The source's hidden stream is deleted
+/// before the run, so the command cannot depend on it.
+#[test]
+fn deletions_write_the_streams_without_x_and_the_sidecar_is_xs_own_row() {
+    let root = tmp("deletions");
+    let (gdir, cache) = fixture_dirs(&root);
+    let pool = root.join("pool");
+    write_fixture_split(&root, &gdir, &pool, "1", 12);
+    let split = pool.join("screen");
+    std::fs::remove_file(split.join("hidden.jsonl.gz")).unwrap();
+    std::fs::remove_file(split.join("manifest.private.json")).unwrap();
+    let dest = root.join("del");
+    let out = deletions_run(&split, &gdir, &cache, &dest, "2");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let visible = gz_records(&dest.join("visible.jsonl.gz"));
+    let visible_h = gz_records(&dest.join("visible_h.jsonl.gz"));
+    let labels = gz_records(&dest.join("labels.jsonl.gz"));
+    assert!(!visible.is_empty());
+    assert_eq!(visible.len(), labels.len());
+    assert_eq!(visible.len(), visible_h.len());
+    let nodes = hf_embed::EmbeddingMatrix::load(&cache).unwrap();
+    let queries = hf_embed::EmbeddingMatrix::load(&dest.join("queries")).unwrap();
+    assert_eq!(queries.len(), labels.len());
+    let mut tags = std::collections::BTreeSet::new();
+    for ((v, h), l) in visible.iter().zip(&visible_h).zip(&labels) {
+        let id = v["episode_id"].as_str().unwrap();
+        assert_eq!(l["episode_id"], v["episode_id"]);
+        let x = l["deleted_node"].as_str().unwrap();
+        let mut named: Vec<String> = vec![
+            id.to_string(),
+            v["visible"]["start_node"].as_str().unwrap().into(),
+        ];
+        for n in v["visible"]["nodes"].as_array().unwrap() {
+            named.push(n.as_str().unwrap().into());
+        }
+        for e in v["visible"]["edges"].as_array().unwrap() {
+            named.push(e["source"].as_str().unwrap().into());
+            named.push(e["target"].as_str().unwrap().into());
+        }
+        assert!(
+            !named.iter().any(|n| n == x),
+            "{x} reached the visible stream of {id}"
+        );
+        assert!(v["visible"].get("targets").is_none() && v["visible"].get("target_node").is_none());
+        let ball: std::collections::BTreeSet<&str> = v["visible"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        let t = l["targets"].as_array().unwrap();
+        assert!(!t.is_empty());
+        assert_eq!(l["target_count"].as_u64().unwrap() as usize, t.len());
+        for n in t {
+            assert!(ball.contains(n["node"].as_str().unwrap()));
+            assert_ne!(n["node"], v["visible"]["start_node"]);
+        }
+        assert_eq!(h["visible"]["start_node"], l["h_node"]);
+        assert_eq!(h["visible"]["nodes"], v["visible"]["nodes"]);
+        let want = nodes.get(x).unwrap();
+        let got = queries.get(id).unwrap();
+        assert_eq!(
+            want.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+            "the sidecar row of {id} is not {x}'s row"
+        );
+        for tag in l["draws"].as_array().unwrap() {
+            tags.insert(tag.as_str().unwrap().to_string());
+        }
+    }
+    assert!(tags.contains("U"));
+    let m: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dest.join("deletions.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        m["streams_opened"],
+        serde_json::json!(["manifest.public.json", "visible.jsonl.gz"])
+    );
+    assert_eq!(m["training_authorized"], false);
+    assert_eq!(
+        m["records_written"].as_u64().unwrap() as usize,
+        labels.len()
+    );
+}
+
+/// Plan test (f): the output does not depend on the thread count.
+#[test]
+fn deletions_do_not_depend_on_the_thread_count() {
+    let root = tmp("deletions-threads");
+    let (gdir, cache) = fixture_dirs(&root);
+    let pool = root.join("pool");
+    write_fixture_split(&root, &gdir, &pool, "1", 10);
+    let split = pool.join("screen");
+    let one = root.join("one");
+    let four = root.join("four");
+    assert!(deletions_run(&split, &gdir, &cache, &one, "1")
+        .status
+        .success());
+    assert!(deletions_run(&split, &gdir, &cache, &four, "4")
+        .status
+        .success());
+    for stream in ["visible.jsonl.gz", "visible_h.jsonl.gz", "labels.jsonl.gz"] {
+        assert_eq!(
+            gz_records(&one.join(stream)),
+            gz_records(&four.join(stream)),
+            "{stream}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(one.join("queries/vectors.jsonl")).unwrap(),
+        std::fs::read(four.join("queries/vectors.jsonl")).unwrap()
+    );
+}
+
+/// Plan tests (g) and (j), the refusals: a stored ball the graph does not
+/// rebuild is band H; a source id inside seed selection's reserve is refused
+/// before anything is written; a holdout path and an existing destination are
+/// refused. Every refusal exits 2.
+#[test]
+fn deletions_refuse_a_doctored_ball_the_reserve_holdout_and_an_existing_destination() {
+    let root = tmp("deletions-refuse");
+    let (gdir, cache) = fixture_dirs(&root);
+    // a ball that is not the one the graph rebuilds
+    let pool = root.join("pool");
+    write_fixture_split(&root, &gdir, &pool, "1", 4);
+    let split = pool.join("screen");
+    doctor_visible(&split, |r| {
+        let nodes = r["visible"]["nodes"].as_array_mut().unwrap();
+        nodes.pop();
+    });
+    let dest = root.join("doctored");
+    let out = deletions_run(&split, &gdir, &cache, &dest, "1");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not the stored ball"));
+    // an id in the screen reserve (raw index >= 4,105)
+    let pool2 = root.join("pool2");
+    write_fixture_split(&root, &gdir, &pool2, "1", 4);
+    let split2 = pool2.join("screen");
+    doctor_visible(&split2, |r| {
+        let id = r["episode_id"].as_str().unwrap().to_string();
+        let tail = id.splitn(4, '-').nth(3).unwrap().to_string();
+        r["episode_id"] = format!("fixture-screen-004105-{tail}").into();
+    });
+    let dest2 = root.join("reserved");
+    let out = deletions_run(&split2, &gdir, &cache, &dest2, "1");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved for seed selection"));
+    assert!(!dest2.exists(), "nothing is written for a reserved id");
+    // just below the reserve is accepted by the check (then fails nothing else)
+    let pool3 = root.join("pool3");
+    write_fixture_split(&root, &gdir, &pool3, "1", 4);
+    let clean = root.join("clean");
+    assert!(
+        deletions_run(&pool3.join("screen"), &gdir, &cache, &clean, "1")
+            .status
+            .success()
+    );
+    let again = deletions_run(&pool3.join("screen"), &gdir, &cache, &clean, "1");
+    assert_eq!(
+        again.status.code(),
+        Some(2),
+        "an existing destination is refused"
+    );
+    let out = deletions_run(
+        &pool3.join("screen"),
+        &gdir,
+        &cache,
+        &root.join("holdout-x"),
+        "1",
+    );
+    assert_eq!(out.status.code(), Some(2));
+}

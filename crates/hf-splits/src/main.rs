@@ -21,10 +21,16 @@
 //! a `subset` block recording the id file's sha256. A Q0 / Q0-rand pool is a
 //! membership, which `--train-episodes` (a prefix) cannot select.
 //!
+//! `hf-splits deletions`: the R1 premise's delete-a-node split
+//! (`R1_PREMISE_PLAN.md` §2 E1), from the VISIBLE stream of one spent split;
+//! see `deletions.rs`.
+//!
 //! `hf-splits prefix-check OLD NEW`: `real_walk_split_prefix_check.py` — the
 //! first `episode_count(OLD)` records of both streams of NEW equal OLD's,
 //! record for record (digests differ by construction and are not the check);
 //! an absent `greedy_share` reads as 1.0, announced once.
+
+mod deletions;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -53,6 +59,8 @@ enum Command {
     Baselines(BaselinesArgs),
     /// write a split holding exactly the listed episode ids, in the source's order
     Subset(SubsetArgs),
+    /// the R1 premise's delete-a-node split from one spent split's starts
+    Deletions(deletions::DeletionsArgs),
     /// check that NEW's first records reproduce OLD's, stream by stream
     PrefixCheck {
         old: PathBuf,
@@ -773,6 +781,7 @@ fn main() {
         Command::Write(args) => write(args),
         Command::Baselines(args) => baselines(args),
         Command::Subset(args) => subset(args),
+        Command::Deletions(args) => deletions::deletions(args),
         Command::PrefixCheck {
             old,
             new,

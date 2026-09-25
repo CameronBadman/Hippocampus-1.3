@@ -51,11 +51,20 @@ pub type Local = u32;
 /// through the hidden payload only, for registration and the losses' labels —
 /// `VisibleIndex` is handed an empty list of shown targets, so no feature
 /// builder can be a function of the target's identity.
+///
+/// `DeletedPayload` is the R1 premise's probe (`R1_PREMISE_PLAN.md` §2 E2):
+/// the query is a DELETED node's own embedding row — the stage-0 query type —
+/// whose node is absent from the ball, so there is nothing to register. The
+/// index has **no registration target at all** and the walk ends only on an
+/// empty frontier or at the caller's expansion cap
+/// ([`walk_batch_capped`]). It is built by [`EpisodeIndex::for_deletion`]
+/// alone: `parse` does not accept it, so no training config can select it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QuerySource {
     #[default]
     TargetEmbedding,
     EpisodeQuery,
+    DeletedPayload,
 }
 
 impl QuerySource {
@@ -73,6 +82,7 @@ impl QuerySource {
         match self {
             Self::TargetEmbedding => "target_embedding",
             Self::EpisodeQuery => "episode_query",
+            Self::DeletedPayload => "deleted_payload",
         }
     }
 }
@@ -230,6 +240,13 @@ impl EpisodeIndex {
             .collect::<Result<Vec<_>, _>>()?;
         let query_source = queries.source;
         let (queries, unit_queries) = match query_source {
+            QuerySource::DeletedPayload => {
+                return Err(HfError::Refused(format!(
+                    "{}: a deleted_payload index is built by EpisodeIndex::for_deletion, \
+                     never from a sampled record",
+                    episode.episode_id
+                )))
+            }
             QuerySource::TargetEmbedding => {
                 if queries.cache.is_some() {
                     return Err(HfError::Invalid(
@@ -333,6 +350,100 @@ impl EpisodeIndex {
         })
     }
 
+    /// The R1 premise's probe index (`QuerySource::DeletedPayload`): a ball
+    /// rebuilt without the deleted node, walked on that node's own row.
+    ///
+    /// `nodes` and `edges` are the deletion record's VISIBLE payload (node
+    /// names; `(edge_id, source, target)`); `query` is the sidecar row. There
+    /// is no hidden input: no target is shown or registered, every on-path
+    /// flag is false and every distance unknown — the probe computes no loss.
+    /// The query's own node is not in the ball: `hf-splits deletions` refuses
+    /// to write a record that names it. It is not re-checked here by vector
+    /// equality, because distinct Wikidata nodes can share a text and so a
+    /// row; the index is never told the deleted node's name.
+    pub fn for_deletion(
+        episode_id: &str,
+        start_node: &str,
+        nodes: &[String],
+        edges: &[(u32, String, String)],
+        embeddings: &hf_embed::EmbeddingMatrix,
+        edim: usize,
+        query: &[f32],
+    ) -> Result<Self, HfError> {
+        if query.len() < edim {
+            return Err(HfError::BandH(format!(
+                "{episode_id}: the query has width {} < {edim}",
+                query.len()
+            )));
+        }
+        let local: HashMap<&str, Local> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i as Local))
+            .collect();
+        if local.len() != nodes.len() {
+            return Err(HfError::BandH(format!(
+                "{episode_id}: a node is listed twice"
+            )));
+        }
+        let lookup = |name: &str| -> Result<Local, HfError> {
+            local.get(name).copied().ok_or_else(|| {
+                HfError::BandH(format!("{episode_id}: node {name} is not in the subgraph"))
+            })
+        };
+        let mut sorted: Vec<(u32, Local, Local)> = edges
+            .iter()
+            .map(|(id, s, t)| Ok((*id, lookup(s)?, lookup(t)?)))
+            .collect::<Result<_, HfError>>()?;
+        sorted.sort_unstable();
+        let n = nodes.len();
+        let mut out = vec![Vec::new(); n];
+        for (_, s, t) in sorted {
+            out[s as usize].push(t);
+        }
+        let mut emb = vec![0f32; n * edim];
+        let mut unit = vec![0f32; n * edim];
+        for (i, name) in nodes.iter().enumerate() {
+            if let Some(row) = embeddings.get(name) {
+                if row.len() < edim {
+                    return Err(HfError::BandH(format!(
+                        "embedding of {name} has width {} < {edim}",
+                        row.len()
+                    )));
+                }
+                emb[i * edim..(i + 1) * edim].copy_from_slice(&row[..edim]);
+                let norm = row[..edim]
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(1e-12);
+                for j in 0..edim {
+                    unit[i * edim + j] = row[j] / norm;
+                }
+            }
+        }
+        let start = lookup(start_node)?;
+        Ok(Self {
+            episode_id: episode_id.to_string(),
+            names: nodes.to_vec(),
+            start,
+            targets_shown: Vec::new(),
+            hidden_targets: Vec::new(),
+            query_source: QuerySource::DeletedPayload,
+            out,
+            edim,
+            emb,
+            unit,
+            queries: query[..edim].to_vec(),
+            unit_queries: visible::unit_query(&query[..edim]),
+            on_path: vec![false; n],
+            distance: vec![None; n],
+            removed_count: 0,
+            greedy_overshoot: None,
+        })
+    }
+
     pub fn degree(&self, node: Local) -> usize {
         self.out[node as usize].len()
     }
@@ -371,6 +482,7 @@ impl EpisodeIndex {
         match self.query_source {
             QuerySource::TargetEmbedding => &self.targets_shown,
             QuerySource::EpisodeQuery => &self.hidden_targets,
+            QuerySource::DeletedPayload => &[],
         }
     }
 
@@ -786,6 +898,26 @@ pub fn walk_batch(
     scorer: &mut dyn Scorer,
     options: WalkOptions,
 ) -> Result<Vec<WalkResult>, HfError> {
+    walk_batch_capped(indexes, features, scorer, options, None)
+}
+
+/// [`walk_batch`] with an expansion cap: a walk whose expansion count (the
+/// start counted, as `expanded` counts it) reaches `max_expansions` stops with
+/// `stop_reason = "expansion_cap"` before its next decision. `None` is
+/// `walk_batch` exactly. Nothing about a decision changes, so a capped walk's
+/// `expanded` is a prefix of the uncapped walk's.
+pub fn walk_batch_capped(
+    indexes: &[&EpisodeIndex],
+    features: &dyn FeatureSet,
+    scorer: &mut dyn Scorer,
+    options: WalkOptions,
+    max_expansions: Option<usize>,
+) -> Result<Vec<WalkResult>, HfError> {
+    if max_expansions == Some(0) {
+        return Err(HfError::Invalid(
+            "an expansion cap counts the start, so it is at least 1".into(),
+        ));
+    }
     // A feature set that forms one query from one target cannot read a k >= 2
     // episode: the refusal of `K_TARGETS_DESIGN.md` §6 item 4, moved from the
     // index (which now builds every record) to the one place that pairs a
@@ -823,6 +955,15 @@ pub fn walk_batch(
         .iter()
         .map(|i| State::new(i, options.record_candidates))
         .collect();
+    let cap_reached = |s: &mut State| {
+        if s.live && max_expansions.is_some_and(|cap| s.expanded.len() >= cap) {
+            s.stop_reason = "expansion_cap";
+            s.live = false;
+        }
+    };
+    for s in states.iter_mut() {
+        cap_reached(s);
+    }
     loop {
         let live: Vec<usize> = states
             .iter()
@@ -961,6 +1102,7 @@ pub fn walk_batch(
             s.expanded.push(node);
             s.push_children(node, depth, &path_mean);
             s.check_registered();
+            cap_reached(s);
         }
     }
     Ok(states
