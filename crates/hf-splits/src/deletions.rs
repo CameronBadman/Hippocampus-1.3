@@ -86,9 +86,35 @@ pub struct DeletionsArgs {
 }
 
 #[derive(Deserialize)]
+struct RawLine {
+    episode_id: String,
+    visible: RawVisible,
+}
+
+/// Only what a draw reads of a source record: its start and its node names.
+/// A typed parse skips every other field (the node texts, the edges) without
+/// building them, so a selected record costs its names and no more.
+#[derive(Deserialize)]
+struct RawVisible {
+    #[serde(default)]
+    start_node: Option<String>,
+    #[serde(default)]
+    nodes: Vec<RawNode>,
+}
+
+#[derive(Deserialize)]
+struct RawNode {
+    #[serde(default)]
+    node: Option<String>,
+}
+
+/// The public manifest, the kept records with their positions, the count.
+type SourceRead = (Value, Vec<(usize, VisibleLine)>, usize);
+
 struct VisibleLine {
     episode_id: String,
-    visible: Value,
+    start_node: Option<String>,
+    nodes: Vec<String>,
 }
 
 fn read_json(path: &Path) -> Result<Value, HfError> {
@@ -103,12 +129,12 @@ fn invalid(e: impl std::fmt::Display) -> HfError {
     HfError::Invalid(e.to_string())
 }
 
-struct Gz {
+pub(crate) struct Gz {
     inner: flate2::write::GzEncoder<std::fs::File>,
 }
 
 impl Gz {
-    fn create(path: &Path) -> Result<Self, HfError> {
+    pub(crate) fn create(path: &Path) -> Result<Self, HfError> {
         let file = std::fs::File::create(path).map_err(invalid)?;
         Ok(Self {
             inner: flate2::write::GzEncoder::new(file, flate2::Compression::default()),
@@ -121,7 +147,13 @@ impl Gz {
         self.inner.write_all(b"\n").map_err(invalid)
     }
 
-    fn finish(self) -> Result<(), HfError> {
+    /// One already-canonical record line, written as `record` writes one.
+    pub(crate) fn raw_line(&mut self, line: &[u8]) -> Result<(), HfError> {
+        self.inner.write_all(line).map_err(invalid)?;
+        self.inner.write_all(b"\n").map_err(invalid)
+    }
+
+    pub(crate) fn finish(self) -> Result<(), HfError> {
         self.inner
             .finish()
             .map_err(invalid)?
@@ -130,8 +162,12 @@ impl Gz {
     }
 }
 
-/// The source's visible stream, checked against its public manifest's digest.
-fn read_source(split_dir: &Path) -> Result<(Value, Vec<VisibleLine>), HfError> {
+/// The source's visible stream, checked against its public manifest's digest,
+/// then STREAMED: only the records at the positions `keep` selects are parsed
+/// and kept (their start and node names), so the memory a draw needs does not
+/// grow with the part of the source it does not draw from. Returns the kept
+/// records with their positions and the stream's record count.
+fn read_source(split_dir: &Path, keep: &dyn Fn(usize) -> bool) -> Result<SourceRead, HfError> {
     let public = read_json(&split_dir.join("manifest.public.json"))?;
     if public.get("training_authorized") != Some(&Value::Bool(false)) {
         return Err(HfError::BandH(
@@ -147,15 +183,35 @@ fn read_source(split_dir: &Path) -> Result<(Value, Vec<VisibleLine>), HfError> {
             "visible.jsonl.gz does not match its public manifest digest".into(),
         ));
     }
-    let raw = hf_io::read_maybe_gz(&path)?;
-    let mut lines = Vec::new();
-    for line in raw.split(|b| *b == b'\n') {
+    use std::io::BufRead;
+    let file = std::fs::File::open(&path).map_err(invalid)?;
+    let reader = std::io::BufReader::with_capacity(1 << 20, flate2::read::GzDecoder::new(file));
+    let mut kept = Vec::new();
+    let mut position = 0usize;
+    for line in reader.split(b'\n') {
+        let line = line.map_err(invalid)?;
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        lines.push(serde_json::from_slice::<VisibleLine>(line).map_err(invalid)?);
+        if keep(position) {
+            let raw: RawLine = serde_json::from_slice(&line).map_err(invalid)?;
+            kept.push((
+                position,
+                VisibleLine {
+                    episode_id: raw.episode_id,
+                    start_node: raw.visible.start_node,
+                    nodes: raw
+                        .visible
+                        .nodes
+                        .into_iter()
+                        .map(|n| n.node.unwrap_or_default())
+                        .collect(),
+                },
+            ));
+        }
+        position += 1;
     }
-    Ok((public, lines))
+    Ok((public, kept, position))
 }
 
 /// The source's sampler block as a config; an absent `greedy_share` (a split
@@ -210,29 +266,23 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
         .as_deref()
         .map(parse_ordinals)
         .transpose()?;
-    let (public, all_source) = read_source(&args.split_dir)?;
-    let (ordinals, source): (Vec<usize>, Vec<&VisibleLine>) = match ordinal_range {
-        Some((lo, hi)) => {
-            let last = hi.unwrap_or(all_source.len().saturating_sub(1));
-            if lo >= all_source.len() || last >= all_source.len() {
-                return Err(HfError::Refused(format!(
-                    "--source-ordinals {}: the source stream holds {} records (positions 0..{})",
-                    args.source_ordinals.as_deref().unwrap_or(""),
-                    all_source.len(),
-                    all_source.len().saturating_sub(1)
-                )));
-            }
-            (lo..=last).map(|i| (i, &all_source[i])).unzip()
-        }
-        None => {
-            let take = if args.limit == 0 {
-                all_source.len()
-            } else {
-                args.limit.min(all_source.len())
-            };
-            all_source[..take].iter().enumerate().unzip()
-        }
+    let limit = args.limit;
+    let keep = |i: usize| match ordinal_range {
+        Some((lo, hi)) => i >= lo && hi.is_none_or(|h| i <= h),
+        None => limit == 0 || i < limit,
     };
+    let (public, kept, total) = read_source(&args.split_dir, &keep)?;
+    if let Some((lo, hi)) = ordinal_range {
+        let last = hi.unwrap_or(total.saturating_sub(1));
+        if lo >= total || last >= total {
+            return Err(HfError::Refused(format!(
+                "--source-ordinals {}: the source stream holds {total} records (positions 0..{})",
+                args.source_ordinals.as_deref().unwrap_or(""),
+                total.saturating_sub(1)
+            )));
+        }
+    }
+    let (ordinals, source): (Vec<usize>, Vec<VisibleLine>) = kept.into_iter().unzip();
     // the declared ranges are checked before any graph is loaded or any file
     // written
     for line in &source {
@@ -271,22 +321,18 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
             .par_iter()
             .zip(ordinals.par_iter())
             .map(|(line, &ordinal)| {
-                let start = line.visible["start_node"]
-                    .as_str()
+                let start = line
+                    .start_node
+                    .as_deref()
                     .ok_or_else(|| HfError::BandH(format!("{}: no start", line.episode_id)))?;
-                let stored: Vec<String> = line.visible["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|n| n["node"].as_str().unwrap_or("").to_string())
-                    .collect();
+                let stored: &[String] = &line.nodes;
                 deletion::draw_for_start(
                     &graph,
                     &sampler,
                     &split,
                     &line.episode_id,
                     start,
-                    &stored,
+                    stored,
                     &has_vector,
                     &in_index,
                     deletion::StartOptions {

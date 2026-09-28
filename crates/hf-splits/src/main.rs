@@ -25,12 +25,17 @@
 //! (`R1_PREMISE_PLAN.md` §2 E1), from the VISIBLE stream of one spent split;
 //! see `deletions.rs`.
 //!
+//! `hf-splits merge-deletions --part A --part B ... --destination D`: the
+//! split one `deletions` draw over the parts' contiguous `--source-ordinals`
+//! blocks would have written; see `merge_deletions.rs`.
+//!
 //! `hf-splits prefix-check OLD NEW`: `real_walk_split_prefix_check.py` — the
 //! first `episode_count(OLD)` records of both streams of NEW equal OLD's,
 //! record for record (digests differ by construction and are not the check);
 //! an absent `greedy_share` reads as 1.0, announced once.
 
 mod deletions;
+mod merge_deletions;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -61,6 +66,8 @@ enum Command {
     Subset(SubsetArgs),
     /// the R1 premise's delete-a-node split from one spent split's starts
     Deletions(deletions::DeletionsArgs),
+    /// join deletion splits drawn over contiguous --source-ordinals blocks
+    MergeDeletions(merge_deletions::MergeArgs),
     /// check that NEW's first records reproduce OLD's, stream by stream
     PrefixCheck {
         old: PathBuf,
@@ -782,6 +789,7 @@ fn main() {
         Command::Baselines(args) => baselines(args),
         Command::Subset(args) => subset(args),
         Command::Deletions(args) => deletions::deletions(args),
+        Command::MergeDeletions(args) => merge_deletions::merge_deletions(args),
         Command::PrefixCheck {
             old,
             new,

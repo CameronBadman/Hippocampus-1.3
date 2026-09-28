@@ -668,3 +668,385 @@ fn source_ordinals_draw_only_the_declared_block_exactly_as_the_whole_stream() {
         assert!(!dest.exists(), "{bad:?} wrote something");
     }
 }
+
+// --------------------------------------------------------------------------
+// `merge-deletions`: a draw built in --source-ordinals chunks
+
+fn merge(parts: &[&Path], dest: &Path) -> std::process::Output {
+    let mut args: Vec<String> = vec!["merge-deletions".into()];
+    for p in parts {
+        args.push("--part".into());
+        args.push(p.to_str().unwrap().into());
+    }
+    args.push("--destination".into());
+    args.push(dest.to_str().unwrap().into());
+    run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+const MERGED_FILES: [&str; 6] = [
+    "visible.jsonl.gz",
+    "visible_h.jsonl.gz",
+    "labels.jsonl.gz",
+    "queries/vectors.jsonl",
+    "queries/manifest.json",
+    "uncached_nodes.txt",
+];
+
+/// The merged manifest with its one provenance key removed, re-serialised as
+/// the writer serialises: must be the one-go manifest's exact bytes.
+fn manifest_without_chunks(dir: &Path) -> String {
+    let mut m = manifest(dir);
+    assert!(
+        m.get("chunks").is_some(),
+        "the merged manifest records its parts"
+    );
+    m.as_object_mut().unwrap().remove("chunks");
+    hf_core::files::python_json_pretty(&m)
+}
+
+/// Chunked = one-go, byte for byte: 4 blocks of 5 starts, given out of
+/// order, merged, against one draw over positions 0..19 — every stream, the
+/// query sidecar and its manifest, the uncached list, and the manifest bar
+/// its `chunks` key. Three draws: the TRAIN shape (`rotate`,
+/// `--require-coverage`), `all` with a node missing from the cache (the drop
+/// path: drops summed, the uncached set united), and `--coverage-only`.
+#[test]
+fn a_chunked_draw_merges_into_the_one_go_draw_byte_for_byte() {
+    let root = tmp("merge-eq");
+    let full = root.join("full");
+    std::fs::create_dir_all(&full).unwrap();
+    let (gdir0, full_cache) = fixture_dirs(&full, &[]);
+    let pool = root.join("pool");
+    write_fixture_split(&gdir0, &pool, 20);
+    let split = pool.join("screen");
+    // an entrant of some draw, to leave out of a second cache
+    let probe = root.join("probe");
+    let mut pe = vec!["--threads", "2"];
+    pe.extend_from_slice(&PREMISE);
+    assert!(deletions(&split, &gdir0, &full_cache, &probe, &pe)
+        .status
+        .success());
+    let entrant = an_entrant(&split, &probe);
+    // and a node in stored balls of starts in the first AND the last block,
+    // so the uncached set of two parts overlaps (a union, not a sum)
+    let balls: Vec<std::collections::BTreeSet<String>> =
+        gz_records(&split.join("visible.jsonl.gz"))
+            .iter()
+            .map(|r| {
+                r["visible"]["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .skip(1)
+                    .map(|n| n["node"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect();
+    let early: std::collections::BTreeSet<&String> = balls[..5].iter().flatten().collect();
+    let shared = balls[15..]
+        .iter()
+        .flatten()
+        .find(|n| early.contains(n) && **n != entrant)
+        .expect("a node shared by the first and last blocks")
+        .clone();
+    let lacking = root.join("lacking");
+    std::fs::create_dir_all(&lacking).unwrap();
+    let (gdir, thin_cache) = fixture_dirs(&lacking, &[entrant.as_str(), shared.as_str()]);
+    let blocks = ["10..14", "0..4", "15..19", "5..9"];
+    for (name, cache, extra) in [
+        (
+            "rotate",
+            &full_cache,
+            vec!["--per-start", "rotate", "--require-coverage"],
+        ),
+        ("all-drop", &thin_cache, vec!["--per-start", "all"]),
+        (
+            "coverage",
+            &thin_cache,
+            vec!["--per-start", "rotate", "--coverage-only"],
+        ),
+    ] {
+        let base = [
+            "--draw-label",
+            "r1-head-test",
+            "--allowed-range",
+            "screen:0..",
+            "--threads",
+            "3",
+        ];
+        let go = |dest: &Path, ordinals: &str| {
+            let mut a: Vec<&str> = base.to_vec();
+            a.extend_from_slice(&extra);
+            a.extend_from_slice(&["--source-ordinals", ordinals]);
+            let out = deletions(&split, &gdir, cache, dest, &a);
+            assert!(
+                out.status.success(),
+                "{name} {ordinals}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let one = root.join(format!("{name}-one"));
+        go(&one, "0..19");
+        let mut parts = Vec::new();
+        for b in blocks {
+            let d = root.join(format!("{name}-part-{b}"));
+            go(&d, b);
+            parts.push(d);
+        }
+        let merged = root.join(format!("{name}-merged"));
+        let refs: Vec<&Path> = parts.iter().map(PathBuf::as_path).collect();
+        let out = merge(&refs, &merged);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let files: &[&str] = if name == "coverage" {
+            &["uncached_nodes.txt"]
+        } else {
+            &MERGED_FILES
+        };
+        for f in files {
+            assert_eq!(sha(&merged.join(f)), sha(&one.join(f)), "{name}: {f}");
+        }
+        if name == "coverage" {
+            assert!(!merged.join("labels.jsonl.gz").exists());
+        }
+        assert_eq!(
+            manifest_without_chunks(&merged),
+            std::fs::read_to_string(one.join("deletions.manifest.json")).unwrap(),
+            "{name}: the manifest"
+        );
+        let m = manifest(&merged);
+        assert_eq!(m["chunks"]["parts"].as_array().unwrap().len(), 4);
+        assert_eq!(m["chunks"]["parts"][0]["first"], 0, "sorted by block");
+        if name != "rotate" {
+            // the uncached set is a union: some node is listed by two parts
+            let mut listed = 0u64;
+            for p in &parts {
+                listed += manifest(p)["uncached_nodes"].as_u64().unwrap();
+            }
+            assert!(
+                listed > m["uncached_nodes"].as_u64().unwrap(),
+                "{name}: no shared uncached node"
+            );
+        }
+        if name == "all-drop" {
+            assert!(
+                m["drops"]["uncached_in_ball"].as_u64().unwrap() > 0,
+                "the drop path ran"
+            );
+        }
+        if name == "rotate" {
+            assert!(m["records_written"].as_u64().unwrap() > 0);
+        }
+    }
+}
+
+/// The refusals, each exit 2 with nothing written: another draw label,
+/// another cache state, another per-start rule, another source; overlapping
+/// or gapped blocks; a part drawn without --source-ordinals; a part whose
+/// streams disagree with its count; a lone part; an existing destination.
+#[test]
+fn merge_deletions_refuses_mismatched_parts_and_broken_blocks() {
+    let root = tmp("merge-refuse");
+    let (gdir, cache) = fixture_dirs(&root, &[]);
+    let pool = root.join("pool");
+    write_fixture_split(&gdir, &pool, 12);
+    let split = pool.join("screen");
+    let pool2 = root.join("pool2");
+    write_fixture_split_seeded(&gdir, &pool2, 12);
+    let draw = |name: &str,
+                src: &Path,
+                cache: &Path,
+                label: &str,
+                per: &str,
+                ord: Option<&str>|
+     -> PathBuf {
+        let dest = root.join(name);
+        let mut a = vec![
+            "--draw-label",
+            label,
+            "--allowed-range",
+            "screen:0..",
+            "--per-start",
+            per,
+            "--threads",
+            "2",
+        ];
+        if let Some(o) = ord {
+            a.extend_from_slice(&["--source-ordinals", o]);
+        }
+        let out = deletions(src, &gdir, cache, &dest, &a);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dest
+    };
+    let a = draw("a", &split, &cache, "L", "rotate", Some("0..5"));
+    let b = draw("b", &split, &cache, "L", "rotate", Some("6..11"));
+    let ok_dest = root.join("ok");
+    assert!(merge(&[&a, &b], &ok_dest).status.success());
+    let bad_label = draw("b-label", &split, &cache, "M", "rotate", Some("6..11"));
+    let bad_rule = draw("b-rule", &split, &cache, "L", "all", Some("6..11"));
+    let bad_source = draw(
+        "b-source",
+        &pool2.join("screen"),
+        &cache,
+        "L",
+        "rotate",
+        Some("6..11"),
+    );
+    let overlap = draw("b-overlap", &split, &cache, "L", "rotate", Some("5..11"));
+    let gap = draw("b-gap", &split, &cache, "L", "rotate", Some("7..11"));
+    let no_ord = draw("b-noord", &split, &cache, "L", "rotate", None);
+    // another cache state: the same rows plus one appended
+    let cache2 = root.join("cache2");
+    std::fs::create_dir_all(&cache2).unwrap();
+    for f in ["vectors.jsonl", "manifest.json"] {
+        std::fs::copy(cache.join(f), cache2.join(f)).unwrap();
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(cache2.join("vectors.jsonl"))
+        .unwrap();
+    hf_embed::append_vector(&mut f, "not-a-node", &[0.5f64; 8]).unwrap();
+    drop(f);
+    let mut m2 = hf_embed::read_manifest(&cache2).unwrap();
+    m2.count += 1;
+    hf_embed::write_manifest(&cache2, &m2).unwrap();
+    let bad_cache = draw("b-cache", &split, &cache2, "L", "rotate", Some("6..11"));
+    // a part with one record cut from its labels stream
+    let cut = root.join("b-cut");
+    std::fs::create_dir_all(cut.join("queries")).unwrap();
+    for f in [
+        "visible.jsonl.gz",
+        "visible_h.jsonl.gz",
+        "queries/vectors.jsonl",
+        "queries/manifest.json",
+        "uncached_nodes.txt",
+        "deletions.manifest.json",
+    ] {
+        std::fs::copy(b.join(f), cut.join(f)).unwrap();
+    }
+    {
+        use std::io::Write;
+        let recs = gz_records(&b.join("labels.jsonl.gz"));
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(cut.join("labels.jsonl.gz")).unwrap(),
+            flate2::Compression::default(),
+        );
+        for r in &recs[1..] {
+            gz.write_all(&hf_core::canonical_bytes(r).unwrap()).unwrap();
+            gz.write_all(b"\n").unwrap();
+        }
+        gz.finish().unwrap();
+    }
+    for (k, (other, needle)) in [
+        (&bad_label, "draw_label"),
+        (&bad_rule, "per_start"),
+        (&bad_source, "source_visible_sha256"),
+        (&bad_cache, "cache_state"),
+        (&overlap, "overlap"),
+        (&gap, "leave a gap"),
+        (&no_ord, "without --source-ordinals"),
+        (&cut, "labels.jsonl.gz holds"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dest = root.join(format!("refused{k}"));
+        let out = merge(&[&a, other], &dest);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{needle}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(needle),
+            "{needle}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!dest.exists(), "{needle}: something was written");
+    }
+    assert_eq!(merge(&[&a], &root.join("lone")).status.code(), Some(2));
+    assert_eq!(
+        merge(&[&a, &b], &ok_dest).status.code(),
+        Some(2),
+        "an existing destination"
+    );
+}
+
+/// Another source split over the same graph (a larger ball).
+fn write_fixture_split_seeded(gdir: &Path, dest: &Path, screen: usize) {
+    let out = run(&[
+        "write",
+        "--family",
+        "fixture",
+        "--graph-dir",
+        gdir.to_str().unwrap(),
+        "--subgraph-size",
+        "80",
+        "--target-distance",
+        "3",
+        "--removal-level",
+        "2",
+        "--targets",
+        "1",
+        "--train",
+        "0",
+        "--screen",
+        &screen.to_string(),
+        "--chunk",
+        "3",
+        "--destination",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The source stream is read selectively (what keeps a chunk's memory to its
+/// own block — the whole TRAIN stream parsed was ~24.7 GB): a record outside
+/// `--source-ordinals` is never parsed, so a malformed one there does not
+/// stop the draw, while the same record inside the block does.
+#[test]
+fn records_outside_the_source_ordinals_are_not_parsed() {
+    let root = tmp("selective");
+    let (gdir, cache) = fixture_dirs(&root, &[]);
+    let pool = root.join("pool");
+    write_fixture_split(&gdir, &pool, 10);
+    let split = pool.join("screen");
+    doctor_visible(&split, |i, r| {
+        if i == 0 {
+            r["visible"]["nodes"] = "not a list".into();
+        }
+    });
+    let base = [
+        "--draw-label",
+        "L",
+        "--allowed-range",
+        "screen:0..",
+        "--threads",
+        "1",
+    ];
+    let with = |ord: &str, dest: &Path| {
+        let mut a = base.to_vec();
+        a.extend_from_slice(&["--source-ordinals", ord]);
+        deletions(&split, &gdir, &cache, dest, &a)
+    };
+    let out = with("5..9", &root.join("outside"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = with("0..4", &root.join("inside"));
+    assert_eq!(out.status.code(), Some(2));
+}
