@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+pub mod r1;
+
 use hf_core::HfError;
 use hf_walk::{
     DecisionBatch, DecisionItem, FeatureSet, RawV5, RelationalV6, RelationalV6K, RelationalV6Prev,
@@ -52,6 +54,11 @@ pub struct ModelConfig {
     pub zero_embedding_blocks: Vec<String>,
     #[serde(default = "default_score_chunk")]
     pub score_chunk: usize,
+    /// The R1 heads (`R1_HEAD_DESIGN.md` §8 ENG-2): `return_head` and
+    /// `rstop_head`, built after every other parameter. False — every config
+    /// written before the key existed — builds exactly today's model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub return_head: bool,
 }
 
 fn default_prior_scale() -> f64 {
@@ -242,6 +249,36 @@ impl Block {
     }
 }
 
+/// Which R1 heads a model carries. `from_config` is both or neither
+/// (`model.return_head`); `rstop_only` is `--trunk-plus-rstop`'s model: the
+/// stage-0 config unchanged plus `rstop_head` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct R1Heads {
+    pub return_head: bool,
+    pub rstop_head: bool,
+}
+
+impl R1Heads {
+    pub fn from_config(config: &ModelConfig) -> Self {
+        Self {
+            return_head: config.return_head,
+            rstop_head: config.return_head,
+        }
+    }
+
+    pub fn rstop_only() -> Self {
+        Self {
+            return_head: false,
+            rstop_head: true,
+        }
+    }
+}
+
+/// The parameter-name patterns of the R1 heads.
+pub const RETURN_HEAD_PATTERN: &str = "return_head.*";
+pub const RSTOP_HEAD_PATTERN: &str = "rstop_head.*";
+pub const R1_HEAD_PATTERNS: [&str; 2] = [RETURN_HEAD_PATTERN, RSTOP_HEAD_PATTERN];
+
 /// `RealWalkModel`.
 pub struct Model {
     pub vs: nn::VarStore,
@@ -258,6 +295,8 @@ pub struct Model {
     greedy_tau: Option<Tensor>,
     stop0: nn::Linear,
     stop2: nn::Linear,
+    return_head: Option<(nn::Linear, nn::Linear)>,
+    rstop_head: Option<(nn::Linear, nn::Linear)>,
     _device_probe: Tensor,
     cdim: i64,
     ctx_dim: i64,
@@ -270,6 +309,18 @@ pub struct Model {
 
 impl Model {
     pub fn new(config: ModelConfig, device: Device) -> Result<Self, HfError> {
+        let heads = R1Heads::from_config(&config);
+        Self::new_with_heads(config, device, heads)
+    }
+
+    /// The model with the R1 heads named by `heads`, created after every
+    /// other parameter so the existing parameters' initialisation, and so a
+    /// seed's trunk, is unchanged.
+    pub fn new_with_heads(
+        config: ModelConfig,
+        device: Device,
+        heads: R1Heads,
+    ) -> Result<Self, HfError> {
         let features = config.features()?;
         let edim = config.embedding_dimension as usize;
         let cdim = features.candidate_dim(edim) as i64;
@@ -360,6 +411,46 @@ impl Model {
             true,
         );
         let device_probe = p.zeros_no_train("_device_probe", &[1]);
+        // the R1 heads (`R1_HEAD_DESIGN.md` §3, §4): shaped like score_head
+        // and stop_head, over `[h ; 4 extras]` and `[rstop_row ; mean h ; max h]`
+        let return_head = if heads.return_head {
+            let width = hidden + hf_walk::RETURN_EXTRAS as i64;
+            Some((
+                torch_linear(
+                    &p / "return_head" / "0",
+                    width,
+                    config.score_hidden_dimension,
+                    true,
+                ),
+                torch_linear(
+                    &p / "return_head" / "2",
+                    config.score_hidden_dimension,
+                    1,
+                    true,
+                ),
+            ))
+        } else {
+            None
+        };
+        let rstop_head = if heads.rstop_head {
+            let width = hf_walk::RSTOP_ROW_DIM as i64 + 2 * hidden;
+            Some((
+                torch_linear(
+                    &p / "rstop_head" / "0",
+                    width,
+                    config.coverage_hidden_dimension,
+                    true,
+                ),
+                torch_linear(
+                    &p / "rstop_head" / "2",
+                    config.coverage_hidden_dimension,
+                    1,
+                    true,
+                ),
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             zero_blocks: config.zero_embedding_blocks.clone(),
             vs,
@@ -376,6 +467,8 @@ impl Model {
             greedy_tau,
             stop0,
             stop2,
+            return_head,
+            rstop_head,
             _device_probe: device_probe,
             cdim,
             ctx_dim,
@@ -449,6 +542,226 @@ impl Model {
     /// `score_decisions`: one padded batch → scores `[N, F]` and residuals `[N, F]`
     /// (`-inf` on padding); the residual equals the score without a prior.
     pub fn score_decisions(&self, items: &[&DecisionItem]) -> (Tensor, Tensor) {
+        let t = self.trunk(items);
+        self.score_from(&t)
+    }
+
+    /// `score_decisions` and, from the same forward pass, each item's final
+    /// hidden states over its valid candidates, mean-pooled and max-pooled:
+    /// `[N, 2H]`, detached (`R1_HEAD_DESIGN.md` §4 item 3).
+    pub fn score_decisions_with_hidden(&self, items: &[&DecisionItem]) -> (Tensor, Tensor, Tensor) {
+        let t = self.trunk(items);
+        let (scores, residuals) = self.score_from(&t);
+        let h = t.h.detach();
+        let pad = t.cmask.unsqueeze(-1); // [N, F, 1], true on padding
+        let valid = pad.logical_not().to_kind(Kind::Float);
+        let count = valid.sum_dim_intlist(1, false, Kind::Float).clamp_min(1.0); // [N, 1]
+        let mean = (&h * &valid).sum_dim_intlist(1, false, Kind::Float) / count;
+        let max = h
+            .masked_fill(&pad, f64::NEG_INFINITY)
+            .amax(1, false)
+            .nan_to_num(0.0, Some(0.0), Some(0.0));
+        (scores, residuals, Tensor::cat(&[mean, max], 1))
+    }
+
+    /// The trunk's final hidden states `[N, F, H]` over a padded batch of
+    /// items (the return items' `h_v`, §3), and the padding mask `[N, F]`.
+    pub fn hidden_states(&self, items: &[&DecisionItem]) -> (Tensor, Tensor) {
+        let t = self.trunk(items);
+        (t.h, t.cmask)
+    }
+
+    fn score_from(&self, t: &Trunk) -> (Tensor, Tensor) {
+        let head = self
+            .score2
+            .forward(&self.score0.forward(&t.h).gelu("none"))
+            .squeeze_dim(-1);
+        let scores = match &self.greedy_tau {
+            Some(tau) => &head + tau * t.cand.select(2, self.cosine_column),
+            None => head.shallow_clone(),
+        };
+        (
+            scores.masked_fill(&t.cmask, f64::NEG_INFINITY),
+            head.masked_fill(&t.cmask, f64::NEG_INFINITY),
+        )
+    }
+
+    /// `return_head` on `[n, H + 4]` rows (`[h_v ; extras]`) → `[n]` logits.
+    pub fn return_head_logits(&self, x: &Tensor) -> Result<Tensor, HfError> {
+        let (l0, l2) = self
+            .return_head
+            .as_ref()
+            .ok_or_else(|| HfError::Invalid("this model has no return_head".into()))?;
+        Ok(l2.forward(&l0.forward(x).gelu("none")).squeeze_dim(-1))
+    }
+
+    /// `rstop_head` on `[n, 11 + 2H]` rows → `[n]` logits.
+    pub fn rstop_head_logits(&self, x: &Tensor) -> Result<Tensor, HfError> {
+        let (l0, l2) = self
+            .rstop_head
+            .as_ref()
+            .ok_or_else(|| HfError::Invalid("this model has no rstop_head".into()))?;
+        Ok(l2.forward(&l0.forward(x).gelu("none")).squeeze_dim(-1))
+    }
+
+    /// `return_logits(item, extras)`: the trunk forward over the return
+    /// items, then `return_head` on `[h ; extras]`, one logit tensor per item
+    /// (its candidates' logits). The graph runs through the trunk, so a
+    /// gradient could reach it were it not frozen (ENG-2 test (d)).
+    pub fn return_logits(
+        &self,
+        items: &[&DecisionItem],
+        extras: &[&[f32]],
+    ) -> Result<Vec<Tensor>, HfError> {
+        let (h, _) = self.hidden_states(items);
+        let mut out = Vec::with_capacity(items.len());
+        for (k, (item, ex)) in items.iter().zip(extras).enumerate() {
+            let n = item.frontier_len as i64;
+            if ex.len() != item.frontier_len * hf_walk::RETURN_EXTRAS {
+                return Err(HfError::BandH(format!(
+                    "{} extras for {} candidates",
+                    ex.len(),
+                    item.frontier_len
+                )));
+            }
+            let hv = h.get(k as i64).narrow(0, 0, n);
+            let ext = Tensor::from_slice(ex)
+                .view([n, hf_walk::RETURN_EXTRAS as i64])
+                .to_device(self.device());
+            out.push(self.return_head_logits(&Tensor::cat(&[hv, ext], 1))?);
+        }
+        Ok(out)
+    }
+
+    /// Whether the model carries each R1 head.
+    pub fn r1_heads(&self) -> R1Heads {
+        R1Heads {
+            return_head: self.return_head.is_some(),
+            rstop_head: self.rstop_head.is_some(),
+        }
+    }
+
+    /// The hidden width `H`.
+    pub fn hidden_dimension(&self) -> i64 {
+        self.config.hidden_dimension
+    }
+
+    /// Load a safetensors checkpoint BY NAME, strictly: every tensor in the
+    /// file must be a model parameter of the same shape, unless its name
+    /// matches `extra_ok` (then it is read and ignored); every model
+    /// parameter absent from the file must match `missing_ok` (it keeps its
+    /// initialisation). Anything else is band H, and nothing is copied until
+    /// every check has passed. Returns the ignored names and the missing ones.
+    pub fn load_strict(
+        &mut self,
+        path: &Path,
+        missing_ok: &[&str],
+        extra_ok: &[&str],
+    ) -> Result<(Vec<String>, Vec<String>), HfError> {
+        let file: HashMap<String, Tensor> = Tensor::read_safetensors(path)
+            .map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?
+            .into_iter()
+            .collect();
+        let vars = self.vs.variables();
+        let mut ignored = Vec::new();
+        let mut missing = Vec::new();
+        let mut names: Vec<&String> = file.keys().collect();
+        names.sort();
+        for name in names {
+            match vars.get(name) {
+                Some(var) => {
+                    if var.size() != file[name].size() {
+                        return Err(HfError::BandH(format!(
+                            "{}: {name} has shape {:?}, the model's is {:?}",
+                            path.display(),
+                            file[name].size(),
+                            var.size()
+                        )));
+                    }
+                }
+                None if extra_ok.iter().any(|p| glob_match(p, name)) => ignored.push(name.clone()),
+                None => {
+                    return Err(HfError::BandH(format!(
+                        "{}: {name} is not a parameter of this model",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        let mut var_names: Vec<&String> = vars.keys().collect();
+        var_names.sort();
+        for name in var_names {
+            if !file.contains_key(name) {
+                if missing_ok.iter().any(|p| glob_match(p, name)) {
+                    missing.push(name.clone());
+                } else {
+                    return Err(HfError::BandH(format!(
+                        "{}: the checkpoint lacks {name}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        tch::no_grad(|| {
+            for (name, var) in &vars {
+                if let Some(src) = file.get(name) {
+                    let mut dst = var.shallow_clone();
+                    dst.copy_(&src.to_device(var.device()).to_kind(var.kind()));
+                }
+            }
+        });
+        Ok((ignored, missing))
+    }
+
+    /// `training.trainable`: every parameter whose name matches none of
+    /// `patterns` gets `requires_grad(false)`, so an optimiser built AFTER
+    /// this call never holds it (and never decays it). A pattern matching no
+    /// parameter is refused. Returns the trainable names, sorted.
+    pub fn freeze_except(&self, patterns: &[String]) -> Result<Vec<String>, HfError> {
+        let vars = self.vs.variables();
+        for p in patterns {
+            if !vars.keys().any(|n| glob_match(p, n)) {
+                return Err(HfError::Invalid(format!(
+                    "training.trainable: {p:?} matches no parameter"
+                )));
+            }
+        }
+        let mut kept = Vec::new();
+        for (name, var) in &vars {
+            let keep = patterns.iter().any(|p| glob_match(p, name));
+            let _ = var.set_requires_grad(keep);
+            if keep {
+                kept.push(name.clone());
+            }
+        }
+        kept.sort();
+        Ok(kept)
+    }
+
+    /// The parameter count of the tensors whose names match `patterns`.
+    pub fn parameter_count_matching(&self, patterns: &[&str]) -> i64 {
+        self.vs
+            .variables()
+            .iter()
+            .filter(|(n, _)| patterns.iter().any(|p| glob_match(p, n)))
+            .map(|(_, t)| t.numel() as i64)
+            .sum()
+    }
+
+    /// The names of the variables matching `patterns`, sorted: what a
+    /// `state_digest` exclusion list is built from.
+    pub fn names_matching(&self, patterns: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .vs
+            .variables()
+            .into_keys()
+            .filter(|n| patterns.iter().any(|p| glob_match(p, n)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn trunk(&self, items: &[&DecisionItem]) -> Trunk {
         let n = items.len() as i64;
         let f = items
             .iter()
@@ -552,18 +865,11 @@ impl Model {
         for block in &self.blocks {
             h = block.forward(&h, &ctx_h, &q, &pair_t, &ctx_mask_t);
         }
-        let head = self
-            .score2
-            .forward(&self.score0.forward(&h).gelu("none"))
-            .squeeze_dim(-1);
-        let scores = match &self.greedy_tau {
-            Some(tau) => &head + tau * cand_t.select(2, self.cosine_column),
-            None => head.shallow_clone(),
-        };
-        (
-            scores.masked_fill(&cmask_t, f64::NEG_INFINITY),
-            head.masked_fill(&cmask_t, f64::NEG_INFINITY),
-        )
+        Trunk {
+            h,
+            cand: cand_t,
+            cmask: cmask_t,
+        }
     }
 
     /// The stop head on `[N, 8]` rows → `[N]` logits.
@@ -635,6 +941,13 @@ impl Model {
     }
 }
 
+/// The trunk's output over one padded batch.
+struct Trunk {
+    h: Tensor,
+    cand: Tensor,
+    cmask: Tensor,
+}
+
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Float => "torch.float32",
@@ -678,31 +991,7 @@ impl Scorer for ModelScorer<'_> {
             return Ok(Scored::default());
         }
         let (s, r) = self.model.score_decisions(&items);
-        let s = s.to_device(Device::Cpu);
-        let r = r.to_device(Device::Cpu);
-        let f = s.size()[1] as usize;
-        let mut sv = vec![0f32; items.len() * f];
-        let mut rv = vec![0f32; items.len() * f];
-        s.copy_data(&mut sv, items.len() * f);
-        r.copy_data(&mut rv, items.len() * f);
-        let scores: Vec<Vec<f32>> = items
-            .iter()
-            .enumerate()
-            .map(|(k, it)| sv[k * f..k * f + it.frontier_len].to_vec())
-            .collect();
-        let residuals: Vec<Vec<f32>> = items
-            .iter()
-            .enumerate()
-            .map(|(k, it)| rv[k * f..k * f + it.frontier_len].to_vec())
-            .collect();
-        Ok(Scored {
-            scores,
-            residuals: if self.model.config.greedy_prior {
-                Some(residuals)
-            } else {
-                None
-            },
-        })
+        Ok(scored_rows(&items, &s, &r, self.model.config.greedy_prior))
     }
 
     fn stop_logits(&mut self, rows: &[[f32; STOP_DIM]]) -> Result<Vec<f32>, HfError> {
@@ -714,6 +1003,76 @@ impl Scorer for ModelScorer<'_> {
         }
         Ok(out)
     }
+
+    fn score_pooled(&mut self, batch: &DecisionBatch) -> Result<(Scored, Vec<Vec<f32>>), HfError> {
+        let _guard = tch::no_grad_guard();
+        let items: Vec<&DecisionItem> = batch.items.iter().collect();
+        if items.is_empty() {
+            return Ok((Scored::default(), Vec::new()));
+        }
+        let (s, r, pooled) = self.model.score_decisions_with_hidden(&items);
+        let scored = scored_rows(&items, &s, &r, self.model.config.greedy_prior);
+        Ok((scored, tensor_rows(&pooled)))
+    }
+
+    fn rstop_logits(&mut self, inputs: &[hf_walk::RstopInput]) -> Result<Vec<f32>, HfError> {
+        let _guard = tch::no_grad_guard();
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let width = hf_walk::RSTOP_ROW_DIM + 2 * self.model.hidden_dimension() as usize;
+        let flat: Vec<f32> = inputs.iter().flat_map(|i| i.flat()).collect();
+        if flat.len() != inputs.len() * width {
+            return Err(HfError::BandH(format!(
+                "rstop inputs are {} values for {} rows of {width}",
+                flat.len(),
+                inputs.len()
+            )));
+        }
+        let x = Tensor::from_slice(&flat)
+            .view([inputs.len() as i64, width as i64])
+            .to_device(self.model.device());
+        let t = self.model.rstop_head_logits(&x)?.to_device(Device::Cpu);
+        let mut out = vec![0f32; inputs.len()];
+        t.copy_data(&mut out, inputs.len());
+        Ok(out)
+    }
+}
+
+/// A `[N, F]` score and residual pair cut back to each item's frontier.
+fn scored_rows(items: &[&DecisionItem], s: &Tensor, r: &Tensor, with_prior: bool) -> Scored {
+    let s = s.to_device(Device::Cpu);
+    let r = r.to_device(Device::Cpu);
+    let f = s.size()[1] as usize;
+    let mut sv = vec![0f32; items.len() * f];
+    let mut rv = vec![0f32; items.len() * f];
+    s.copy_data(&mut sv, items.len() * f);
+    r.copy_data(&mut rv, items.len() * f);
+    let scores: Vec<Vec<f32>> = items
+        .iter()
+        .enumerate()
+        .map(|(k, it)| sv[k * f..k * f + it.frontier_len].to_vec())
+        .collect();
+    let residuals: Vec<Vec<f32>> = items
+        .iter()
+        .enumerate()
+        .map(|(k, it)| rv[k * f..k * f + it.frontier_len].to_vec())
+        .collect();
+    Scored {
+        scores,
+        residuals: if with_prior { Some(residuals) } else { None },
+    }
+}
+
+/// A `[N, W]` tensor as N rows of W f32s.
+pub fn tensor_rows(t: &Tensor) -> Vec<Vec<f32>> {
+    let t = t.detach().to_device(Device::Cpu).contiguous();
+    let (n, w) = (t.size()[0] as usize, t.size()[1] as usize);
+    let mut flat = vec![0f32; n * w];
+    if n * w > 0 {
+        t.copy_data(&mut flat, n * w);
+    }
+    flat.chunks(w.max(1)).take(n).map(|c| c.to_vec()).collect()
 }
 
 /// `walk_losses`' knobs.

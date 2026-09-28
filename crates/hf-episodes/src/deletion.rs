@@ -16,13 +16,18 @@
 //!   an orphan of the deletion.
 //! - The draw: per start, one X uniform over the candidates (`U`) and one per
 //!   degree stratum on `|T|` (`D1`–`D4`), each by
-//!   `hash_int([DRAW_LABEL, episode_id, tag]) % len(sorted candidates)`. A
+//!   `hash_int([label, episode_id, tag]) % len(sorted candidates)`. A
 //!   candidate is a node of the stored ball other than the start, with a
 //!   vector in the cache and a non-empty `T`; the ones with an empty `T` are
-//!   counted, not drawn.
-//! - The seed-selection reserve is refused before anything is computed: a
-//!   source id whose raw draw index is `>= 73,360` in `train` or `>= 4,105` in
-//!   `screen` (Cameron, 2026-09-25).
+//!   counted, not drawn. The label is declared by the caller ([`DrawSpec`]);
+//!   the premise's was [`DRAW_LABEL`].
+//! - [`PerStart::Rotate`] (the R1 head's TRAIN, `R1_HEAD_DESIGN.md` §8
+//!   ENG-1) keeps exactly one record per start: tag `DRAW_TAGS[ordinal mod
+//!   5]`, falling back to `U` when that tag has no candidate.
+//! - A source id outside the caller's declared raw-index ranges, or of an
+//!   undeclared split, is refused before anything is computed. The premise's
+//!   constants (`>= 73,360` in `train`, `>= 4,105` in `screen` refused,
+//!   Cameron 2026-09-25) are [`DrawSpec::premise`].
 //!
 //! Nothing here reads a hidden payload: the inputs are the graph, the source
 //! record's VISIBLE start and node list, the sampler block and the cache.
@@ -36,7 +41,8 @@ use serde_json::{json, Value};
 
 use crate::{hash_int, Sampler};
 
-/// The draw's hash domain, fixed by the plan.
+/// The premise's hash domain (`R1_PREMISE_PLAN.md`); a draw now declares its
+/// own ([`DrawSpec`]).
 pub const DRAW_LABEL: &str = "r1-premise-2026-09-25";
 /// Seed selection's reserved raw draw indices (Cameron, 2026-09-25).
 pub const RESERVED_TRAIN_FROM: u64 = 73_360;
@@ -93,6 +99,137 @@ pub fn refuse_reserved(episode_id: &str) -> Result<(), HfError> {
             "{episode_id}: screen raw index {i} is reserved for seed selection (>= {RESERVED_SCREEN_FROM})"
         ))),
         Some(_) => Ok(()),
+    }
+}
+
+/// One declared raw-index range of one split, BOTH ends inclusive; `hi:
+/// None` is open above. Written `split:lo..hi` or `split:lo..`, so the
+/// premise's `train:0..73359` admits 73,359 and refuses 73,360.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedRange {
+    pub split: &'static str,
+    pub lo: u64,
+    pub hi: Option<u64>,
+}
+
+impl AllowedRange {
+    pub fn parse(text: &str) -> Result<Self, HfError> {
+        let bad = || {
+            HfError::Invalid(format!(
+                "--allowed-range {text:?}: expected <train|screen>:<lo>..<hi> or <train|screen>:<lo>.. \
+                 (both ends inclusive)"
+            ))
+        };
+        let (split, range) = text.split_once(':').ok_or_else(bad)?;
+        let split = match split {
+            "train" => "train",
+            "screen" => "screen",
+            _ => return Err(bad()),
+        };
+        let (lo, hi) = range.split_once("..").ok_or_else(bad)?;
+        let lo: u64 = lo.parse().map_err(|_| bad())?;
+        let hi: Option<u64> = if hi.is_empty() {
+            None
+        } else {
+            Some(hi.parse().map_err(|_| bad())?)
+        };
+        if hi.is_some_and(|h| h < lo) {
+            return Err(bad());
+        }
+        Ok(Self { split, lo, hi })
+    }
+
+    pub fn contains(&self, split: &str, index: u64) -> bool {
+        split == self.split && index >= self.lo && self.hi.is_none_or(|h| index <= h)
+    }
+
+    /// The range as it is written on the command line and in a manifest.
+    pub fn label(&self) -> String {
+        match self.hi {
+            Some(h) => format!("{}:{}..{}", self.split, self.lo, h),
+            None => format!("{}:{}..", self.split, self.lo),
+        }
+    }
+}
+
+/// What a deletion draw declares: its hash label and the raw-index ranges its
+/// source ids must fall in (`R1_HEAD_DESIGN.md` §8 ENG-1).
+#[derive(Clone, Debug)]
+pub struct DrawSpec {
+    pub label: String,
+    pub ranges: Vec<AllowedRange>,
+}
+
+impl DrawSpec {
+    /// The premise's draw: its label and the complement of seed selection's
+    /// reserve, `train:0..73359` and `screen:0..4104`.
+    pub fn premise() -> Self {
+        Self {
+            label: DRAW_LABEL.to_string(),
+            ranges: vec![
+                AllowedRange {
+                    split: "train",
+                    lo: 0,
+                    hi: Some(RESERVED_TRAIN_FROM - 1),
+                },
+                AllowedRange {
+                    split: "screen",
+                    lo: 0,
+                    hi: Some(RESERVED_SCREEN_FROM - 1),
+                },
+            ],
+        }
+    }
+
+    /// Refuse an id whose raw index cannot be read, whose split no range
+    /// declares, or whose index lies outside every range of its split.
+    pub fn check(&self, episode_id: &str) -> Result<(), HfError> {
+        let Some((split, index)) = raw_index(episode_id) else {
+            return Err(HfError::Refused(format!(
+                "{episode_id}: no raw draw index can be read from this id, so the declared \
+                 ranges cannot be checked"
+            )));
+        };
+        if !self.ranges.iter().any(|r| r.split == split) {
+            return Err(HfError::Refused(format!(
+                "{episode_id}: split {split} is not declared by any --allowed-range"
+            )));
+        }
+        if !self.ranges.iter().any(|r| r.contains(split, index)) {
+            let declared: Vec<String> = self.ranges.iter().map(AllowedRange::label).collect();
+            return Err(HfError::Refused(format!(
+                "{episode_id}: {split} raw index {index} is outside the declared ranges {declared:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// How many records a start yields: `All` is one per distinct pick over the
+/// five tags (the premise); `Rotate` is exactly one, tag
+/// `DRAW_TAGS[ordinal mod 5]`, falling back to `U` when that tag is empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerStart {
+    All,
+    Rotate,
+}
+
+impl PerStart {
+    pub fn parse(s: &str) -> Result<Self, HfError> {
+        match s {
+            "all" => Ok(Self::All),
+            "rotate" => Ok(Self::Rotate),
+            other => Err(HfError::Invalid(format!(
+                "--per-start is all or rotate, not {other:?}"
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Rotate => "rotate",
+        }
     }
 }
 
@@ -324,6 +461,26 @@ pub struct StartDraws {
     pub start_isolated: usize,
     /// candidates per stratum, `U` excluded
     pub stratum_sizes: BTreeMap<&'static str, usize>,
+    /// Stored-ball nodes other than the start that the cache lacks: the X
+    /// candidates whose row is missing (listed for coverage, whether or not
+    /// they were counted out of the pool).
+    pub uncached_candidates: Vec<String>,
+    /// Under [`PerStart::Rotate`], the rotated tag that had no candidate and
+    /// fell back to `U`.
+    pub fallback: Option<&'static str>,
+}
+
+/// The per-start options of [`draw_for_start`].
+#[derive(Clone, Copy, Debug)]
+pub struct StartOptions<'a> {
+    pub spec: &'a DrawSpec,
+    pub per_start: PerStart,
+    /// The start's position in the source stream (the rotation's ordinal).
+    pub ordinal: usize,
+    /// Treat every candidate as if the cache held its row (`--coverage-only`:
+    /// the draw a fully covered cache would make, so one embedding pass
+    /// reaches the fixed point).
+    pub assume_covered: bool,
 }
 
 /// The draw for one start of a spent split (§3.3). `stored_names` is the
@@ -339,8 +496,9 @@ pub fn draw_for_start(
     stored_names: &[String],
     has_vector: &(dyn Fn(&str) -> bool + Sync),
     in_index: &InIndex,
+    options: StartOptions<'_>,
 ) -> Result<StartDraws, HfError> {
-    refuse_reserved(episode_id)?;
+    options.spec.check(episode_id)?;
     let start = graph
         .id(start_name)
         .ok_or_else(|| HfError::BandH(format!("{episode_id}: start {start_name} not in graph")))?;
@@ -373,12 +531,16 @@ pub fn draw_for_start(
     let mut without_vector = 0usize;
     let mut without_neighbour = 0usize;
     let mut start_isolated = 0usize;
+    let mut uncached_candidates = Vec::new();
     let start_tails = graph.out_neighbours(start);
     let mut pool: Vec<Deletion> = Vec::new();
     for (name, x) in &names {
         if !has_vector(name) {
-            without_vector += 1;
-            continue;
+            uncached_candidates.push(name.clone());
+            if !options.assume_covered {
+                without_vector += 1;
+                continue;
+            }
         }
         if start_tails.iter().all(|t| t == x) {
             start_isolated += 1;
@@ -393,18 +555,37 @@ pub fn draw_for_start(
     }
     let mut stratum_sizes: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut chosen: BTreeMap<NodeId, (Vec<&'static str>, usize)> = BTreeMap::new();
-    for tag in DRAW_TAGS {
-        let members: Vec<usize> = (0..pool.len())
+    let members_of = |tag: &str| -> Vec<usize> {
+        (0..pool.len())
             .filter(|i| tag == "U" || stratum(pool[*i].targets.len()) == Some(tag))
-            .collect();
+            .collect()
+    };
+    let label = options.spec.label.as_str();
+    for tag in DRAW_TAGS {
+        let members = members_of(tag);
         if tag != "U" {
             stratum_sizes.insert(tag, members.len());
         }
+    }
+    let mut fallback = None;
+    let tags: Vec<&'static str> = match options.per_start {
+        PerStart::All => DRAW_TAGS.to_vec(),
+        PerStart::Rotate => {
+            let tag = DRAW_TAGS[options.ordinal % DRAW_TAGS.len()];
+            if tag != "U" && members_of(tag).is_empty() {
+                fallback = Some(tag);
+                vec!["U"]
+            } else {
+                vec![tag]
+            }
+        }
+    };
+    for tag in tags {
+        let members = members_of(tag);
         if members.is_empty() {
             continue;
         }
-        let pick =
-            members[(hash_int(&[DRAW_LABEL, episode_id, tag]) % members.len() as u64) as usize];
+        let pick = members[(hash_int(&[label, episode_id, tag]) % members.len() as u64) as usize];
         chosen
             .entry(pool[pick].deleted)
             .or_insert_with(|| (Vec::new(), pick))
@@ -435,6 +616,8 @@ pub fn draw_for_start(
         without_vector,
         start_isolated,
         stratum_sizes,
+        uncached_candidates,
+        fallback,
     })
 }
 
@@ -548,6 +731,54 @@ mod tests {
         assert!(refuse_reserved("wikidata5m-train-073359-aa").is_ok());
         assert!(refuse_reserved("wikidata5m-train-073360-aa").is_err());
         assert!(refuse_reserved("no-index-here").is_err());
+    }
+
+    /// ENG-1 (b), the parser half: both ends inclusive, `lo..` open, a
+    /// reversed or malformed range refused; the premise's ranges are exactly
+    /// the complement of the old reserve.
+    #[test]
+    fn allowed_ranges_are_inclusive_and_the_premise_spec_is_the_old_reserve() {
+        let r = AllowedRange::parse("train:0..72452").unwrap();
+        assert!(r.contains("train", 0) && r.contains("train", 72452));
+        assert!(!r.contains("train", 72453) && !r.contains("screen", 5));
+        let open = AllowedRange::parse("screen:8214..").unwrap();
+        assert!(!open.contains("screen", 8213) && open.contains("screen", 8214));
+        assert!(open.contains("screen", 999_999));
+        assert_eq!(open.label(), "screen:8214..");
+        assert_eq!(r.label(), "train:0..72452");
+        for bad in [
+            "train:5..4",
+            "vault:0..1",
+            "train:0",
+            "train:a..b",
+            "0..1",
+            "train:..5",
+        ] {
+            assert!(AllowedRange::parse(bad).is_err(), "{bad}");
+        }
+        let premise = DrawSpec::premise();
+        for id in [
+            "wikidata5m-screen-004104-aa",
+            "wikidata5m-train-073359-aa",
+            "wikidata5m-train-000000-aa",
+        ] {
+            assert!(premise.check(id).is_ok(), "{id}");
+            assert!(refuse_reserved(id).is_ok(), "{id}");
+        }
+        for id in [
+            "wikidata5m-screen-004105-aa",
+            "wikidata5m-train-073360-aa",
+            "no-index-here",
+        ] {
+            assert!(premise.check(id).is_err(), "{id}");
+            assert!(refuse_reserved(id).is_err(), "{id}");
+        }
+        let train_only = DrawSpec {
+            label: "x".into(),
+            ranges: vec![AllowedRange::parse("train:76043..").unwrap()],
+        };
+        let e = train_only.check("wikidata5m-screen-009000-aa").unwrap_err();
+        assert!(e.to_string().contains("not declared"), "{e}");
     }
 
     #[test]

@@ -552,6 +552,100 @@ pub struct Scored {
 pub trait Scorer {
     fn score(&mut self, batch: &DecisionBatch) -> Result<Scored, HfError>;
     fn stop_logits(&mut self, rows: &[[f32; STOP_DIM]]) -> Result<Vec<f32>, HfError>;
+    /// `score`, and from the SAME forward pass each item's final hidden
+    /// states over its valid candidates, mean-pooled then max-pooled (`2H`
+    /// values per item): the R1 stop head's pooled input
+    /// (`R1_HEAD_DESIGN.md` §4). The scores must be bit-identical to `score`'s.
+    fn score_pooled(&mut self, batch: &DecisionBatch) -> Result<(Scored, Vec<Vec<f32>>), HfError> {
+        let _ = batch;
+        Err(HfError::Invalid(
+            "this scorer has no hidden states to pool (the R1 stop needs them)".into(),
+        ))
+    }
+    /// The R1 stop head (`rstop_head`) on its 523-wide inputs → one logit each.
+    fn rstop_logits(&mut self, inputs: &[RstopInput]) -> Result<Vec<f32>, HfError> {
+        let _ = inputs;
+        Err(HfError::Invalid("this scorer has no rstop_head".into()))
+    }
+}
+
+/// The widths of the R1 stop's own row: `stop_row`'s eight values, then
+/// `expansions / 80`, `|E| / 160` and `|frontier| / 160` (`R1_HEAD_DESIGN.md`
+/// §4 item 2), which do not saturate before the cap.
+pub const RSTOP_ROW_DIM: usize = STOP_DIM + 3;
+/// The return item's extras per candidate: `is_expanded`, `ordinal / 80`,
+/// `cos(v, q)`, `rank_E` (§3).
+pub const RETURN_EXTRAS: usize = 4;
+/// The normalisers of the R1 counts: the cap, and twice it.
+pub const R1_EXPANSION_NORM: f32 = 80.0;
+pub const R1_EXAMINED_NORM: f32 = 160.0;
+
+/// `rstop_row`: `stop_row` unchanged, then the three unsaturated counts.
+pub fn rstop_row(
+    stop: &[f32; STOP_DIM],
+    expansions: usize,
+    examined_set: usize,
+    frontier_size: usize,
+) -> [f32; RSTOP_ROW_DIM] {
+    let mut row = [0f32; RSTOP_ROW_DIM];
+    row[..STOP_DIM].copy_from_slice(stop);
+    row[STOP_DIM] = expansions as f32 / R1_EXPANSION_NORM;
+    row[STOP_DIM + 1] = examined_set as f32 / R1_EXAMINED_NORM;
+    row[STOP_DIM + 2] = frontier_size as f32 / R1_EXAMINED_NORM;
+    row
+}
+
+/// The R1 stop head's input at one snapshot decision: the row and the
+/// decision's pooled hidden states (`2H`), detached. `t` is the expansion
+/// count the decision was made at (before expansion `t + 1`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RstopInput {
+    pub t: usize,
+    pub row: [f32; RSTOP_ROW_DIM],
+    pub pooled: Vec<f32>,
+}
+
+impl RstopInput {
+    /// The flat `RSTOP_ROW_DIM + 2H` input, as the head reads it.
+    pub fn flat(&self) -> Vec<f32> {
+        let mut v = self.row.to_vec();
+        v.extend_from_slice(&self.pooled);
+        v
+    }
+}
+
+/// A return item (`R1_HEAD_DESIGN.md` §3) at one snapshot: the candidates
+/// `E_t ∖ {s}` — the expanded nodes in expansion order, then the frontier in
+/// insertion order — their decision item built by the walk's own feature set,
+/// and the four extras per candidate. `t` is the snapshot asked for; `t_eff`
+/// the expansion count it was taken at (smaller when the walk ended first).
+#[derive(Clone, Debug)]
+pub struct ReturnSnapshot {
+    pub t: usize,
+    pub t_eff: usize,
+    pub candidates: Vec<Local>,
+    pub item: DecisionItem,
+    pub extras: Vec<f32>,
+}
+
+/// What an R1 walk records beside its `WalkResult`.
+#[derive(Clone, Debug, Default)]
+pub struct R1Trace {
+    /// One per requested snapshot, in the order requested.
+    pub snapshots: Vec<ReturnSnapshot>,
+    /// The stop inputs at the requested decisions that were made (a walk
+    /// that ended first has none at the later ones).
+    pub rstop: Vec<RstopInput>,
+    /// `(t, logit)` wherever `StopRule::LearnedR1` consulted `rstop_head`.
+    pub rstop_logits: Vec<(usize, f32)>,
+}
+
+/// What an R1 walk records: return items at `return_at`, stop inputs at the
+/// decisions made at `rstop_at` expansions.
+#[derive(Clone, Debug, Default)]
+pub struct R1Options {
+    pub return_at: Vec<usize>,
+    pub rstop_at: Vec<usize>,
 }
 
 /// One recorded decision, for the gradient pass and the readers.
@@ -583,11 +677,20 @@ pub struct CandidateRecord {
     pub depths: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Exhaust` stops on registration or an empty frontier; `Learned` consults
+/// the stage-0 `stop_head` after every decision. `LearnedR1` is the R1 stop
+/// (`R1_HEAD_DESIGN.md` §4, ENG-3): it consults `rstop_head`, never
+/// `stop_head`, and ONLY at the decisions made at the `snapshots` expansion
+/// counts, stopping on `σ(logit) > theta`; otherwise it is `Exhaust`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StopRule {
     Exhaust,
     Learned,
+    LearnedR1 { theta: f64, snapshots: [usize; 4] },
 }
+
+/// The R1 stop's snapshots: before expansions 17, 33, 49 and 65.
+pub const R1_STOP_SNAPSHOTS: [usize; 4] = [16, 32, 48, 64];
 
 impl StopRule {
     pub fn parse(s: &str) -> Result<Self, HfError> {
@@ -596,6 +699,11 @@ impl StopRule {
             "learned" => Ok(Self::Learned),
             other => Err(HfError::Invalid(format!("unknown stop rule: {other}"))),
         }
+    }
+
+    /// `σ(logit) > theta`, in f64 over the f32 logit — the reader's rule.
+    pub fn r1_fires(logit: f32, theta: f64) -> bool {
+        1.0 / (1.0 + (-(logit as f64)).exp()) > theta
     }
 }
 
@@ -672,6 +780,10 @@ struct State<'a> {
     seen: HashSet<Local>,
     /// The discovery parent of every expanded node (the start has none).
     parent_of: HashMap<Local, Local>,
+    /// Each expanded node's frontier entry as it was pushed (parent, depth,
+    /// path mean), in expansion order, the start excluded: the return item's
+    /// rows for the expanded candidates.
+    expanded_entries: Vec<Entry>,
     frontier: Vec<Entry>,
     /// One flag per **registration** target (`K_TARGETS_DESIGN.md` §2: at
     /// stage 0 the mask comes from the visible side and the walk's own
@@ -701,6 +813,7 @@ impl<'a> State<'a> {
             expanded: Vec::new(),
             seen: HashSet::from([index.start]),
             parent_of: HashMap::new(),
+            expanded_entries: Vec::new(),
             frontier: Vec::new(),
             registered: vec![false; index.registration_targets().len()],
             registered_at_by_target: vec![None; index.registration_targets().len()],
@@ -830,6 +943,57 @@ impl<'a> State<'a> {
         }
     }
 
+    /// The return item of this instant (`R1_HEAD_DESIGN.md` §3).
+    fn return_snapshot(&self, features: &dyn FeatureSet, t: usize) -> ReturnSnapshot {
+        let mut entries: Vec<Entry> = self.expanded_entries.clone();
+        entries.extend(self.frontier.iter().cloned());
+        let mask = self.unregistered();
+        let visible = VisibleIndex::new(self.index, &mask);
+        let item = features.build(visible, &entries, &self.expanded, &self.parent_of);
+        let n = entries.len();
+        let cosines: Vec<f32> = entries
+            .iter()
+            .map(|e| visible.cos_query_max(self.index.emb(e.node)))
+            .collect();
+        // rank within E ∖ {s}, 0 = highest cosine, normalised: the builder's
+        // own rank rule (a stable sort on the cosine, descending)
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|a, b| {
+            cosines[*b]
+                .partial_cmp(&cosines[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut rank = vec![0f32; n];
+        for (r, i) in order.iter().enumerate() {
+            rank[*i] = if n > 1 {
+                r as f32 / (n - 1) as f32
+            } else {
+                0.0
+            };
+        }
+        let expanded_count = self.expanded_entries.len();
+        let mut extras = Vec::with_capacity(n * RETURN_EXTRAS);
+        for (i, _) in entries.iter().enumerate() {
+            let is_expanded = i < expanded_count;
+            // the start is ordinal 0 and never a candidate, so an expanded
+            // candidate's ordinal is its position in `expanded`
+            let ordinal = if is_expanded { i + 1 } else { 0 };
+            extras.extend_from_slice(&[
+                if is_expanded { 1.0 } else { 0.0 },
+                ordinal as f32 / R1_EXPANSION_NORM,
+                cosines[i],
+                rank[i],
+            ]);
+        }
+        ReturnSnapshot {
+            t,
+            t_eff: self.expanded.len(),
+            candidates: entries.iter().map(|e| e.node).collect(),
+            item,
+            extras,
+        }
+    }
+
     fn finish(self, with_prior: bool) -> WalkResult {
         WalkResult {
             expanded: self.expanded,
@@ -913,6 +1077,49 @@ pub fn walk_batch_capped(
     options: WalkOptions,
     max_expansions: Option<usize>,
 ) -> Result<Vec<WalkResult>, HfError> {
+    Ok(walk_batch_r1(
+        indexes,
+        features,
+        scorer,
+        options,
+        max_expansions,
+        &R1Options::default(),
+    )?
+    .into_iter()
+    .map(|(w, _)| w)
+    .collect())
+}
+
+/// [`walk_batch_capped`] that also records the R1 head's inputs
+/// (`R1_HEAD_DESIGN.md` §8 ENG-3): a return item at each expansion count in
+/// `r1.return_at` (and, for a count the walk never reaches, at its end), and
+/// the stop head's input at the decisions made at `r1.rstop_at` expansions.
+/// With an empty `r1` and any stop rule but `LearnedR1` it IS
+/// `walk_batch_capped`: the scorer is called exactly as before.
+pub fn walk_batch_r1(
+    indexes: &[&EpisodeIndex],
+    features: &dyn FeatureSet,
+    scorer: &mut dyn Scorer,
+    options: WalkOptions,
+    max_expansions: Option<usize>,
+    r1: &R1Options,
+) -> Result<Vec<(WalkResult, R1Trace)>, HfError> {
+    let r1_active = !r1.return_at.is_empty()
+        || !r1.rstop_at.is_empty()
+        || matches!(options.stop_rule, StopRule::LearnedR1 { .. });
+    if r1_active && features.embeds_query_vector() {
+        return Err(HfError::Refused(format!(
+            "the R1 head reads a relational feature set; {:?} copies raw coordinates",
+            features.name()
+        )));
+    }
+    if let StopRule::LearnedR1 { theta, .. } = options.stop_rule {
+        if !(0.0..1.0).contains(&theta) {
+            return Err(HfError::Invalid(format!(
+                "the R1 stop threshold is a probability in [0, 1), not {theta}"
+            )));
+        }
+    }
     if max_expansions == Some(0) {
         return Err(HfError::Invalid(
             "an expansion cap counts the start, so it is at least 1".into(),
@@ -955,6 +1162,21 @@ pub fn walk_batch_capped(
         .iter()
         .map(|i| State::new(i, options.record_candidates))
         .collect();
+    let mut traces: Vec<R1Trace> = indexes.iter().map(|_| R1Trace::default()).collect();
+    let stop_snapshots: &[usize] = match &options.stop_rule {
+        StopRule::LearnedR1 { snapshots, .. } => snapshots,
+        _ => &[],
+    };
+    // a snapshot is taken when the expansion count reaches a requested t
+    let snapshot_now = |s: &State, trace: &mut R1Trace| {
+        let t = s.expanded.len();
+        if r1.return_at.contains(&t) && !trace.snapshots.iter().any(|x| x.t == t) {
+            trace.snapshots.push(s.return_snapshot(features, t));
+        }
+    };
+    for (s, trace) in states.iter().zip(traces.iter_mut()) {
+        snapshot_now(s, trace);
+    }
     let cap_reached = |s: &mut State| {
         if s.live && max_expansions.is_some_and(|cap| s.expanded.len() >= cap) {
             s.stop_reason = "expansion_cap";
@@ -997,7 +1219,25 @@ pub fn walk_batch_capped(
         let batch = DecisionBatch {
             items: items.iter().map(|(it, _)| it.clone()).collect(),
         };
-        let scored = scorer.score(&batch)?;
+        // the pooled hidden states are asked for only at a decision the R1
+        // stop reads; every other call is the plain `score` it always was
+        let wants_pooled = |i: usize| {
+            let t = states[i].expanded.len();
+            r1.rstop_at.contains(&t) || stop_snapshots.contains(&t)
+        };
+        let (scored, pooled) = if live.iter().any(|&i| wants_pooled(i)) {
+            let (scored, pooled) = scorer.score_pooled(&batch)?;
+            if pooled.len() != live.len() {
+                return Err(HfError::BandH(format!(
+                    "the scorer pooled {} rows for {} decisions",
+                    pooled.len(),
+                    live.len()
+                )));
+            }
+            (scored, Some(pooled))
+        } else {
+            (scorer.score(&batch)?, None)
+        };
         if scored.scores.len() != live.len() {
             return Err(HfError::BandH(format!(
                 "the scorer returned {} rows for {} decisions",
@@ -1006,6 +1246,7 @@ pub fn walk_batch_capped(
             )));
         }
         let mut stop_rows: Vec<(usize, [f32; STOP_DIM])> = Vec::new();
+        let mut r1_rows: Vec<(usize, RstopInput)> = Vec::new();
         for (k, &i) in live.iter().enumerate() {
             let (item, cosines) = &items[k];
             let s = &mut states[i];
@@ -1072,6 +1313,22 @@ pub fn walk_batch_capped(
             if options.stop_rule == StopRule::Learned {
                 stop_rows.push((i, stop_features));
             }
+            if let Some(pooled) = &pooled {
+                let t = s.expanded.len();
+                if r1.rstop_at.contains(&t) || stop_snapshots.contains(&t) {
+                    let input = RstopInput {
+                        t,
+                        row: rstop_row(&stop_features, t, s.seen.len(), n),
+                        pooled: pooled[k].clone(),
+                    };
+                    if stop_snapshots.contains(&t) {
+                        r1_rows.push((i, input.clone()));
+                    }
+                    if r1.rstop_at.contains(&t) {
+                        traces[i].rstop.push(input);
+                    }
+                }
+            }
         }
         // the learned stop rule consults the stop head before expanding
         let mut stopped: HashSet<usize> = HashSet::new();
@@ -1084,6 +1341,27 @@ pub fn walk_batch_capped(
                 }
             }
         }
+        // the R1 stop consults rstop_head, at its snapshots only
+        let mut r1_stopped: HashSet<usize> = HashSet::new();
+        if let StopRule::LearnedR1 { theta, .. } = options.stop_rule {
+            if !r1_rows.is_empty() {
+                let inputs: Vec<RstopInput> = r1_rows.iter().map(|(_, r)| r.clone()).collect();
+                let logits = scorer.rstop_logits(&inputs)?;
+                if logits.len() != inputs.len() {
+                    return Err(HfError::BandH(format!(
+                        "the scorer returned {} rstop logits for {} inputs",
+                        logits.len(),
+                        inputs.len()
+                    )));
+                }
+                for ((i, input), logit) in r1_rows.iter().zip(logits) {
+                    traces[*i].rstop_logits.push((input.t, logit));
+                    if StopRule::r1_fires(logit, theta) {
+                        r1_stopped.insert(*i);
+                    }
+                }
+            }
+        }
         for &i in &live {
             let s = &mut states[i];
             if stopped.contains(&i) {
@@ -1091,23 +1369,39 @@ pub fn walk_batch_capped(
                 s.live = false;
                 continue;
             }
+            if r1_stopped.contains(&i) {
+                s.stop_reason = "learned_r1_stop";
+                s.live = false;
+                continue;
+            }
             let chosen = s.decisions.last().unwrap().chosen;
-            let Entry {
-                node,
-                parent,
-                depth,
-                path_mean,
-            } = s.frontier.remove(chosen);
+            let entry = s.frontier.remove(chosen);
+            let (node, parent, depth) = (entry.node, entry.parent, entry.depth);
             s.parent_of.insert(node, parent);
             s.expanded.push(node);
-            s.push_children(node, depth, &path_mean);
+            s.push_children(node, depth, &entry.path_mean);
+            if r1_active {
+                s.expanded_entries.push(entry);
+            }
             s.check_registered();
+            snapshot_now(s, &mut traces[i]);
             cap_reached(s);
         }
     }
+    // a requested snapshot the walk never reached is taken at its end
+    for (s, trace) in states.iter().zip(traces.iter_mut()) {
+        for &t in &r1.return_at {
+            if !trace.snapshots.iter().any(|x| x.t == t) {
+                trace.snapshots.push(s.return_snapshot(features, t));
+            }
+        }
+        let order = |t: usize| r1.return_at.iter().position(|x| *x == t);
+        trace.snapshots.sort_by_key(|x| order(x.t));
+    }
     Ok(states
         .into_iter()
-        .map(|s| s.finish(options.with_prior))
+        .zip(traces)
+        .map(|(s, trace)| (s.finish(options.with_prior), trace))
         .collect())
 }
 

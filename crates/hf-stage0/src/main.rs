@@ -29,6 +29,7 @@
 mod data;
 mod eval;
 mod probe;
+mod r1;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -37,7 +38,10 @@ use std::time::Instant;
 
 use clap::Parser;
 use hf_core::{HfError, PyRandom, PyRandomState};
-use hf_model::{clip_grad_norm, walk_losses, AdamW, LossConfig, Model, ModelConfig, ModelScorer};
+use hf_model::{
+    clip_grad_norm, walk_losses, AdamW, LossConfig, Model, ModelConfig, ModelScorer, R1Heads,
+    R1_HEAD_PATTERNS, RETURN_HEAD_PATTERN, RSTOP_HEAD_PATTERN,
+};
 use hf_walk::{walk_batch, EpisodeIndex, StopRule, WalkOptions};
 use serde_json::{json, Map, Value};
 use tch::Device;
@@ -172,6 +176,50 @@ struct Args {
     /// walk only the first N records (0 = all): the plan's 50-episode timing run
     #[arg(long, default_value_t = 0)]
     probe_limit: usize,
+    /// R1 head, ENG-7 (`R1_HEAD_DESIGN.md` §8): walk every record of the
+    /// deletion split in DIR to the cap with the `--init-from` trunk, frozen,
+    /// and write the f32 walk cache to `--output`. Never opens the labels.
+    #[arg(long, value_name = "DIR")]
+    r1_cache: Option<PathBuf>,
+    /// R1 head, ENG-4: train the return and stop heads from the cache in
+    /// CACHE ONLY (it never walks), on the `--init-from` trunk, frozen
+    #[arg(long, value_name = "CACHE")]
+    r1_train: Option<PathBuf>,
+    /// R1 head, ENG-4: write the `--reevaluate-checkpoint` R1 checkpoint's
+    /// logits over the cache in CACHE to `r1_rows.jsonl`; never opens labels
+    #[arg(long, value_name = "CACHE")]
+    r1_eval: Option<PathBuf>,
+    /// R1 head, ENG-4: compare every frozen parameter of the R1 checkpoint
+    /// R1CKPT with `--init-from`'s, writing `frozen_check.json`
+    #[arg(long, value_name = "R1CKPT")]
+    frozen_check: Option<PathBuf>,
+    /// R1 head, ENG-7 (a) as an operator line: recompute the cache in CACHE
+    /// on this device with its own batching and compare every value bit for
+    /// bit, writing `cache_verify.json`; a mismatch is band H
+    #[arg(long, value_name = "CACHE")]
+    r1_cache_verify: Option<PathBuf>,
+    /// the stage-0 checkpoint whose trunk an R1 path loads (strictly, by
+    /// name; only the R1 heads may be absent from it)
+    #[arg(long, value_name = "CKPT")]
+    init_from: Option<PathBuf>,
+    /// with --reevaluate-checkpoint: load an R1 checkpoint into the head-less
+    /// stage-0 config, ignoring exactly its return_head.* and rstop_head.*
+    /// tensors (the traversal regression)
+    #[arg(long, conflicts_with = "trunk_plus_rstop")]
+    trunk_only: bool,
+    /// with --reevaluate-checkpoint and --stop-rule learned-r1: load an R1
+    /// checkpoint into the stage-0 config plus rstop_head (return_head.* is
+    /// ignored), for the learned stop's share on stage-0 episodes
+    #[arg(long)]
+    trunk_plus_rstop: bool,
+    /// `learned-r1`: consult rstop_head at the snapshots 16, 32, 48 and 64 of
+    /// an extra stage-0 walk (`r1_stop_rows.jsonl`); the stage-0 `learned`
+    /// rule every evaluation runs is unchanged
+    #[arg(long, value_parser = ["learned-r1"])]
+    stop_rule: Option<String>,
+    /// the R1 stop's threshold: stop where sigmoid(rstop logit) > THETA
+    #[arg(long, value_name = "THETA")]
+    stop_theta: Option<f64>,
 }
 
 fn foundation_root(args: &Args) -> PathBuf {
@@ -475,6 +523,17 @@ fn main() {
         }
         return;
     }
+    if args.r1_cache.is_some()
+        || args.r1_train.is_some()
+        || args.r1_eval.is_some()
+        || args.frozen_check.is_some()
+        || args.r1_cache_verify.is_some()
+    {
+        if let Err(e) = run_r1(&args) {
+            hf_core::exit_with("hf-stage0", &e);
+        }
+        return;
+    }
     if let Err(e) = run(args) {
         hf_core::exit_with("hf-stage0", &e);
     }
@@ -525,6 +584,168 @@ fn run_probe(args: &Args) -> Result<(), HfError> {
         }),
         evidence: !args.fixture,
     })
+}
+
+/// The R1 head's paths (`R1_HEAD_DESIGN.md` §8 ENG-4, ENG-7): governance as
+/// a run's, then exactly one of `--r1-cache`, `--r1-train`, `--r1-eval`,
+/// `--frozen-check`.
+fn run_r1(args: &Args) -> Result<(), HfError> {
+    let modes = [
+        args.r1_cache.is_some(),
+        args.r1_train.is_some(),
+        args.r1_eval.is_some(),
+        args.frozen_check.is_some(),
+        args.r1_cache_verify.is_some(),
+    ];
+    if modes.iter().filter(|m| **m).count() != 1 {
+        return Err(HfError::Invalid(
+            "exactly one of --r1-cache, --r1-train, --r1-eval, --frozen-check, \
+             --r1-cache-verify"
+                .into(),
+        ));
+    }
+    // a deletion episode's query is a deleted payload: it never meets a
+    // stage-0 split, a vault, a screen2 or the probe
+    if !args.splits_dir.is_empty()
+        || args.screen2_splits_dir.is_some()
+        || args.heldout_splits_dir.is_some()
+        || args.heldout_family.is_some()
+        || args.heldout_embeddings_dir.is_some()
+        || args.deletion_probe.is_some()
+        || args.query_embeddings_dir.is_some()
+    {
+        return Err(HfError::Refused(
+            "an R1 path reads deletion episodes (query_source deleted_payload) and takes no \
+             stage-0 split, screen2, vault or query sidecar"
+                .into(),
+        ));
+    }
+    if args.trunk_only || args.trunk_plus_rstop || args.stop_rule.is_some() {
+        return Err(HfError::Invalid(
+            "--trunk-only, --trunk-plus-rstop and --stop-rule are stage-0 re-evaluation flags"
+                .into(),
+        ));
+    }
+    let output = args.output.clone().expect("required");
+    let config_path = args.config.clone().expect("required");
+    for p in [&output, &config_path] {
+        hf_core::refuse_holdout(p)?;
+    }
+    let foundation = foundation_root(args);
+    let engine_head = data::engine_head();
+    preflight(args, &foundation, &engine_head)?;
+    let config = data::read_json(&config_path)?;
+    if config.get("training_authorized") != Some(&Value::Bool(false)) {
+        return Err(HfError::Refused(
+            "an R1 config must state training_authorized: false".into(),
+        ));
+    }
+    let device = if tch::Cuda::is_available() && !args.fixture {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
+    let provenance = || r1::Provenance {
+        value: json!({
+            "git_head": data::git_head(&foundation),
+            "preregistration_commit": args.preregistration_commit,
+            "engine_stale_allowed": args.allow_stale_engine,
+            "fixture": args.fixture,
+        }),
+        evidence: !args.fixture,
+    };
+    let need_init = || {
+        args.init_from
+            .clone()
+            .ok_or_else(|| HfError::Invalid("an R1 path needs --init-from".into()))
+    };
+    let model_seed = args.model_seed.expect("required");
+    if let Some(dir) = &args.r1_cache {
+        let embeddings_dir = args
+            .embeddings_dir
+            .clone()
+            .ok_or_else(|| HfError::Invalid("--r1-cache needs --embeddings-dir".into()))?;
+        if args.deterministic && std::env::var_os("CUBLAS_WORKSPACE_CONFIG").is_none() {
+            std::env::set_var("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+        }
+        return r1::build_cache(r1::CacheArgs {
+            deletion_dir: dir,
+            config: &config,
+            config_path: &config_path,
+            init: &need_init()?,
+            embeddings_dir: &embeddings_dir,
+            output: &output,
+            model_seed,
+            device,
+            deterministic: args.deterministic,
+            provenance: provenance(),
+        });
+    }
+    if let Some(cache) = &args.r1_train {
+        return r1::train(r1::TrainArgs {
+            cache_dir: cache,
+            config: &config,
+            init: &need_init()?,
+            output: &output,
+            model_seed,
+            updates: args.updates,
+            device,
+            fixture: args.fixture,
+            provenance: provenance(),
+        });
+    }
+    if let Some(cache) = &args.r1_eval {
+        let checkpoint = args.reevaluate_checkpoint.clone().ok_or_else(|| {
+            HfError::Invalid("--r1-eval needs the R1 checkpoint as --reevaluate-checkpoint".into())
+        })?;
+        return r1::eval(r1::EvalArgs {
+            cache_dir: cache,
+            config: &config,
+            checkpoint: &checkpoint,
+            output: &output,
+            device,
+            fixture: args.fixture,
+            provenance: provenance(),
+        });
+    }
+    if let Some(cache) = &args.r1_cache_verify {
+        let embeddings_dir = args
+            .embeddings_dir
+            .clone()
+            .ok_or_else(|| HfError::Invalid("--r1-cache-verify needs --embeddings-dir".into()))?;
+        if args.deterministic && std::env::var_os("CUBLAS_WORKSPACE_CONFIG").is_none() {
+            std::env::set_var("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+        }
+        let ok = r1::verify_cache(r1::VerifyArgs {
+            cache_dir: cache,
+            config: &config,
+            init: &need_init()?,
+            embeddings_dir: &embeddings_dir,
+            output: &output,
+            device,
+            provenance: provenance(),
+        })?;
+        if !ok {
+            return Err(HfError::BandH(
+                "the cache differs from the on-the-fly computation (cache_verify.json)".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let checkpoint = args.frozen_check.clone().expect("the one mode left");
+    // the model is built at the node cache's width, which the relational
+    // feature sets never read but the config's model block is keyed by
+    let emb = args.embeddings_dir.clone().ok_or_else(|| {
+        HfError::Invalid("--frozen-check needs --embeddings-dir (for the width)".into())
+    })?;
+    hf_core::refuse_holdout(&emb)?;
+    let dim = hf_embed::read_manifest(&emb)?.dimension as i64;
+    if !r1::frozen_check(&config, &checkpoint, &need_init()?, &output, dim)? {
+        return Err(HfError::BandH(
+            "frozen_check: a frozen parameter differs from the init checkpoint".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn run(args: Args) -> Result<(), HfError> {
@@ -631,13 +852,26 @@ fn run(args: Args) -> Result<(), HfError> {
     };
     let d = data::load(&inputs, &config)?;
     let model_config = ModelConfig::from_value(&config["model"], d.dim as i64)?;
+    if model_config.return_head {
+        return Err(HfError::Refused(
+            "a stage-0 run takes a head-less config; the R1 heads train by --r1-train".into(),
+        ));
+    }
     let model_config_value = {
         let mut m = config["model"].as_object().cloned().unwrap_or_default();
         m.insert("embedding_dimension".into(), d.dim.into());
         json!({"model": m})
     };
-    let mut model = Model::new(model_config.clone(), device)?;
-    let capacity = model.trainable_parameter_count();
+    // `--trunk-plus-rstop` adds rstop_head alone to the stage-0 model; its
+    // capacity is then checked on the trunk, the head counted beside
+    let heads = if args.trunk_plus_rstop {
+        R1Heads::rstop_only()
+    } else {
+        R1Heads::from_config(&model_config)
+    };
+    let mut model = Model::new_with_heads(model_config.clone(), device, heads)?;
+    let capacity =
+        model.trainable_parameter_count() - model.parameter_count_matching(&[RSTOP_HEAD_PATTERN]);
     if let Some(stated) = config["model"]
         .get("stated_capacity")
         .and_then(|s| s.get(d.dim.to_string()))
@@ -649,6 +883,44 @@ fn run(args: Args) -> Result<(), HfError> {
             )));
         }
     }
+    if args.init_from.is_some() {
+        return Err(HfError::Invalid(
+            "--init-from belongs to the R1 paths (--r1-cache, --r1-train, --frozen-check)".into(),
+        ));
+    }
+    match (
+        args.trunk_plus_rstop,
+        args.stop_rule.as_deref(),
+        args.stop_theta,
+    ) {
+        (true, Some("learned-r1"), Some(theta)) if (0.0..1.0).contains(&theta) => {}
+        (true, Some("learned-r1"), _) => {
+            return Err(HfError::Invalid(
+                "--stop-rule learned-r1 needs --stop-theta in [0, 1)".into(),
+            ))
+        }
+        (true, _, _) => {
+            return Err(HfError::Refused(
+                "--trunk-plus-rstop without --stop-rule learned-r1 would be inert".into(),
+            ))
+        }
+        (false, Some(_), _) => {
+            return Err(HfError::Refused(format!(
+                "--stop-rule learned-r1 reads rstop_head, which only --trunk-plus-rstop loads{}",
+                if args.trunk_only {
+                    " (--trunk-only ignores it)"
+                } else {
+                    ""
+                }
+            )))
+        }
+        (false, None, Some(_)) => {
+            return Err(HfError::Invalid(
+                "--stop-theta needs --stop-rule learned-r1".into(),
+            ))
+        }
+        (false, None, None) => {}
+    }
     for (flag, set) in [
         ("--override-greedy-tau", args.override_greedy_tau.is_some()),
         ("--train-sample", args.train_sample > 0),
@@ -657,6 +929,8 @@ fn run(args: Args) -> Result<(), HfError> {
             "--ablate-embedding-blocks",
             args.ablate_embedding_blocks.is_some(),
         ),
+        ("--trunk-only", args.trunk_only),
+        ("--trunk-plus-rstop", args.trunk_plus_rstop),
     ] {
         if set && args.reevaluate_checkpoint.is_none() {
             return Err(HfError::Invalid(format!(
@@ -718,10 +992,41 @@ fn reevaluate(
     let ck = locate_checkpoint(ck_path)?;
     let (weights, _, meta_path) = ck.paths();
     let saved = data::read_json(&meta_path)?;
-    model
-        .vs
-        .load(&weights)
-        .map_err(|e| HfError::Invalid(format!("{}: {e}", weights.display())))?;
+    // strictly by name: a checkpoint tensor the model lacks is band H unless
+    // a flag names it — `--trunk-only` ignores exactly the R1 heads, and
+    // `--trunk-plus-rstop` ignores exactly return_head (rstop_head loads)
+    let extra_ok: &[&str] = if args.trunk_only {
+        &R1_HEAD_PATTERNS
+    } else if args.trunk_plus_rstop {
+        &[RETURN_HEAD_PATTERN]
+    } else {
+        &[]
+    };
+    if args.trunk_only || args.trunk_plus_rstop {
+        let strip = |v: &Value| -> Value {
+            let mut m = v.as_object().cloned().unwrap_or_default();
+            for k in [
+                "note",
+                "stated_capacity",
+                "return_head",
+                "embedding_dimension",
+            ] {
+                m.remove(k);
+            }
+            Value::Object(m)
+        };
+        if strip(&saved["config"]["model"]) != strip(&config["model"]) {
+            return Err(HfError::BandH(format!(
+                "the checkpoint's model config, less return_head, is not this config's model: {} \
+                 against {}",
+                strip(&saved["config"]["model"]),
+                strip(&config["model"])
+            )));
+        }
+    }
+    let (ignored, _) = model.load_strict(&weights, &[], extra_ok)?;
+    let (_, checkpoint_sha256) =
+        hf_core::sha256_file(&weights).map_err(|e| HfError::Invalid(e.to_string()))?;
     let mut ablation = Value::Null;
     if let Some(spec) = &args.ablate_embedding_blocks {
         let mut names: Vec<String> = spec
@@ -795,6 +1100,12 @@ fn reevaluate(
             .output
             .as_ref()
             .expect("required")
+            .join(eval::R1_STOP_ROWS)
+            .exists()
+        || args
+            .output
+            .as_ref()
+            .expect("required")
             .join("candidate_dump.jsonl.gz")
             .exists()
     {
@@ -804,6 +1115,7 @@ fn reevaluate(
         )));
     }
     let update = Value::from("reeval");
+    let r1_stop: std::cell::RefCell<serde_json::Map<String, Value>> = Default::default();
     let evaluate_split = |split: &str,
                           episodes: &[hf_io::RealEpisode],
                           emb: &hf_embed::EmbeddingMatrix|
@@ -822,6 +1134,12 @@ fn reevaluate(
             &update,
             &ev.rows,
         )?;
+        if let (true, Some(theta)) = (args.trunk_plus_rstop, args.stop_theta) {
+            let (rows, summary) =
+                eval::evaluate_r1_stop(model, episodes, emb, d.dim, d.query_vectors(), theta)?;
+            eval::write_r1_stop_rows(args.output.as_ref().expect("required"), split, &rows)?;
+            r1_stop.borrow_mut().insert(split.to_string(), summary);
+        }
         if args.dump_candidates {
             eval::write_candidate_dump(
                 args.output.as_ref().expect("required"),
@@ -954,6 +1272,22 @@ fn reevaluate(
         "evaluation_heldout": report_heldout,
         "greedy_tau": greedy_tau,
         "ablation": ablation,
+        "checkpoint_sha256": checkpoint_sha256,
+        "trunk_only": args.trunk_only,
+        "rstop_loaded": args.trunk_plus_rstop,
+        "ignored_tensors": ignored,
+        "r1_stop": if args.trunk_plus_rstop {
+            json!({
+                "stop_rule": "learned-r1",
+                "stop_theta": args.stop_theta,
+                "snapshots": hf_walk::R1_STOP_SNAPSHOTS,
+                "rstop_head_parameters": model.parameter_count_matching(&[RSTOP_HEAD_PATTERN]),
+                "capacity_trunk_plus_rstop": model.trainable_parameter_count(),
+                "splits": Value::Object(r1_stop.borrow().clone()),
+            })
+        } else {
+            Value::Null
+        },
         "deterministic": deterministic,
         "screen2_episodes": d.screen2.len(),
         "screen2_skip": if d.screen2.is_empty() { Value::Null } else { Value::from(args.screen2_skip) },

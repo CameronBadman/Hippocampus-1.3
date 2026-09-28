@@ -470,6 +470,121 @@ pub fn write_evaluation_rows(
     file.flush().map_err(|e| HfError::Invalid(e.to_string()))
 }
 
+/// The R1 stop's stage-0 rows (`R1_HEAD_DESIGN.md` §8 ENG-4, `--trunk-plus-rstop
+/// --stop-rule learned-r1`), kept apart from `evaluation_rows.jsonl`, whose
+/// rows — the `learned` rule on the old stop_head included — are unchanged.
+pub const R1_STOP_ROWS: &str = "r1_stop_rows.jsonl";
+
+/// The per-episode reading of a `learned-r1` stage-0 walk:
+/// `stopped_before_registration` — the R1 stop ended the walk, which it can
+/// only do while the target is unregistered (a decision is made only on a
+/// live walk, and registration ends it); `unregistered_at_16` — the target
+/// had not registered within the first 16 expansions, the only walks on
+/// which the stop's first snapshot is ever consulted.
+pub fn r1_stop_fields(w: &WalkResult) -> (bool, bool) {
+    let stopped = w.stop_reason == "learned_r1_stop";
+    let unregistered_at_16 = w.registered_at.is_none_or(|r| r > 16);
+    (stopped, unregistered_at_16)
+}
+
+/// The stage-0 walk under `StopRule::LearnedR1` (rstop_head at snapshots 16,
+/// 32, 48 and 64, stopping on σ > θ), one row per episode, and the split's
+/// summary: the share of episodes the stop ended before registration, and the
+/// count still unregistered at 16 expansions beside it.
+pub fn evaluate_r1_stop(
+    model: &Model,
+    episodes: &[hf_io::RealEpisode],
+    embeddings: &hf_embed::EmbeddingMatrix,
+    dim: usize,
+    queries: QueryVectors<'_>,
+    theta: f64,
+) -> Result<(Vec<Value>, Value), HfError> {
+    let features = model.features();
+    let mut rows = Vec::with_capacity(episodes.len());
+    let (mut stopped, mut unregistered) = (0usize, 0usize);
+    for chunk in episodes.chunks(EVAL_BATCH) {
+        let indexes: Vec<EpisodeIndex> = chunk
+            .iter()
+            .map(|e| EpisodeIndex::new_with_query(e, embeddings, dim, queries))
+            .collect::<Result<_, _>>()?;
+        let refs: Vec<&EpisodeIndex> = indexes.iter().collect();
+        let mut scorer = ModelScorer { model };
+        let walked = hf_walk::walk_batch_r1(
+            &refs,
+            features.as_ref(),
+            &mut scorer,
+            WalkOptions {
+                stop_rule: StopRule::LearnedR1 {
+                    theta,
+                    snapshots: hf_walk::R1_STOP_SNAPSHOTS,
+                },
+                record_candidates: false,
+                keep_items: false,
+                with_prior: model.config.greedy_prior,
+            },
+            None,
+            &hf_walk::R1Options::default(),
+        )?;
+        for (index, (w, trace)) in indexes.iter().zip(&walked) {
+            let (s, u) = r1_stop_fields(w);
+            stopped += s as usize;
+            unregistered += u as usize;
+            rows.push(json!({
+                "episode_id": index.episode_id,
+                "stop_theta": theta,
+                "walk_expanded": w.expanded.iter().map(|n| index.names[*n as usize].as_str()).collect::<Vec<_>>(),
+                "expansions": w.expansions(),
+                "stop_reason": w.stop_reason,
+                "registered": w.registered(),
+                "registered_at": w.registered_at,
+                "stopped_before_registration": s,
+                "unregistered_at_16": u,
+                "rstop_logits": trace.rstop_logits.iter().map(|(t, l)| json!({"t": t, "logit": l})).collect::<Vec<_>>(),
+            }));
+        }
+    }
+    let n = episodes.len();
+    let share = |k: usize| {
+        if n == 0 {
+            Value::Null
+        } else {
+            Value::from(k as f64 / n as f64)
+        }
+    };
+    Ok((
+        rows,
+        json!({
+            "episodes": n,
+            "stopped_before_registration": stopped,
+            "stopped_before_registration_share": share(stopped),
+            "unregistered_at_16": unregistered,
+            "unregistered_at_16_share": share(unregistered),
+        }),
+    ))
+}
+
+/// Append `learned-r1` rows to `r1_stop_rows.jsonl`, `split` first.
+pub fn write_r1_stop_rows(output: &Path, split: &str, rows: &[Value]) -> Result<(), HfError> {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(output.join(R1_STOP_ROWS))
+        .map_err(|e| HfError::Invalid(e.to_string()))?;
+    for row in rows {
+        let mut full = Map::new();
+        full.insert("split".into(), split.into());
+        for (k, v) in row.as_object().unwrap() {
+            full.insert(k.clone(), v.clone());
+        }
+        let line = serde_json::to_string(&Value::Object(full))
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+        file.write_all(line.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|e| HfError::Invalid(e.to_string()))?;
+    }
+    file.flush().map_err(|e| HfError::Invalid(e.to_string()))
+}
+
 /// Append candidate records to `candidate_dump.jsonl.gz` (one line per exhaust decision).
 pub fn write_candidate_dump(
     output: &Path,
@@ -509,6 +624,64 @@ pub fn write_candidate_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn walk(
+        expansions: usize,
+        registered_at: Option<usize>,
+        stop_reason: &'static str,
+    ) -> WalkResult {
+        WalkResult {
+            expanded: (0..expansions as u32).collect(),
+            decisions: Vec::new(),
+            registered_at,
+            registered_at_by_target: vec![registered_at],
+            cosine_rank_at_registration: vec![None],
+            stop_reason,
+            examined: 0,
+            residuals: None,
+            margins: Vec::new(),
+            cosine_margins: Vec::new(),
+            candidates: None,
+        }
+    }
+
+    /// ENG-4 (b2): `stopped_before_registration` and `unregistered_at_16`
+    /// on hand-built walks, at and around the first snapshot.
+    #[test]
+    fn the_r1_stop_fields_are_exact_on_hand_built_walks() {
+        // registered while expanding the 16th node: registered at 16
+        assert_eq!(
+            r1_stop_fields(&walk(16, Some(16), "target_registered")),
+            (false, false)
+        );
+        // registered one later: still unregistered after 16 expansions
+        assert_eq!(
+            r1_stop_fields(&walk(17, Some(17), "target_registered")),
+            (false, true)
+        );
+        // the R1 stop at the first snapshot, before registration
+        assert_eq!(
+            r1_stop_fields(&walk(16, None, "learned_r1_stop")),
+            (true, true)
+        );
+        // the R1 stop at 32
+        assert_eq!(
+            r1_stop_fields(&walk(32, None, "learned_r1_stop")),
+            (true, true)
+        );
+        // exhausted without registering, short of 16
+        assert_eq!(r1_stop_fields(&walk(9, None, "exhausted")), (false, true));
+        // registered early
+        assert_eq!(
+            r1_stop_fields(&walk(3, Some(2), "target_registered")),
+            (false, false)
+        );
+        // the stage-0 learned rule is not the R1 stop
+        assert_eq!(
+            r1_stop_fields(&walk(20, None, "learned_stop")),
+            (false, true)
+        );
+    }
 
     /// The golden fixture episodes, rewritten as the stage-1 records a teacher
     /// would write (no `target_node`, a `query`), with the node cache and a

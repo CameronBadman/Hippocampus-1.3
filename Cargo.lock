@@ -517,6 +517,7 @@ dependencies = [
  "hf-episodes",
  "hf-io",
  "hf-walk",
+ "memmap2",
  "serde",
  "serde_json",
  "sha2",

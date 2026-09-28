@@ -1378,6 +1378,13 @@ fn deletions_run(
         dest.to_str().unwrap(),
         "--threads",
         threads,
+        // the premise's draw, declared (R1_HEAD_DESIGN.md §8 ENG-1)
+        "--draw-label",
+        "r1-premise-2026-09-25",
+        "--allowed-range",
+        "train:0..73359",
+        "--allowed-range",
+        "screen:0..4104",
     ])
 }
 
@@ -1562,7 +1569,7 @@ fn deletions_refuse_a_doctored_ball_the_reserve_holdout_and_an_existing_destinat
     let dest2 = root.join("reserved");
     let out = deletions_run(&split2, &gdir, &cache, &dest2, "1");
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved for seed selection"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("outside the declared ranges"));
     assert!(!dest2.exists(), "nothing is written for a reserved id");
     // just below the reserve is accepted by the check (then fails nothing else)
     let pool3 = root.join("pool3");

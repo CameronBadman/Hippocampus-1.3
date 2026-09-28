@@ -16,10 +16,11 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tch.workspace = true
-
-[dev-dependencies]
 hf-io.workspace = true
 hf-embed.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
 hf-episodes.workspace = true
 
 [[bin]]

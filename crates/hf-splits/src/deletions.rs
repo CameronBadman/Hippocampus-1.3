@@ -44,8 +44,16 @@ pub struct DeletionsArgs {
     #[arg(long)]
     destination: PathBuf,
     /// read only the first N source episodes (0 = every one)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, conflicts_with = "source_ordinals")]
     limit: usize,
+    /// `<lo>..<hi>` or `<lo>..`, both ends inclusive: draw only from the
+    /// source records at these POSITIONS of its visible stream (0-based; the
+    /// others are skipped, not refused). A range reaching past the stream's
+    /// end exits 2. `--per-start rotate` keeps the ABSOLUTE position as its
+    /// ordinal, so a block drawn alone rotates exactly as it would in the
+    /// whole stream.
+    #[arg(long)]
+    source_ordinals: Option<String>,
     /// worker threads (0 = rayon's default); the output does not depend on it
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -53,6 +61,28 @@ pub struct DeletionsArgs {
     /// (default: drop it, counted, and list the node in uncached_nodes.txt)
     #[arg(long)]
     keep_uncached: bool,
+    /// the draw's hash label: X is `hash_int([label, episode_id, tag])` over
+    /// the sorted candidates (the premise's was `r1-premise-2026-09-25`)
+    #[arg(long)]
+    draw_label: String,
+    /// `<train|screen>:<lo>..<hi>` or `<train|screen>:<lo>..`, both ends
+    /// inclusive, repeatable: a source id outside every declared range, or of
+    /// an undeclared split, exits 2 before anything is written
+    #[arg(long = "allowed-range", required = true)]
+    allowed_range: Vec<String>,
+    /// `all`: one record per distinct pick over U, D1-D4 (the premise);
+    /// `rotate`: exactly one per start, tag DRAW_TAGS[ordinal mod 5], falling
+    /// back to U when that tag has no candidate
+    #[arg(long, default_value = "all")]
+    per_start: String,
+    /// compute every ball' and draw as a fully covered cache would, and write
+    /// only uncached_nodes.txt and the manifest: no visible, labels or queries
+    #[arg(long, conflicts_with_all = ["require_coverage", "keep_uncached"])]
+    coverage_only: bool,
+    /// exit 2, writing nothing, on any uncached ball' node or X candidate
+    /// instead of dropping it
+    #[arg(long, conflicts_with = "keep_uncached")]
+    require_coverage: bool,
 }
 
 #[derive(Deserialize)]
@@ -162,16 +192,51 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
             args.destination.display()
         )));
     }
-    let (public, source) = read_source(&args.split_dir)?;
-    let take = if args.limit == 0 {
-        source.len()
-    } else {
-        args.limit.min(source.len())
+    let ranges = args
+        .allowed_range
+        .iter()
+        .map(|r| deletion::AllowedRange::parse(r))
+        .collect::<Result<Vec<_>, _>>()?;
+    if args.draw_label.trim().is_empty() {
+        return Err(HfError::Invalid("--draw-label is empty".into()));
+    }
+    let spec = deletion::DrawSpec {
+        label: args.draw_label.clone(),
+        ranges,
     };
-    let source = &source[..take];
-    // the reserve is refused before any graph is loaded or any file written
-    for line in source {
-        deletion::refuse_reserved(&line.episode_id)?;
+    let per_start = deletion::PerStart::parse(&args.per_start)?;
+    let ordinal_range = args
+        .source_ordinals
+        .as_deref()
+        .map(parse_ordinals)
+        .transpose()?;
+    let (public, all_source) = read_source(&args.split_dir)?;
+    let (ordinals, source): (Vec<usize>, Vec<&VisibleLine>) = match ordinal_range {
+        Some((lo, hi)) => {
+            let last = hi.unwrap_or(all_source.len().saturating_sub(1));
+            if lo >= all_source.len() || last >= all_source.len() {
+                return Err(HfError::Refused(format!(
+                    "--source-ordinals {}: the source stream holds {} records (positions 0..{})",
+                    args.source_ordinals.as_deref().unwrap_or(""),
+                    all_source.len(),
+                    all_source.len().saturating_sub(1)
+                )));
+            }
+            (lo..=last).map(|i| (i, &all_source[i])).unzip()
+        }
+        None => {
+            let take = if args.limit == 0 {
+                all_source.len()
+            } else {
+                args.limit.min(all_source.len())
+            };
+            all_source[..take].iter().enumerate().unzip()
+        }
+    };
+    // the declared ranges are checked before any graph is loaded or any file
+    // written
+    for line in &source {
+        spec.check(&line.episode_id)?;
     }
     let split = public
         .get("split")
@@ -194,6 +259,7 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
     }
     let graph =
         hf_graph::RealGraph::from_triples(&args.graph_dir.join("edges.tsv"), &family, None)?;
+    let cache_state = cache_state(&args.embeddings)?;
     let embeddings = hf_embed::EmbeddingMatrix::load(&args.embeddings)?;
     let embedding_manifest = hf_embed::read_manifest(&args.embeddings)?;
     let in_index = deletion::InIndex::new(&graph);
@@ -203,7 +269,8 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
         use rayon::prelude::*;
         source
             .par_iter()
-            .map(|line| {
+            .zip(ordinals.par_iter())
+            .map(|(line, &ordinal)| {
                 let start = line.visible["start_node"]
                     .as_str()
                     .ok_or_else(|| HfError::BandH(format!("{}: no start", line.episode_id)))?;
@@ -222,6 +289,12 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
                     &stored,
                     &has_vector,
                     &in_index,
+                    deletion::StartOptions {
+                        spec: &spec,
+                        per_start,
+                        ordinal,
+                        assume_covered: args.coverage_only,
+                    },
                 )
             })
             .collect()
@@ -235,7 +308,64 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
     } else {
         work()
     };
+    let results: Vec<StartDraws> = results.into_iter().collect::<Result<_, _>>()?;
+    // what the cache lacks: every X candidate without a row, and every node
+    // of a DRAWN ball' without one
+    let mut lacking: BTreeSet<String> = BTreeSet::new();
+    let mut fallbacks: BTreeMap<&str, u64> = BTreeMap::new();
+    for draws in &results {
+        lacking.extend(draws.uncached_candidates.iter().cloned());
+        if let Some(tag) = draws.fallback {
+            *fallbacks.entry(tag).or_default() += 1;
+        }
+        for drawn in &draws.drawn {
+            lacking.extend(
+                drawn
+                    .deletion
+                    .ball
+                    .iter()
+                    .map(|n| graph.name(*n))
+                    .filter(|n| !embeddings.contains(n))
+                    .map(str::to_string),
+            );
+        }
+    }
+    if args.require_coverage && !lacking.is_empty() {
+        let shown: Vec<&String> = lacking.iter().take(10).collect();
+        return Err(HfError::Refused(format!(
+            "--require-coverage: {} ball' nodes or X candidates lack a row in {} (first: {shown:?}); \
+             nothing was written",
+            lacking.len(),
+            args.embeddings.display()
+        )));
+    }
+    let settings = json!({
+        "draw_label": spec.label,
+        "allowed_ranges": spec.ranges.iter().map(deletion::AllowedRange::label).collect::<Vec<_>>(),
+        "per_start": per_start.as_str(),
+        "source_ordinals": match ordinal_range {
+            Some((lo, _)) => json!({
+                "declared": args.source_ordinals,
+                "first": lo,
+                "last": ordinals.last(),
+                "count": ordinals.len(),
+            }),
+            None => Value::Null,
+        },
+        "rotate_fallbacks_to_u": fallbacks,
+        "mode": if args.coverage_only {
+            "coverage_only"
+        } else if args.require_coverage {
+            "require_coverage"
+        } else {
+            "drop_uncached"
+        },
+        "cache_state": cache_state,
+    });
     std::fs::create_dir_all(&args.destination).map_err(invalid)?;
+    if args.coverage_only {
+        return write_coverage_only(&args, &public, &results, &lacking, &settings);
+    }
     let mut visible = Gz::create(&args.destination.join("visible.jsonl.gz"))?;
     let mut visible_h = Gz::create(&args.destination.join("visible_h.jsonl.gz"))?;
     let mut labels = Gz::create(&args.destination.join("labels.jsonl.gz"))?;
@@ -248,8 +378,7 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
     let (mut candidates, mut without_neighbour, mut without_vector) = (0u64, 0u64, 0u64);
     let mut start_isolated = 0u64;
     let mut written = 0u64;
-    for (line, result) in source.iter().zip(results) {
-        let draws = result?;
+    for (line, draws) in source.iter().zip(results) {
         candidates += draws.candidates as u64;
         without_neighbour += draws.without_neighbour as u64;
         without_vector += draws.without_vector as u64;
@@ -365,10 +494,15 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
         "embeddings": args.embeddings.to_string_lossy(),
         "embedding_model": embedding_manifest.model,
         "embedding_model_digest": embedding_manifest.model_digest,
-        "draw_label": deletion::DRAW_LABEL,
+        "draw_label": settings["draw_label"],
+        "allowed_ranges": settings["allowed_ranges"],
+        "per_start": settings["per_start"],
+        "source_ordinals": settings["source_ordinals"],
+        "rotate_fallbacks_to_u": settings["rotate_fallbacks_to_u"],
+        "mode": settings["mode"],
+        "cache_state": settings["cache_state"],
         "draw_tags": deletion::DRAW_TAGS,
         "strata_on": "target_count (|T|); stratum_degree beside, same cuts",
-        "reserved": {"train_from": deletion::RESERVED_TRAIN_FROM, "screen_from": deletion::RESERVED_SCREEN_FROM},
         "records_written": written,
         "records_per_draw_tag": per_tag,
         "drops": drops,
@@ -392,4 +526,97 @@ pub fn deletions(args: DeletionsArgs) -> Result<(), HfError> {
         args.destination.display()
     );
     Ok(())
+}
+
+/// The cache state a draw depends on: X's candidate set is the stored-ball
+/// nodes that have a row, so a draw reproduces only against this prefix of
+/// `vectors.jsonl` (its line count, and the sha256 of exactly those bytes).
+fn cache_state(dir: &Path) -> Result<Value, HfError> {
+    let path = dir.join("vectors.jsonl");
+    let bytes =
+        std::fs::read(&path).map_err(|e| HfError::Invalid(format!("{}: {e}", path.display())))?;
+    let lines = bytes.iter().filter(|b| **b == b'\n').count();
+    // the prefix ends at the last newline: a line being appended is not in it
+    let end = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let sha = hf_core::sha256_bytes(&bytes[..end]);
+    Ok(json!({
+        "vectors_jsonl": path.to_string_lossy(),
+        "vectors_lines": lines,
+        "vectors_prefix_bytes": end,
+        "vectors_prefix_sha256": sha,
+    }))
+}
+
+/// `--coverage-only`: the draw's uncached nodes and a manifest, nothing else.
+fn write_coverage_only(
+    args: &DeletionsArgs,
+    public: &Value,
+    results: &[StartDraws],
+    lacking: &BTreeSet<String>,
+    settings: &Value,
+) -> Result<(), HfError> {
+    let mut list = String::new();
+    for n in lacking {
+        list.push_str(n);
+        list.push('\n');
+    }
+    std::fs::write(args.destination.join("uncached_nodes.txt"), list).map_err(invalid)?;
+    let drawn: usize = results.iter().map(|r| r.drawn.len()).sum();
+    let manifest = json!({
+        "record_kind": "r1_deletion_coverage_manifest_v1",
+        "engine": "hippo-13 hf-splits deletions --coverage-only",
+        "governed_by": "experiments/real_walk_v2/R1_HEAD_DESIGN.md",
+        "source_split_dir": args.split_dir.to_string_lossy(),
+        "source_split": public.get("split").cloned().unwrap_or(Value::Null),
+        "source_visible_sha256": public.get("visible_sha256").cloned().unwrap_or(Value::Null),
+        "source_episodes_read": results.len(),
+        "streams_opened": ["manifest.public.json", "visible.jsonl.gz"],
+        "draw_label": settings["draw_label"],
+        "allowed_ranges": settings["allowed_ranges"],
+        "per_start": settings["per_start"],
+        "source_ordinals": settings["source_ordinals"],
+        "rotate_fallbacks_to_u": settings["rotate_fallbacks_to_u"],
+        "mode": settings["mode"],
+        "cache_state": settings["cache_state"],
+        "draws_computed": drawn,
+        "uncached_nodes": lacking.len(),
+        "streams_written": [],
+        "training_authorized": false,
+    });
+    std::fs::write(
+        args.destination.join("deletions.manifest.json"),
+        hf_core::files::python_json_pretty(&manifest),
+    )
+    .map_err(invalid)?;
+    println!(
+        "deletions --coverage-only: {drawn} draws from {} starts, {} uncached nodes -> {}",
+        results.len(),
+        lacking.len(),
+        args.destination.display()
+    );
+    Ok(())
+}
+
+/// `--source-ordinals`: `<lo>..<hi>` or `<lo>..`, both ends inclusive.
+fn parse_ordinals(text: &str) -> Result<(usize, Option<usize>), HfError> {
+    let bad = || {
+        HfError::Invalid(format!(
+            "--source-ordinals {text:?}: expected <lo>..<hi> or <lo>.. (both ends inclusive)"
+        ))
+    };
+    let (lo, hi) = text.split_once("..").ok_or_else(bad)?;
+    let lo: usize = lo.parse().map_err(|_| bad())?;
+    let hi: Option<usize> = if hi.is_empty() {
+        None
+    } else {
+        Some(hi.parse().map_err(|_| bad())?)
+    };
+    if hi.is_some_and(|h| h < lo) {
+        return Err(bad());
+    }
+    Ok((lo, hi))
 }

@@ -27,6 +27,9 @@ tch.workspace = true
 hf-core.workspace = true
 
 [dev-dependencies]
+hf-model.workspace = true
+hf-walk.workspace = true
+tch.workspace = true
 hf-core.workspace = true
 hf-io.workspace = true
 hf-embed.workspace = true
